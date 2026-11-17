@@ -1,0 +1,5 @@
+build/
+out/
+*.wav
+.pi-loop.json.lock
+.DS_Store
