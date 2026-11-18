@@ -49,13 +49,12 @@ PianoDesign makeGrand(const GrandOptions& o) {
     for (int key = 27; key <= 88; key++) treble.push_back(bridgePoint(key));
     b.bridges = {bass, treble};
 
-    for (int key = std::max(1, o.firstKey); key <= std::min(88, o.lastKey); key++) {
-        NoteDesign n;
-        n.midi = keyToMidi(key);
-        double f0 = 440.0 * std::pow(2.0, (key - 49) / 12.0);
-        int count = key <= 10 ? 1 : key <= 26 ? 2 : 3;
-
+    // The wire of one key, before tuning: length, mass and stiffness follow from the scale
+    // design at the nominal pitch.
+    auto equal = [](int key) { return 440.0 * std::pow(2.0, (key - 49) / 12.0); };
+    auto wire = [&](int key) {
         StringDesign s;
+        double f0 = equal(key);
         if (key <= 26) {  // copper wound on a steel core; only the core carries bending
             double t = (26 - key) / 25.0;
             s.L = lerp(1.12, 1.42, t);
@@ -70,6 +69,40 @@ PianoDesign makeGrand(const GrandOptions& o) {
             double dia = std::sqrt(4 * s.rhoA / (M_PI * steelRho));
             s.EI = steelE * M_PI * std::pow(dia, 4) / 64.0;
         }
+        return s;
+    };
+
+    // Tuning. Stiff strings have sharp partials, so octaves that sound in tune are wider than
+    // 2:1. Tune as a tuner does: an equal tempered octave around A4, then octaves outward by
+    // matching partials (4:2 in the middle, 2:1 in the high treble, 6:3 in the bass).
+    std::vector<double> tuned(89);
+    {
+        std::vector<double> B(89);
+        for (int key = 1; key <= 88; key++) {
+            StringDesign s = wire(key);
+            B[key] = M_PI * M_PI * s.EI / (s.T * s.L * s.L);
+            tuned[key] = equal(key);
+        }
+        if (o.stretchTuning) {
+            // Partial k of a string whose first partial is f1.
+            auto partial = [&](int key, int k, double f1) { return k * f1 * std::sqrt((1 + B[key] * k * k) / (1 + B[key])); };
+            // First partial of `key` such that its partial a equals partial b of `ref`.
+            auto match = [&](int key, int a, int ref, int b) { return partial(ref, b, tuned[ref]) / partial(key, a, 1.0); };
+            tuned[37] = match(37, 4, 49, 2);
+            for (int key = 38; key < 49; key++) tuned[key] = tuned[37] * std::pow(tuned[49] / tuned[37], (key - 37) / 12.0);
+            for (int key = 50; key <= 88; key++) tuned[key] = key <= 64 ? match(key, 2, key - 12, 4) : match(key, 1, key - 12, 2);
+            for (int key = 36; key >= 1; key--) tuned[key] = key >= 28 ? match(key, 4, key + 12, 2) : match(key, 6, key + 12, 3);
+        }
+    }
+
+    for (int key = std::max(1, o.firstKey); key <= std::min(88, o.lastKey); key++) {
+        NoteDesign n;
+        n.midi = keyToMidi(key);
+        double f0 = tuned[key];
+        int count = key <= 10 ? 1 : key <= 26 ? 2 : 3;
+
+        StringDesign s = wire(key);
+        s.T *= std::pow(f0 / equal(key), 2);  // the tension that gives the tuned pitch
         // Loss law of Chaigne & Askenfelt (1994): rate = b1 + b3 * omega^2.
         double b3 = key <= 40 ? 6.25e-9 : 6.25e-9 * std::pow(1.0e-9 / 6.25e-9, (key - 40) / 48.0);
         // Their constant term (0.5 /s) was fitted with a rigid bridge, so it contains the energy

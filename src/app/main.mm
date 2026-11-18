@@ -49,7 +49,8 @@ struct Engine {
     EventQueue uiEvents, midiEvents;
     std::vector<float> l, r;
     std::atomic<float> volume{0.8f}, load{0}, loadPeak{0}, level{0};
-    std::atomic<int> focus{60}, overruns{0};
+    std::atomic<int> focus{60}, overruns{0}, blocks{0};
+    std::atomic<bool> mute{false};  // write silence (used to measure on the real audio thread without sound)
     double sampleRate = 48000, gridScale = 1.5;
     os_workgroup_t workgroup = nullptr;  // the audio device's realtime thread group
     bool sideways = false;
@@ -139,6 +140,7 @@ struct Engine {
         for (int i = 0; i < n; i++) {
             float a = std::tanh(l[i] * vol), b = std::tanh(r[i] * vol);  // soft ceiling
             outL[i] = a; outR[i] = b;
+            if (mute.load(std::memory_order_relaxed)) outL[i] = outR[i] = 0;
             pk = std::max(pk, std::max(std::fabs(a), std::fabs(b)));
         }
         level = std::max(pk, level.load() * 0.9f);
@@ -153,6 +155,7 @@ struct Engine {
         load = load.load() * 0.95f + ld * 0.05f;
         if (ld > loadPeak.load()) loadPeak = ld;
         if (ld > 1.0f) overruns++;
+        blocks++;
     }
 };
 
@@ -417,6 +420,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 - (PianoView*)setUp;
 - (BOOL)openAudio;
+- (void)toggleAudio:(id)sender;
 @end
 
 @implementation AppDelegate {
@@ -604,8 +608,35 @@ static int selfTest(const char* png) {
     return peak > 0.001f && std::isfinite(peak) ? 0 : 1;
 }
 
+// Measures the engine on the real audio thread, with the output forced to silence.
+static int loadTest(int demo, double seconds, double grid, bool sideways) {
+    [NSApplication sharedApplication];
+    AppDelegate* d = [AppDelegate new];
+    gEngine.mute = true;
+    gEngine.gridScale = grid; gEngine.sideways = sideways;
+    if (![d openAudio]) { printf("loadtest: no audio device\n"); return 1; }
+    [d setUp];
+    gEngine.gridScale = grid; gEngine.sideways = sideways;
+    gEngine.build();
+    [d toggleAudio:nil];
+    gEngine.uiEvents.push({4, demo, 0});
+    printf("loadtest: %s, board grid %.2fx, sideways %d, silent output\n", gEngine.demos[demo].title.c_str(), grid, (int)sideways);
+    for (double t = 0; t < seconds; t += 5) {
+        gEngine.loadPeak = 0;
+        int o0 = gEngine.overruns.load(), b0 = gEngine.blocks.load();
+        [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:5]];
+        printf("  %3.0f-%3.0f s: mean load %3.0f %%, worst block %3.0f %%, blocks over budget %d of %d, strings awake %d\n", t, t + 5,
+               gEngine.load.load() * 100, gEngine.loadPeak.load() * 100, gEngine.overruns.load() - o0, gEngine.blocks.load() - b0,
+               gEngine.piano->awakeStrings());
+    }
+    [d toggleAudio:nil];
+    return 0;
+}
+
 int main(int argc, const char** argv) {
     @autoreleasepool {
+        if (argc > 2 && strcmp(argv[1], "--loadtest") == 0)
+            return loadTest(atoi(argv[2]), argc > 3 ? atof(argv[3]) : 30, argc > 4 ? atof(argv[4]) : 1.5, argc > 5 && atoi(argv[5]));
         if (argc > 2 && strcmp(argv[1], "--selftest") == 0) return selfTest(argv[2]);
         NSApplication* app = [NSApplication sharedApplication];
         app.activationPolicy = NSApplicationActivationPolicyRegular;

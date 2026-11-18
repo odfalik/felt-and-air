@@ -72,6 +72,7 @@ struct GrandOptions {
     double bridgeTiltDeg = 6.0;      // assumed; see docs/MODEL.md
     double hammerTiltDeg = 4.0;      // assumed
     bool twoPolarisations = true;
+    bool stretchTuning = true;       // octaves tuned by matching partials, as on a real piano
 };
 
 // A generic 2 m class grand. Not a model of any specific instrument.
