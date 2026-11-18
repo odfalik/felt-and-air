@@ -120,6 +120,7 @@ private:
         double hMass = 0, hK = 0, hP = 0, hMu = 0;
         double eta = 0, veta = 0;
         bool hammerActive = false, keyDown = false, hasDamper = false;
+        double thump = 0; Interp thumpAt;
     };
 
     void wake(StringRT& s);
@@ -155,6 +156,11 @@ private:
     int histPos_ = 0;
 
     Interp extAt_; double extF_ = 0;
+    // Key knocks in flight: short force pulses on the board.
+    struct Pulse { Interp at; double peak; int step, length; };
+    static const int kPulses = 32;
+    Pulse pulses_[kPulses];
+    int pulseCount_ = 0;
     long stepCount_ = 0;
     int hammerItersMax_ = 0;
     double dampMax_ = 1500.0;

@@ -153,6 +153,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
         if (n.count > 3) throw std::runtime_error("at most three strings per note");
         n.hMass = nd.hammerMass; n.hK = nd.hammerK; n.hP = nd.hammerP; n.hMu = nd.hammerMu;
         n.hasDamper = nd.hasDamper;
+        n.thump = nd.keyThump;
         for (const StringDesign& sd : nd.strings) {
             StringRT s;
             s.note = (int)notes_.size();
@@ -285,6 +286,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     }
     w_.assign(P.gridSize, 0); vw_.assign(P.gridSize, 0); r_.assign(P.gridSize, 0);
 
+    for (size_t i = 0; i < notes_.size(); i++) notes_[i].thumpAt = P.interp(d.notes[i].keyThumpAt);
     radiation_.build(P, d, fs_);
 
     if (os_ > 1) {  // Kaiser windowed sinc, cutoff at 0.45 of the output rate
@@ -338,6 +340,11 @@ void Piano::noteOn(int midi, double speed) {
         s.dampTarget = s.dampRate = 0;  // the key lifts the damper well before the hammer arrives
     }
     if (!(speed > 0)) return;
+    if (n.thump > 0 && pulseCount_ < kPulses) {
+        // A 3 ms half-sine carrying the key's impulse; its peak is impulse * pi / (2 T).
+        int len = std::max(2, (int)(0.003 * fs_));
+        pulses_[pulseCount_++] = {n.thumpAt, n.thump * speed * M_PI / (2 * len * k_), 0, len};
+    }
     // Position and speed of each string along the strike direction, at the hammer.
     auto along = [&](int i, const std::vector<RealS>& f) {
         double g = 0;
@@ -605,6 +612,12 @@ void Piano::step(double& pL, double& pR) {
 
     if (shared) runChunks(0);  // helpers start on the strings while this thread does the plate
     P.apply(w, vw, r);  // plate internal forces, scaled by dt^2
+    for (int i = 0; i < pulseCount_;) {
+        Pulse& pu = pulses_[i];
+        double f = pu.peak * std::sin(M_PI * (pu.step + 0.5) / pu.length) * k_ * k_;
+        for (int q = 0; q < 4; q++) r[pu.at.idx[q]] += (RealP)(pu.at.w[q] * f);
+        if (++pu.step >= pu.length) pulses_[i] = pulses_[--pulseCount_]; else i++;
+    }
     if (extF_ != 0) {
         for (int q = 0; q < 4; q++) r[extAt_.idx[q]] += (RealP)(extAt_.w[q] * extF_ * k_ * k_);
         extF_ = 0;

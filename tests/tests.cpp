@@ -32,6 +32,7 @@ static void makeLossless(PianoDesign& d) {
     d.board.sigma0 = 0;
     for (auto& n : d.notes) {
         n.hammerMu = 0;
+        n.keyThump = 0;  // an outside force: it would add energy
         for (auto& s : n.strings) s.sigma0 = s.sigma1 = 0;
     }
 }
@@ -120,7 +121,9 @@ static void testEnergyAfterRelease() {
 
 static void testPassivity() {
     std::printf("\n4. Lossy instrument: energy never increases (strike, hold, damper)\n");
-    Piano p(oneNote(), {48000, 1, 0.5});
+    PianoDesign pd = oneNote();
+    pd.notes[0].keyThump = 0;  // the key knock is an outside force and would add energy
+    Piano p(pd, {48000, 1, 0.5});
     p.noteOn(60, 4.0);
     double prev = p.energy(), worstRise = 0, a, b, e0 = prev;
     int n = 0;

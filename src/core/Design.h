@@ -33,6 +33,10 @@ struct NoteDesign {
     bool hasDamper = true;
     double hammerTilt = 0;      // strike direction away from the soundboard normal, rad
     bool twoPolarisations = true;
+    // The key landing on the keybed sends a knock through the case into the board's front
+    // edge. Impulse reaching the board per unit hammer speed (N s per m/s), and where.
+    double keyThump = 0;
+    Vec2 keyThumpAt;
 };
 
 struct BoardDesign {
@@ -99,6 +103,20 @@ struct GrandOptions {
     bool twoPolarisations = true;
     bool stretchTuning = true;       // octaves tuned by matching partials, as on a real piano
     bool playerPerspective = false;  // ears at the keyboard instead of in the room
+
+    // Voicing and build variations, as multiples of the reference instrument.
+    double hammerHardness = 1.0;   // felt stiffness
+    double hammerMass = 1.0;
+    double feltDamping = 1.0;
+    double strikePosition = 1.0;   // hammer strike point along the string
+    double stringLoss = 1.0;
+    double boardThickness = 1.0;
+    double boardLoss = 1.0;
+    double ribHeight = 1.0;
+    double keyThump = 1.0;         // knock of the key on the keybed
+    double roomSize = 1.0;
+    double roomAbsorption = 0.18;
+    double lidAngleDeg = 38;       // 0 closes the lid
 };
 
 // A generic 2 m class grand. Not a model of any specific instrument.

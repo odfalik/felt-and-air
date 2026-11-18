@@ -25,6 +25,14 @@ PianoDesign makeGrand(const GrandOptions& o) {
     b.outline = {{0, 0},       {1.40, 0},    {1.40, 0.42}, {1.33, 0.62}, {1.20, 0.82},
                  {1.02, 1.02}, {0.82, 1.22}, {0.62, 1.38}, {0.45, 1.50}, {0, 1.50}};
     b.grainAngle = 130.0 * M_PI / 180.0;  // roughly parallel to the long bridge
+    b.thickness *= o.boardThickness;
+    b.lossFactor *= o.boardLoss;
+    b.ribHeight *= o.ribHeight;
+    d.room.Lx *= o.roomSize; d.room.Ly *= o.roomSize; d.room.Lz *= std::sqrt(o.roomSize);
+    d.room.pianoX *= o.roomSize; d.room.pianoY *= o.roomSize;
+    d.room.absorption = o.roomAbsorption;
+    d.lid.open = o.lidAngleDeg > 1;
+    d.lid.angleDeg = o.lidAngleDeg;
 
     const double steelE = 2.0e11, steelRho = 7850;
     const double agraffeY = 0.03;
@@ -108,8 +116,8 @@ PianoDesign makeGrand(const GrandOptions& o) {
         // Their constant term (0.5 /s) was fitted with a rigid bridge, so it contains the energy
         // the soundboard takes. Here the board takes that energy itself, and only the string's
         // own loss (air and internal friction) belongs in the constant. 0.12 /s is an estimate.
-        s.sigma0 = 0.12;
-        s.sigma1 = b3 * s.T / s.rhoA;
+        s.sigma0 = 0.12 * o.stringLoss;
+        s.sigma1 = b3 * s.T / s.rhoA * o.stringLoss;
 
         Vec2 bp = bridgePoint(key);
         for (int i = 0; i < count; i++) {
@@ -124,13 +132,17 @@ PianoDesign makeGrand(const GrandOptions& o) {
             n.strings.push_back(si);
         }
 
-        n.strikeRatio = key <= 50 ? 0.12 : lerp(0.12, 0.075, (key - 50) / 38.0);
+        n.strikeRatio = (key <= 50 ? 0.12 : lerp(0.12, 0.075, (key - 50) / 38.0)) * o.strikePosition;
         // Chaigne & Askenfelt give per-string equivalent hammers at C2, C4, C7.
         double perStringMass = std::clamp(anchors(key, 4.9e-3, 2.97e-3, 2.2e-3), 2.0e-3, 5.5e-3);
-        n.hammerMass = perStringMass * count;
-        n.hammerK = std::exp(anchors(key, std::log(4.0e8), std::log(4.5e9), std::log(1.0e11)));
+        n.hammerMass = perStringMass * count * o.hammerMass;
+        n.hammerK = std::exp(anchors(key, std::log(4.0e8), std::log(4.5e9), std::log(1.0e11))) * o.hammerHardness;
         n.hammerP = std::clamp(anchors(key, 2.3, 2.5, 3.0), 2.2, 3.1);
-        n.hammerMu = 0.1;
+        n.hammerMu = 0.1 * o.feltDamping;
+        // About 50 g of key and finger landing at a fifth of the hammer's speed, of which an
+        // assumed 15 % reaches the board through keybed and case.
+        n.keyThump = 0.05 / 5.0 * 0.15 * o.keyThump;
+        n.keyThumpAt = {keyX(key), 0.06};
         n.hasDamper = key <= 69;
         n.hammerTilt = o.hammerTiltDeg * M_PI / 180.0;
         n.twoPolarisations = o.twoPolarisations;
