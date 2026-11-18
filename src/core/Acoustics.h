@@ -23,6 +23,12 @@ public:
     void step(const RealP* r, double& left, double& right);
 
     double reverbTime = 0;       // Sabine, seconds (0 when there is no room)
+
+    // Reaction of the air on the board, per patch, as dt^2 * force on each node of the patch,
+    // from the motion up to the step last passed to step(). Empty when air loading is off.
+    const std::vector<RealP>& airForce() const { return airForce_; }
+    const std::vector<int>& patchPtr() const { return patchPtr_; }
+    const std::vector<int>& patchNode() const { return patchNode_; }
     int imageCount = 0, patchCount = 0;
 
 private:
@@ -39,6 +45,17 @@ private:
     std::vector<RealP> patchAcc_;
     std::vector<double> ring_[2];
     int ringPos_ = 0, ringMask_ = 0;
+
+    // Air loading: each patch feels its own motion (a piston: pressure rho c [v(t) - v(t - a/c)]
+    // at its centre, which is mass-like at low and resistive at high frequency) and the delayed
+    // acceleration of every other patch. Both faces of the board count.
+    bool air_ = false;
+    std::vector<RealP> airForce_;
+    std::vector<double> patchVel_, velHist_, accHist_, invCount_;
+    std::vector<int> selfDelay_, mutDelay_, mutSrc_, mutPtr_;
+    std::vector<double> mutGain_;
+    double selfGain_ = 0;
+    int histPos_ = 0, histMask_ = 0;
 
     // Late field.
     static const int kLines = 8;

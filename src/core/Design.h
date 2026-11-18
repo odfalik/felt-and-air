@@ -94,6 +94,9 @@ struct PianoDesign {
     // presses on the board through the downbearing angles, front plus back.
     bool longitudinal = true;
     double downbearingDeg = 1.5;
+    // The air pushes back on the moving board: it adds mass at low frequency and carries
+    // energy away as sound.
+    bool airLoading = true;
     double damperStrength = 1.0;
     std::vector<NoteDesign> notes;
     Listener ears[2];
@@ -114,6 +117,7 @@ struct GrandOptions {
     double stringLoss = 1.0;         // x reference: the string's own damping
     double stringStiffness = 1.0;    // x reference: bending stiffness, sets the inharmonicity
     bool longitudinal = true;        // stretching of the strings along their length
+    bool airLoading = true;          // reaction of the air on the soundboard
     double downbearingDeg = 1.5;     // angle the strings make over the bridge, each side
     bool twoPolarisations = true;
     double bridgeTiltDeg = 6.0;      // assumed; see docs/MODEL.md

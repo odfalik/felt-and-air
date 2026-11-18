@@ -52,6 +52,39 @@ void Radiation::build(const Plate& P, const PianoDesign& d, double fs) {
         patchAcc_.assign(patchCount, 0);
     }
 
+    air_ = d.airLoading;
+    airForce_.clear();
+    if (air_) {
+        const int np = patchCount;
+        airForce_.assign(np, 0);
+        patchVel_.assign(np, 0.0); invCount_.resize(np); selfDelay_.resize(np);
+        int far = 1;
+        mutPtr_.assign(1, 0); mutDelay_.clear(); mutSrc_.clear(); mutGain_.clear();
+        for (int p = 0; p < np; p++) {
+            int count = patchPtr_[p + 1] - patchPtr_[p];
+            invCount_[p] = 1.0 / count;
+            double radius = std::sqrt(count * dS / M_PI);
+            selfDelay_[p] = std::max(1, (int)std::lround(radius / c * fs));
+            far = std::max(far, selfDelay_[p]);
+            for (int q = 0; q < np; q++) {
+                if (q == p) continue;
+                double r = std::hypot(centre[p].x - centre[q].x, centre[p].y - centre[q].y);
+                int dl = std::max(1, (int)std::lround(r / c * fs));
+                mutDelay_.push_back(dl);
+                mutSrc_.push_back(q);
+                mutGain_.push_back(-rho * dS * dS / (M_PI * r));  // both faces; acts on the patch's summed dt^2 * accel
+                far = std::max(far, dl);
+            }
+            mutPtr_.push_back((int)mutDelay_.size());
+        }
+        selfGain_ = -2 * rho * c * k * dS;  // both faces; acts on the mean increment per step
+        int len = 1;
+        while (len < far + 2) len <<= 1;
+        histMask_ = len - 1; histPos_ = 0;
+        velHist_.assign((size_t)np * len, 0.0);
+        accHist_.assign((size_t)np * len, 0.0);
+    }
+
     int maxDelay = 0;
     imageCount = 0;
     for (int e = 0; e < 2; e++) {
@@ -210,6 +243,21 @@ void Radiation::step(const RealP* __restrict r, double& left, double& right) {
         if (q < end) s0 += r[patchNode_[q]];
         patchAcc_[p] = s0 + s1;
         total += s0 + s1;
+    }
+    if (air_) {
+        const int len = histMask_ + 1, now = histPos_;
+        for (int p = 0; p < np; p++) {
+            patchVel_[p] += (double)patchAcc_[p] * invCount_[p];
+            velHist_[(size_t)p * len + now] = patchVel_[p];
+            accHist_[(size_t)p * len + now] = (double)patchAcc_[p];
+        }
+        for (int p = 0; p < np; p++) {
+            double f = selfGain_ * (patchVel_[p] - velHist_[(size_t)p * len + ((now - selfDelay_[p]) & histMask_)]);
+            for (int q = mutPtr_[p]; q < mutPtr_[p + 1]; q++)
+                f += mutGain_[q] * accHist_[(size_t)mutSrc_[q] * len + ((now - mutDelay_[q]) & histMask_)];
+            airForce_[p] = (RealP)f;
+        }
+        histPos_ = (now + 1) & histMask_;
     }
     const RealP* __restrict pa = patchAcc_.data();
     for (int e = 0; e < 2; e++) {

@@ -29,6 +29,7 @@ static PianoDesign oneNote(int key = 40) {
 
 static void makeLossless(PianoDesign& d) {
     d.longitudinal = false;  // driven one-way by the transverse motion, so not part of the energy balance
+    d.airLoading = false;    // the air carries energy away
     d.board.lossFactor = 0;
     d.board.sigma0 = 0;
     for (auto& n : d.notes) {
@@ -125,6 +126,7 @@ static void testPassivity() {
     PianoDesign pd = oneNote();
     pd.notes[0].keyThump = 0;  // the key knock is an outside force and would add energy
     pd.longitudinal = false;   // one-way drive, outside the energy balance
+    pd.airLoading = false;     // acts through delays, outside the step-by-step energy argument
     Piano p(pd, {48000, 1, 0.5});
     p.noteOn(60, 4.0);
     double prev = p.energy(), worstRise = 0, a, b, e0 = prev;
@@ -418,6 +420,37 @@ static void testLongitudinal() {
     CHECK(peak > 0.5 && peak < 0.2 * view.tension, "tension change is a small fraction of the tension");
 }
 
+static void testAirLoading() {
+    std::printf("\n14. Air loading: the air's mass lowers the board's resonances, and it stays stable\n");
+    double first[2] = {0, 0};
+    for (int air = 0; air < 2; air++) {
+        GrandOptions g;
+        g.firstKey = g.lastKey = 40;
+        g.airLoading = air;
+        PianoDesign d = makeGrand(g);
+        Piano p(d, {48000, 1});
+        Vec2 at = d.notes[0].strings[0].bridge;
+        const size_t n = 1 << 16;
+        std::vector<double> v(n);
+        double a, b;
+        p.pushBoard(at, 1.0);
+        for (size_t i = 0; i < n; i++) { p.step(a, b); v[i] = p.boardVelocity(at); }
+        first[air] = peakFrequency(v, 48000, 30, 60);
+    }
+    double shift = 100 * (first[1] / first[0] - 1);
+    CHECK(shift < -2 && shift > -20, "lowest resonance %.1f Hz in vacuum, %.1f Hz in air (%.1f %%)", first[0], first[1], shift);
+    Piano p(makeGrand(), {48000, 1});
+    p.setSustain(true);
+    double a, b, early = 0, late = 0;
+    for (int i = 0; i < 48000 * 6; i++) {
+        if (i % 6000 == 0 && i < 48000 * 2) p.noteOn(24 + (i / 6000 * 7) % 80, 5.0);
+        p.step(a, b);
+        if (i > 48000 * 2 && i < 48000 * 3) early += a * a;
+        if (i > 48000 * 5) late += a * a;
+    }
+    CHECK(std::isfinite(late) && late < early, "fortissimo with pedal rings down: last second %.1f dB below the third", 10 * std::log10(early / late));
+}
+
 static void testThreads() {
     std::printf("\n11. Helper threads give bit-identical output\n");
     std::vector<float> ref, out;
@@ -447,7 +480,7 @@ int main(int argc, char** argv) {
         {"passivity", testPassivity},          {"plate", testPlateAnalytic},       {"partials", testStringPartials},
         {"hammer", testHammer},                {"reciprocity", testReciprocity},   {"coupling", testCoupling},
         {"robust", testRobustness},           {"threads", testThreads},           {"room", testRoom},
-        {"longitudinal", testLongitudinal}};
+        {"longitudinal", testLongitudinal},  {"air", testAirLoading}};
     for (auto& t : tests)
         if (argc < 2 || t.first == argv[1]) t.second();
     std::printf("\n%s (%d failed checks)\n", failures ? "FAILED" : "ALL PASSED", failures);

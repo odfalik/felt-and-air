@@ -707,6 +707,15 @@ void Piano::step(double& pL, double& pR) {
     runChunks(0);  // strings, plate stencil and last step's sound, side by side
     finish(0);
     P.applyExtras(w, r);
+    {   // Reaction of the air, worked out by the radiation task from the motion so far.
+        const std::vector<RealP>& air = radiation_.airForce();
+        const int* __restrict ptr = radiation_.patchPtr().data();
+        const int* __restrict node = radiation_.patchNode().data();
+        for (int p = 0; p < (int)air.size(); p++) {
+            const RealP f = air[p];
+            for (int q = ptr[p]; q < ptr[p + 1]; q++) r[node[q]] += f;
+        }
+    }
     for (int i = 0; i < pulseCount_;) {
         Pulse& pu = pulses_[i];
         double f = pu.peak * std::sin(M_PI * (pu.step + 0.5) / pu.length) * k_ * k_;

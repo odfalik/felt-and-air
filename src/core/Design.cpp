@@ -34,6 +34,7 @@ PianoDesign makeGrand(const GrandOptions& o) {
     b.bridgeHeight = o.bridgeHeightMm * 1e-3;
     d.damperStrength = o.damperStrength;
     d.longitudinal = o.longitudinal;
+    d.airLoading = o.airLoading;
     d.downbearingDeg = o.downbearingDeg;
     d.room.enabled = o.roomEnabled;
     d.room.Lx = o.roomLx; d.room.Ly = o.roomLy; d.room.Lz = o.roomLz;
