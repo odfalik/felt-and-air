@@ -88,6 +88,7 @@ struct LidDesign {
 
 struct PianoDesign {
     BoardDesign board;
+    double damperStrength = 1.0;
     std::vector<NoteDesign> notes;
     Listener ears[2];
     RoomDesign room;
@@ -95,28 +96,48 @@ struct PianoDesign {
     double airRho = 1.2, airC = 343.0;
 };
 
+// Everything adjustable about the reference grand, in physical units where the quantity
+// has one, and as a multiple of the reference where it varies from note to note.
 struct GrandOptions {
     int firstKey = 1, lastKey = 88;  // piano key numbers, A0 = 1, C4 = 40
+
+    // Strings and tuning.
+    double a4Hz = 440.0;
+    bool stretchTuning = true;       // octaves tuned by matching partials, as on a real piano
     double unisonDetuneCents = 0.6;  // spread of the strings inside one note
+    double stringLoss = 1.0;         // x reference: the string's own damping
+    double stringStiffness = 1.0;    // x reference: bending stiffness, sets the inharmonicity
+    bool twoPolarisations = true;
     double bridgeTiltDeg = 6.0;      // assumed; see docs/MODEL.md
     double hammerTiltDeg = 4.0;      // assumed
-    bool twoPolarisations = true;
-    bool stretchTuning = true;       // octaves tuned by matching partials, as on a real piano
-    bool playerPerspective = false;  // ears at the keyboard instead of in the room
 
-    // Voicing and build variations, as multiples of the reference instrument.
-    double hammerHardness = 1.0;   // felt stiffness
-    double hammerMass = 1.0;
-    double feltDamping = 1.0;
-    double strikePosition = 1.0;   // hammer strike point along the string
-    double stringLoss = 1.0;
-    double boardThickness = 1.0;
-    double boardLoss = 1.0;
-    double ribHeight = 1.0;
-    double keyThump = 1.0;         // knock of the key on the keybed
-    double roomSize = 1.0;
+    // Hammers and action.
+    double hammerHardness = 1.0;     // x reference: felt stiffness
+    double hammerMass = 1.0;         // x reference
+    double feltDamping = 1.0;        // x reference
+    double strikePosition = 1.0;     // x reference: strike point along the string
+    double keyThump = 1.0;           // x reference: knock of the key on the keybed
+    double damperStrength = 1.0;     // x reference
+
+    // Soundboard.
+    double boardThicknessMm = 8.0;
+    double boardLossPercent = 2.0;   // structural loss factor
+    double ribHeightMm = 22.0;
+    double ribSpacingMm = 125.0;
+    double crownRadiusM = 18.0;      // 0: flat board
+    double rimClamp = 1.0;           // 0 simply supported, 1 clamped
+    double bridgeHeightMm = 34.0;
+
+    // Space. Room coordinates in metres from one corner; the piano is placed by the bass
+    // end of its keyboard side, keyboard along x, tail toward +y.
+    bool roomEnabled = true;
+    double roomLx = 9.0, roomLy = 7.0, roomLz = 4.0;
     double roomAbsorption = 0.18;
-    double lidAngleDeg = 38;       // 0 closes the lid
+    double pianoX = 3.0, pianoY = 2.2;
+    double listenerX = 6.4, listenerY = 2.9;  // centre of the head
+    double earHeightM = 1.2;                  // above the floor
+    double earSpacingM = 0.5;                 // a spaced pair; the head turns to face the piano
+    double lidAngleDeg = 38;                  // 0 closes the lid
 };
 
 // A generic 2 m class grand. Not a model of any specific instrument.

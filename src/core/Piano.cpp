@@ -172,6 +172,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     outGain_ = o.outputGain;
     const double k = k_;
     std::fill(noteOfMidi_, noteOfMidi_ + 128, -1);
+    dampMax_ = 1500.0 * d.damperStrength;
 
     std::vector<Attachment> att;
     std::vector<double> endScale;

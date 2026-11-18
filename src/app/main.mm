@@ -56,8 +56,8 @@ struct Engine {
     double sampleRate = 48000, gridScale = 1.5;
     os_workgroup_t workgroup = nullptr;  // the audio device's realtime thread group
     bool sideways = false;
-    int listener = 0;  // 0 in the room, 1 at the keyboard, 2 no room
-    GrandOptions voicing;  // what the Instrument panel edits
+    GrandOptions voicing;  // what the Instrument window edits
+    double lastPedal = 0;
     int framesSinceSnap = 0;
 
     // Demo recordings, loaded once at start. The audio thread only reads them.
@@ -82,6 +82,7 @@ struct Engine {
     }
     void silence() {
         for (int m = 21; m <= 108; m++) piano->noteOff(m);
+        lastPedal = 0;
         piano->setSustain(false);
     }
     mach_timebase_info_data_t tb;
@@ -89,10 +90,7 @@ struct Engine {
     void build() {
         GrandOptions g = voicing;
         g.twoPolarisations = sideways;
-        g.playerPerspective = listener == 1;
         design = makeGrand(g);
-        if (listener == 2) { design.room.enabled = false; design.lid.open = false; }
-        demoPlaying = -1; demoIndex = -1;
         PianoOptions o;
         o.sampleRate = sampleRate;
         o.boardGridScale = gridScale;
@@ -119,13 +117,14 @@ struct Engine {
             [wg] { if (joined) os_workgroup_leave(wg, &token); joined = false; });
         piano->prepareSnapshot(snap);
         piano->prepareSnapshot(snapUI);
+        piano->setPedal(lastPedal);  // a demo keeps playing across a rebuild; carry the pedal over
         l.assign(8192, 0); r.assign(8192, 0);
         mach_timebase_info(&tb);
     }
     void handle(const Event& e) {
         if (e.type == 1) { piano->noteOn(e.a, midiVelocityToHammerSpeed(e.b)); focus = e.a; }
         else if (e.type == 0) piano->noteOff(e.a);
-        else if (e.type == 2) piano->setPedal(e.a / 127.0);
+        else if (e.type == 2) { lastPedal = e.a / 127.0; piano->setPedal(lastPedal); }
         else if (e.type == 4 && e.a >= 0 && e.a < (int)demos.size()) { silence(); demoIndex = e.a; demoNext = 0; demoFrame = 0; demoPlaying = e.a; }
         else if (e.type == 5) { silence(); demoIndex = -1; demoPlaying = -1; }
     }
@@ -432,6 +431,108 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 - (void)midiNote:(int)m on:(BOOL)on { if (m >= 0 && m < 128) _down[m] = on; }
 @end
 
+// ------------------------------------------------------------------------------ room plan
+
+// Top-down drawing of the room. Drag the piano or the listener.
+@interface RoomPlanView : NSView
+@property(nonatomic, copy) void (^changed)(void);
+@end
+
+@implementation RoomPlanView {
+    int _drag;  // 0 none, 1 listener, 2 piano
+    NSPoint _grab;
+}
+- (BOOL)isFlipped { return NO; }
+- (CGFloat)scale {
+    const GrandOptions& o = gEngine.voicing;
+    return std::min((self.bounds.size.width - 20) / o.roomLx, (self.bounds.size.height - 44) / o.roomLy);
+}
+- (NSPoint)toView:(double)x :(double)y {
+    const GrandOptions& o = gEngine.voicing;
+    CGFloat s = [self scale];
+    return NSMakePoint(self.bounds.size.width / 2 + (x - o.roomLx / 2) * s, self.bounds.size.height / 2 + 10 + (y - o.roomLy / 2) * s);
+}
+- (void)drawRect:(NSRect)dirty {
+    const GrandOptions& o = gEngine.voicing;
+    [[NSColor colorWithWhite:0.12 alpha:1] setFill];
+    NSRectFill(self.bounds);
+    NSPoint a = [self toView:0 :0], b = [self toView:o.roomLx :o.roomLy];
+    NSRect room = NSMakeRect(a.x, a.y, b.x - a.x, b.y - a.y);
+    [(o.roomEnabled ? [NSColor colorWithWhite:0.2 alpha:1] : [NSColor colorWithWhite:0.14 alpha:1]) setFill];
+    NSRectFill(room);
+    [[NSColor colorWithWhite:o.roomEnabled ? 0.75 : 0.35 alpha:1] setStroke];
+    NSBezierPath* walls = [NSBezierPath bezierPathWithRect:room];
+    walls.lineWidth = o.roomEnabled ? 2 : 1;
+    if (!o.roomEnabled) { CGFloat dash[] = {4, 4}; [walls setLineDash:dash count:2 phase:0]; }
+    [walls stroke];
+    // Piano: the soundboard outline, with the keyboard along its near edge.
+    NSBezierPath* piano = [NSBezierPath bezierPath];
+    const auto& outline = gEngine.design.board.outline;
+    for (size_t i = 0; i < outline.size(); i++) {
+        NSPoint q = [self toView:o.pianoX + outline[i].x :o.pianoY + outline[i].y];
+        if (i == 0) [piano moveToPoint:q]; else [piano lineToPoint:q];
+    }
+    [piano closePath];
+    [[NSColor colorWithRed:0.75 green:0.55 blue:0.3 alpha:1] setFill];
+    [piano fill];
+    NSPoint k0 = [self toView:o.pianoX :o.pianoY - 0.16], k1 = [self toView:o.pianoX + 1.40 :o.pianoY];
+    [[NSColor colorWithWhite:0.92 alpha:1] setFill];
+    NSRectFill(NSMakeRect(k0.x, k0.y, k1.x - k0.x, k1.y - k0.y));
+    if (o.lidAngleDeg > 1) {  // the lid is hinged on the bass side and opens toward the treble
+        [[NSColor colorWithWhite:1 alpha:0.8] setStroke];
+        NSBezierPath* hinge = [NSBezierPath bezierPath];
+        [hinge moveToPoint:[self toView:o.pianoX :o.pianoY]];
+        [hinge lineToPoint:[self toView:o.pianoX :o.pianoY + 1.5]];
+        hinge.lineWidth = 3;
+        [hinge stroke];
+    }
+    // Listener: two ears and the direction faced.
+    [[NSColor colorWithRed:0.45 green:0.8 blue:1 alpha:1] setFill];
+    for (int e = 0; e < 2; e++) {
+        NSPoint q = [self toView:o.pianoX + gEngine.design.ears[e].x :o.pianoY + gEngine.design.ears[e].y];
+        [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(q.x - 4, q.y - 4, 8, 8)] fill];
+    }
+    NSPoint h = [self toView:o.listenerX :o.listenerY], c = [self toView:o.pianoX + 0.7 :o.pianoY + 0.6];
+    CGFloat len = hypot(c.x - h.x, c.y - h.y);
+    if (len > 1) {
+        [[NSColor colorWithRed:0.45 green:0.8 blue:1 alpha:0.7] setStroke];
+        NSBezierPath* look = [NSBezierPath bezierPath];
+        [look moveToPoint:h];
+        [look lineToPoint:NSMakePoint(h.x + (c.x - h.x) / len * 14, h.y + (c.y - h.y) / len * 14)];
+        look.lineWidth = 2;
+        [look stroke];
+    }
+    NSDictionary* small = @{NSFontAttributeName: [NSFont systemFontOfSize:10.5], NSForegroundColorAttributeName: [NSColor colorWithWhite:0.7 alpha:1]};
+    double dist = hypot(o.listenerX - (o.pianoX + 0.7), o.listenerY - (o.pianoY + 0.6));
+    [[NSString stringWithFormat:@"Drag the piano or the listener.   %.1f x %.1f m   listener %.1f m from the board", o.roomLx, o.roomLy, dist]
+        drawAtPoint:NSMakePoint(6, 4) withAttributes:small];
+}
+- (void)mouseDown:(NSEvent*)e {
+    const GrandOptions& o = gEngine.voicing;
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    NSPoint h = [self toView:o.listenerX :o.listenerY];
+    NSPoint pa = [self toView:o.pianoX :o.pianoY - 0.2], pb = [self toView:o.pianoX + 1.4 :o.pianoY + 1.5];
+    _drag = 0;
+    if (hypot(p.x - h.x, p.y - h.y) < 16) { _drag = 1; _grab = NSMakePoint(p.x - h.x, p.y - h.y); }
+    else if (p.x >= pa.x && p.x <= pb.x && p.y >= pa.y && p.y <= pb.y) { _drag = 2; NSPoint q = [self toView:o.pianoX :o.pianoY]; _grab = NSMakePoint(p.x - q.x, p.y - q.y); }
+}
+- (void)mouseDragged:(NSEvent*)e {
+    if (!_drag) return;
+    GrandOptions& o = gEngine.voicing;
+    NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
+    CGFloat s = [self scale];
+    double x = o.roomLx / 2 + (p.x - _grab.x - self.bounds.size.width / 2) / s, y = o.roomLy / 2 + (p.y - _grab.y - self.bounds.size.height / 2 - 10) / s;
+    if (_drag == 1) { o.listenerX = std::clamp(x, 0.3, o.roomLx - 0.3); o.listenerY = std::clamp(y, 0.3, o.roomLy - 0.3); }
+    else { o.pianoX = std::clamp(x, 0.2, std::max(0.2, o.roomLx - 1.6)); o.pianoY = std::clamp(y, 0.8, std::max(0.8, o.roomLy - 1.7)); }
+    gEngine.design = makeGrand(o);  // only to redraw the ears while dragging; the engine is rebuilt on release
+    self.needsDisplay = YES;
+}
+- (void)mouseUp:(NSEvent*)e {
+    if (_drag && self.changed) self.changed();
+    _drag = 0;
+}
+@end
+
 // ------------------------------------------------------------------------------ app
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
@@ -455,10 +556,13 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     NSButton* _sidewaysBox;
     NSPopUpButton* _demoMenu;
     NSPopUpButton* _gridMenu;
-    NSPopUpButton* _listenerMenu;
     NSPanel* _panel;
     NSMutableArray<NSSlider*>* _sliders;
     NSMutableArray<NSTextField*>* _values;
+    NSPopUpButton* _presetMenu;
+    NSButton* _roomBox;
+    NSButton* _stretchBox;
+    RoomPlanView* _plan;
     NSSlider* _volume;
 }
 
@@ -507,7 +611,6 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     const double scales[] = {1.0, 1.25, 1.5};
     gEngine.gridScale = scales[std::clamp((int)_gridMenu.indexOfSelectedItem, 0, 2)];
     gEngine.sideways = _sidewaysBox.state == NSControlStateValueOn;
-    gEngine.listener = (int)_listenerMenu.indexOfSelectedItem;
     gEngine.build();
     [_view rebuildMap];
     [_view clearKeys];
@@ -515,26 +618,62 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     [_window makeFirstResponder:_view];
 }
 
-// One row of the Instrument panel: a physical quantity of the design.
-struct Knob { const char* name; double GrandOptions::* field; double lo, hi; bool logScale; const char* format; };
+// ---- Instrument window ---------------------------------------------------------------
+// One adjustable quantity of the design. Every one is a physical number.
+struct Knob { int tab; const char* name; double GrandOptions::* field; double lo, hi; bool logScale; const char* format; const char* help; };
+enum { kSpace, kHammers, kStrings, kBoard, kTabCount };
+static const char* kTabNames[] = {"Space", "Hammers", "Strings", "Soundboard"};
 static const Knob kKnobs[] = {
-    {"Hammer felt hardness", &GrandOptions::hammerHardness, 0.25, 4.0, true, "x %.2f"},
-    {"Hammer mass", &GrandOptions::hammerMass, 0.5, 2.0, true, "x %.2f"},
-    {"Felt damping", &GrandOptions::feltDamping, 0.0, 4.0, false, "x %.2f"},
-    {"Strike point along string", &GrandOptions::strikePosition, 0.6, 1.6, false, "x %.2f"},
-    {"Unison detune", &GrandOptions::unisonDetuneCents, 0.0, 3.0, false, "%.2f cents"},
-    {"String internal loss", &GrandOptions::stringLoss, 0.3, 4.0, true, "x %.2f"},
-    {"Soundboard thickness", &GrandOptions::boardThickness, 0.6, 1.6, false, "x %.2f (8 mm)"},
-    {"Soundboard loss", &GrandOptions::boardLoss, 0.3, 4.0, true, "x %.2f"},
-    {"Rib height", &GrandOptions::ribHeight, 0.5, 1.6, false, "x %.2f (22 mm)"},
-    {"Key knock on keybed", &GrandOptions::keyThump, 0.0, 20.0, false, "x %.1f"},
-    {"Room size", &GrandOptions::roomSize, 0.5, 2.0, true, "x %.2f (9 x 7 x 4 m)"},
-    {"Room absorption", &GrandOptions::roomAbsorption, 0.05, 0.6, false, "%.2f"},
-    {"Lid angle", &GrandOptions::lidAngleDeg, 0.0, 60.0, false, "%.0f deg (0 = closed)"},
+    {kSpace, "Room length", &GrandOptions::roomLx, 3.0, 30.0, true, "%.1f m", "Along the keyboard direction."},
+    {kSpace, "Room width", &GrandOptions::roomLy, 3.0, 30.0, true, "%.1f m", "Along the strings."},
+    {kSpace, "Room height", &GrandOptions::roomLz, 2.2, 15.0, true, "%.1f m", ""},
+    {kSpace, "Wall absorption", &GrandOptions::roomAbsorption, 0.03, 0.7, true, "%.2f", "Share of sound each surface soaks up. Low is a tiled hall, high is a carpeted studio."},
+    {kSpace, "Ear height", &GrandOptions::earHeightM, 0.6, 2.5, false, "%.2f m", "Above the floor. The soundboard sits at 0.75 m."},
+    {kSpace, "Ear spacing", &GrandOptions::earSpacingM, 0.1, 1.5, false, "%.2f m", "A spaced pair; wider gives a wider image."},
+    {kSpace, "Lid angle", &GrandOptions::lidAngleDeg, 0.0, 60.0, false, "%.0f deg", "0 takes the lid's reflection away."},
+    {kHammers, "Felt hardness", &GrandOptions::hammerHardness, 0.2, 5.0, true, "x %.2f", "Felt stiffness. Harder is brighter."},
+    {kHammers, "Hammer mass", &GrandOptions::hammerMass, 0.5, 2.0, true, "x %.2f", "Heavier stays on the string longer: louder and duller."},
+    {kHammers, "Felt damping", &GrandOptions::feltDamping, 0.0, 5.0, false, "x %.2f", "Energy the felt loses as it is squeezed."},
+    {kHammers, "Strike point", &GrandOptions::strikePosition, 0.5, 1.8, false, "x %.2f", "Distance from the agraffe; the reference is about 1/8 of the string."},
+    {kHammers, "Key knock", &GrandOptions::keyThump, 0.0, 30.0, false, "x %.1f", "Knock of the key landing on the keybed."},
+    {kHammers, "Damper strength", &GrandOptions::damperStrength, 0.2, 4.0, true, "x %.2f", "How fast a released note is stopped."},
+    {kStrings, "Pitch of A4", &GrandOptions::a4Hz, 415.0, 466.0, false, "%.1f Hz", ""},
+    {kStrings, "Unison detune", &GrandOptions::unisonDetuneCents, 0.0, 6.0, false, "%.2f cents", "Spread between the strings of one note. More gives beating, then honky-tonk."},
+    {kStrings, "Internal loss", &GrandOptions::stringLoss, 0.25, 5.0, true, "x %.2f", "The string's own damping, apart from what the board takes."},
+    {kStrings, "Wire stiffness", &GrandOptions::stringStiffness, 0.25, 4.0, true, "x %.2f", "Bending stiffness. More makes the overtones sharper."},
+    {kStrings, "Bridge axis tilt", &GrandOptions::bridgeTiltDeg, 0.0, 30.0, false, "%.0f deg", "Couples sideways string motion to the board (needs sideways motion on)."},
+    {kBoard, "Thickness", &GrandOptions::boardThicknessMm, 5.0, 13.0, false, "%.1f mm", ""},
+    {kBoard, "Loss factor", &GrandOptions::boardLossPercent, 0.5, 8.0, true, "%.1f %%", "Internal damping of the wood."},
+    {kBoard, "Rib height", &GrandOptions::ribHeightMm, 10.0, 36.0, false, "%.0f mm", ""},
+    {kBoard, "Rib spacing", &GrandOptions::ribSpacingMm, 80.0, 220.0, false, "%.0f mm", ""},
+    {kBoard, "Crown radius", &GrandOptions::crownRadiusM, 6.0, 80.0, true, "%.0f m", "Smaller is a more domed, stiffer board."},
+    {kBoard, "Rim grip", &GrandOptions::rimClamp, 0.0, 1.0, false, "%.2f", "0: edge free to tilt. 1: edge clamped."},
+    {kBoard, "Bridge height", &GrandOptions::bridgeHeightMm, 20.0, 50.0, false, "%.0f mm", ""},
 };
 static const int kKnobCount = sizeof(kKnobs) / sizeof(kKnobs[0]);
+// Fields that have no slider but belong to a saved setup.
+static double GrandOptions::* const kPlanFields[] = {&GrandOptions::pianoX, &GrandOptions::pianoY, &GrandOptions::listenerX, &GrandOptions::listenerY};
 static double knobToSlider(const Knob& k, double v) { return k.logScale ? std::log(v / k.lo) / std::log(k.hi / k.lo) : (v - k.lo) / (k.hi - k.lo); }
 static double sliderToKnob(const Knob& k, double t) { return k.logScale ? k.lo * std::pow(k.hi / k.lo, t) : k.lo + t * (k.hi - k.lo); }
+
+struct Preset { const char* name; void (*apply)(GrandOptions&); };
+static const Preset kPresets[] = {
+    {"Recital room, listener by the lid", [](GrandOptions& o) { o = GrandOptions(); }},
+    {"At the keyboard", [](GrandOptions& o) { GrandOptions d; o.roomEnabled = true; o.roomLx = d.roomLx; o.roomLy = d.roomLy; o.roomLz = d.roomLz; o.roomAbsorption = d.roomAbsorption;
+                                              o.pianoX = d.pianoX; o.pianoY = d.pianoY; o.listenerX = d.pianoX + 0.70; o.listenerY = d.pianoY - 0.45; o.earHeightM = 1.2; o.earSpacingM = 0.18; }},
+    {"Small studio, close", [](GrandOptions& o) { o.roomEnabled = true; o.roomLx = 5.0; o.roomLy = 4.2; o.roomLz = 2.7; o.roomAbsorption = 0.40; o.pianoX = 1.2; o.pianoY = 1.3;
+                                                   o.listenerX = 3.6; o.listenerY = 1.9; o.earHeightM = 1.3; o.earSpacingM = 0.5; }},
+    {"Concert hall, tenth row", [](GrandOptions& o) { o.roomEnabled = true; o.roomLx = 28; o.roomLy = 18; o.roomLz = 12; o.roomAbsorption = 0.16; o.pianoX = 5.0; o.pianoY = 7.0;
+                                                       o.listenerX = 15.0; o.listenerY = 7.8; o.earHeightM = 1.2; o.earSpacingM = 0.3; }},
+    {"Stone chapel", [](GrandOptions& o) { o.roomEnabled = true; o.roomLx = 16; o.roomLy = 8; o.roomLz = 9; o.roomAbsorption = 0.06; o.pianoX = 4.0; o.pianoY = 2.5;
+                                            o.listenerX = 9.0; o.listenerY = 3.2; o.earHeightM = 1.2; o.earSpacingM = 0.4; }},
+    {"No room (open air), mics over the strings", [](GrandOptions& o) { o.roomEnabled = false; o.lidAngleDeg = 0; o.listenerX = o.pianoX + 0.70; o.listenerY = o.pianoY + 0.50; o.earHeightM = 1.65; o.earSpacingM = 0.7; }},
+    {"Voicing: bright", [](GrandOptions& o) { o.hammerHardness = 2.2; o.feltDamping = 0.6; o.hammerMass = 0.9; }},
+    {"Voicing: mellow", [](GrandOptions& o) { o.hammerHardness = 0.45; o.feltDamping = 1.6; o.hammerMass = 1.1; }},
+    {"Voicing: reference", [](GrandOptions& o) { GrandOptions d; o.hammerHardness = d.hammerHardness; o.feltDamping = d.feltDamping; o.hammerMass = d.hammerMass; o.strikePosition = d.strikePosition; }},
+    {"Honky-tonk tuning", [](GrandOptions& o) { o.unisonDetuneCents = 5.0; }},
+};
+static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
 
 - (void)refreshKnobs {
     for (int i = 0; i < kKnobCount; i++) {
@@ -542,20 +681,91 @@ static double sliderToKnob(const Knob& k, double t) { return k.logScale ? k.lo *
         _sliders[i].doubleValue = knobToSlider(kKnobs[i], v);
         _values[i].stringValue = [NSString stringWithFormat:@(kKnobs[i].format), v];
     }
+    _roomBox.state = gEngine.voicing.roomEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+    _stretchBox.state = gEngine.voicing.stretchTuning ? NSControlStateValueOn : NSControlStateValueOff;
+    _plan.needsDisplay = YES;
+}
+
+// Keep the piano and the listener inside the room after any change.
+- (void)fitToRoom {
+    GrandOptions& o = gEngine.voicing;
+    o.pianoX = std::clamp(o.pianoX, 0.2, std::max(0.2, o.roomLx - 1.6));
+    o.pianoY = std::clamp(o.pianoY, 0.8, std::max(0.8, o.roomLy - 1.7));
+    o.listenerX = std::clamp(o.listenerX, 0.3, o.roomLx - 0.3);
+    o.listenerY = std::clamp(o.listenerY, 0.3, o.roomLy - 0.3);
+    o.earHeightM = std::min(o.earHeightM, o.roomLz - 0.2);
+}
+
+- (void)applyVoicing {
+    [self fitToRoom];
+    [self refreshKnobs];
+    [self rebuild:nil];
 }
 
 // Sliders act when released: every change builds a new instrument.
 - (void)knobChanged:(NSSlider*)sender {
     const Knob& k = kKnobs[sender.tag];
     gEngine.voicing.*(k.field) = sliderToKnob(k, sender.doubleValue);
-    [self refreshKnobs];
-    [self rebuild:nil];
+    [self applyVoicing];
+}
+- (void)boxChanged:(id)sender {
+    gEngine.voicing.roomEnabled = _roomBox.state == NSControlStateValueOn;
+    gEngine.voicing.stretchTuning = _stretchBox.state == NSControlStateValueOn;
+    [self applyVoicing];
+}
+- (void)planChanged { [self applyVoicing]; }
+
+- (NSDictionary*)savedSetups { return [[NSUserDefaults standardUserDefaults] dictionaryForKey:@"setups"] ?: @{}; }
+
+- (void)fillPresetMenu {
+    [_presetMenu removeAllItems];
+    [_presetMenu addItemWithTitle:@"Presets"];
+    for (int i = 0; i < kPresetCount; i++) [_presetMenu addItemWithTitle:@(kPresets[i].name)];
+    NSArray* saved = [[[self savedSetups] allKeys] sortedArrayUsingSelector:@selector(compare:)];
+    if (saved.count) [_presetMenu.menu addItem:[NSMenuItem separatorItem]];
+    for (NSString* name in saved) [_presetMenu addItemWithTitle:[@"Saved: " stringByAppendingString:name]];
+    [_presetMenu.menu addItem:[NSMenuItem separatorItem]];
+    [_presetMenu addItemWithTitle:@"Save current setup..."];
+    [_presetMenu addItemWithTitle:@"Reset everything"];
 }
 
-- (void)resetKnobs:(id)sender {
-    gEngine.voicing = GrandOptions();
-    [self refreshKnobs];
-    [self rebuild:nil];
+- (void)presetChosen:(id)sender {
+    NSString* title = _presetMenu.titleOfSelectedItem;
+    NSInteger idx = _presetMenu.indexOfSelectedItem;
+    GrandOptions& o = gEngine.voicing;
+    if (idx >= 1 && idx <= kPresetCount) {
+        kPresets[idx - 1].apply(o);
+    } else if ([title hasPrefix:@"Saved: "]) {
+        NSDictionary* d = [self savedSetups][[title substringFromIndex:7]];
+        for (int i = 0; i < kKnobCount; i++) if (d[@(kKnobs[i].name)]) o.*(kKnobs[i].field) = [d[@(kKnobs[i].name)] doubleValue];
+        const char* planNames[] = {"pianoX", "pianoY", "listenerX", "listenerY"};
+        for (int i = 0; i < 4; i++) if (d[@(planNames[i])]) o.*(kPlanFields[i]) = [d[@(planNames[i])] doubleValue];
+        if (d[@"room"]) o.roomEnabled = [d[@"room"] boolValue];
+        if (d[@"stretch"]) o.stretchTuning = [d[@"stretch"] boolValue];
+    } else if ([title isEqualToString:@"Reset everything"]) {
+        o = GrandOptions();
+    } else if ([title hasPrefix:@"Save current"]) {
+        NSAlert* alert = [NSAlert new];
+        alert.messageText = @"Save this setup as";
+        NSTextField* field = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 240, 24)];
+        alert.accessoryView = field;
+        [alert addButtonWithTitle:@"Save"];
+        [alert addButtonWithTitle:@"Cancel"];
+        if ([alert runModal] == NSAlertFirstButtonReturn && field.stringValue.length) {
+            NSMutableDictionary* d = [NSMutableDictionary new];
+            for (int i = 0; i < kKnobCount; i++) d[@(kKnobs[i].name)] = @(o.*(kKnobs[i].field));
+            const char* planNames[] = {"pianoX", "pianoY", "listenerX", "listenerY"};
+            for (int i = 0; i < 4; i++) d[@(planNames[i])] = @(o.*(kPlanFields[i]));
+            d[@"room"] = @(o.roomEnabled); d[@"stretch"] = @(o.stretchTuning);
+            NSMutableDictionary* all = [[self savedSetups] mutableCopy];
+            all[field.stringValue] = d;
+            [[NSUserDefaults standardUserDefaults] setObject:all forKey:@"setups"];
+        }
+        [self fillPresetMenu];
+        return;
+    }
+    [_presetMenu selectItemAtIndex:0];
+    [self applyVoicing];
 }
 
 - (void)showPanel:(id)sender {
@@ -564,41 +774,84 @@ static double sliderToKnob(const Knob& k, double t) { return k.logScale ? k.lo *
 }
 
 - (void)buildPanel {
-    if (!_panel) {
-        CGFloat h = 60 + 30 * kKnobCount;
-        _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 560, h)
-                                            styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
-                                              backing:NSBackingStoreBuffered defer:NO];
-        _panel.title = @"Instrument";
-        _panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
-        _panel.floatingPanel = YES;
-        _panel.releasedWhenClosed = NO;
-        _sliders = [NSMutableArray new];
-        _values = [NSMutableArray new];
-        for (int i = 0; i < kKnobCount; i++) {
-            CGFloat y = h - 36 - 30 * i;
-            NSTextField* name = [NSTextField labelWithString:@(kKnobs[i].name)];
-            name.frame = NSMakeRect(16, y, 170, 18);
-            NSSlider* sl = [NSSlider sliderWithValue:0 minValue:0 maxValue:1 target:self action:@selector(knobChanged:)];
-            sl.frame = NSMakeRect(190, y - 2, 200, 22);
-            sl.tag = i;
-            sl.continuous = NO;
-            NSTextField* val = [NSTextField labelWithString:@""];
-            val.frame = NSMakeRect(398, y, 156, 18);
-            val.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
-            [_panel.contentView addSubview:name];
-            [_panel.contentView addSubview:sl];
-            [_panel.contentView addSubview:val];
-            [_sliders addObject:sl];
-            [_values addObject:val];
-        }
-        NSButton* reset = [NSButton buttonWithTitle:@"Reset to reference" target:self action:@selector(resetKnobs:)];
-        reset.frame = NSMakeRect(12, 10, 160, 28);
-        [_panel.contentView addSubview:reset];
-        [self refreshKnobs];
-        NSRect f = _window.frame;
-        [_panel setFrameOrigin:NSMakePoint(NSMaxX(f) + 8, NSMaxY(f) - _panel.frame.size.height)];
+    if (_panel) return;
+    const CGFloat W = 600, H = 620;
+    _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, W, H)
+                                        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
+                                          backing:NSBackingStoreBuffered defer:NO];
+    _panel.title = @"Instrument";
+    _panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    _panel.floatingPanel = YES;
+    _panel.releasedWhenClosed = NO;
+    _sliders = [NSMutableArray new];
+    _values = [NSMutableArray new];
+
+    _presetMenu = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(14, H - 40, 330, 26) pullsDown:NO];
+    _presetMenu.target = self; _presetMenu.action = @selector(presetChosen:);
+    [self fillPresetMenu];
+    [_panel.contentView addSubview:_presetMenu];
+    NSTextField* hint = [NSTextField labelWithString:@"Changes apply when you let go."];
+    hint.textColor = [NSColor secondaryLabelColor];
+    hint.font = [NSFont systemFontOfSize:11];
+    hint.frame = NSMakeRect(356, H - 36, 230, 16);
+    [_panel.contentView addSubview:hint];
+
+    NSTabView* tabs = [[NSTabView alloc] initWithFrame:NSMakeRect(6, 6, W - 12, H - 52)];
+    [_panel.contentView addSubview:tabs];
+    NSView* pages[kTabCount];
+    CGFloat rowY[kTabCount];
+    for (int t = 0; t < kTabCount; t++) {
+        NSTabViewItem* item = [[NSTabViewItem alloc] initWithIdentifier:@(t)];
+        item.label = @(kTabNames[t]);
+        pages[t] = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, W - 40, H - 100)];
+        item.view = pages[t];
+        [tabs addTabViewItem:item];
+        rowY[t] = H - 140;
     }
+    // Space tab: the plan on top, then the room switch.
+    _plan = [[RoomPlanView alloc] initWithFrame:NSMakeRect(10, H - 100 - 262, W - 60, 254)];
+    __weak AppDelegate* me = self;
+    _plan.changed = ^{ [me planChanged]; };
+    [pages[kSpace] addSubview:_plan];
+    _roomBox = [NSButton checkboxWithTitle:@"Room (walls, floor, ceiling, reverberation)" target:self action:@selector(boxChanged:)];
+    _roomBox.frame = NSMakeRect(12, H - 100 - 290, 400, 20);
+    [pages[kSpace] addSubview:_roomBox];
+    rowY[kSpace] = H - 100 - 322;
+    _stretchBox = [NSButton checkboxWithTitle:@"Stretch tuning (octaves tuned by matching overtones)" target:self action:@selector(boxChanged:)];
+    _stretchBox.frame = NSMakeRect(12, rowY[kStrings], 420, 20);
+    [pages[kStrings] addSubview:_stretchBox];
+    rowY[kStrings] -= 34;
+
+    for (int i = 0; i < kKnobCount; i++) {
+        const Knob& k = kKnobs[i];
+        CGFloat y = rowY[k.tab];
+        rowY[k.tab] -= k.tab == kSpace ? 27 : 44;
+        NSTextField* name = [NSTextField labelWithString:@(k.name)];
+        name.frame = NSMakeRect(12, y, 130, 18);
+        NSSlider* sl = [NSSlider sliderWithValue:0 minValue:0 maxValue:1 target:self action:@selector(knobChanged:)];
+        sl.frame = NSMakeRect(146, y - 2, 270, 22);
+        sl.tag = i;
+        sl.continuous = NO;
+        sl.toolTip = @(k.help);
+        NSTextField* val = [NSTextField labelWithString:@""];
+        val.frame = NSMakeRect(426, y, 120, 18);
+        val.font = [NSFont monospacedDigitSystemFontOfSize:12 weight:NSFontWeightRegular];
+        [pages[k.tab] addSubview:name];
+        [pages[k.tab] addSubview:sl];
+        [pages[k.tab] addSubview:val];
+        if (k.tab != kSpace && strlen(k.help)) {
+            NSTextField* help = [NSTextField labelWithString:@(k.help)];
+            help.textColor = [NSColor secondaryLabelColor];
+            help.font = [NSFont systemFontOfSize:10.5];
+            help.frame = NSMakeRect(148, y - 18, 400, 14);
+            [pages[k.tab] addSubview:help];
+        }
+        [_sliders addObject:sl];
+        [_values addObject:val];
+    }
+    [self refreshKnobs];
+    NSRect f = _window.frame;
+    [_panel setFrameOrigin:NSMakePoint(NSMaxX(f) + 8, NSMaxY(f) - _panel.frame.size.height)];
 }
 
 - (NSPanel*)panel { return _panel; }
@@ -638,10 +891,6 @@ static double sliderToKnob(const Knob& k, double t) { return k.logScale ? k.lo *
     [_gridMenu selectItemAtIndex:2];
     _gridMenu.target = self; _gridMenu.action = @selector(rebuild:);
     [_view addSubview:_gridMenu];
-    _listenerMenu = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(820, 370, 182, 26) pullsDown:NO];
-    [_listenerMenu addItemsWithTitles:@[@"Listener: in the room", @"Listener: at the keys", @"No room, lid off"]];
-    _listenerMenu.target = self; _listenerMenu.action = @selector(rebuild:);
-    [_view addSubview:_listenerMenu];
     _sidewaysBox = [NSButton checkboxWithTitle:@"Sideways string motion (2x string cost)" target:self action:@selector(rebuild:)];
     _sidewaysBox.frame = NSMakeRect(468, 372, 340, 20);
     _sidewaysBox.contentTintColor = [NSColor whiteColor];
@@ -707,8 +956,7 @@ static int selfTest(const char* png) {
     BOOL audio = [d openAudio];  // opened but never started, so helpers get the real thread group and nothing sounds
     PianoView* view = [d setUp];  // window is built but never shown
     // Rebuild the engine the way the grid and string controls do.
-    for (double g : {1.0, 1.25, 1.5}) { gEngine.gridScale = g; gEngine.sideways = g == 1.25; gEngine.listener = g == 1.0 ? 1 : 2; gEngine.build(); [view rebuildMap]; }
-    gEngine.listener = 0;
+    for (double g : {1.0, 1.25, 1.5}) { gEngine.gridScale = g; gEngine.sideways = g == 1.25; gEngine.build(); [view rebuildMap]; }
     gEngine.sideways = false;
     gEngine.build(); [view rebuildMap];
     printf("selftest: engine rebuilt 4 times, audio device %s, thread group %s\n", audio ? "opened" : "unavailable", gEngine.workgroup ? "joined" : "none");
@@ -724,13 +972,25 @@ static int selfTest(const char* png) {
     NSBitmapImageRep* rep = [view bitmapImageRepForCachingDisplayInRect:view.bounds];
     [view cacheDisplayInRect:view.bounds toBitmapImageRep:rep];
     [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:@(png) atomically:YES];
-    {   // The Instrument panel, built but not shown on screen.
-        gEngine.voicing.hammerHardness = 2.0;
+    {   // The Instrument window, built but not shown on screen: one picture per tab.
         [d buildPanel];
         NSView* pv = [d panel].contentView;
-        NSBitmapImageRep* pr = [pv bitmapImageRepForCachingDisplayInRect:pv.bounds];
-        [pv cacheDisplayInRect:pv.bounds toBitmapImageRep:pr];
-        [[pr representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[@(png) stringByReplacingOccurrencesOfString:@".png" withString:@"_panel.png"] atomically:YES];
+        NSTabView* tabs = nil;
+        for (NSView* v in pv.subviews) if ([v isKindOfClass:[NSTabView class]]) tabs = (NSTabView*)v;
+        for (int t = 0; t < kTabCount; t++) {
+            [tabs selectTabViewItemAtIndex:t];
+            [pv layoutSubtreeIfNeeded];
+            NSBitmapImageRep* outRep = [pv bitmapImageRepForCachingDisplayInRect:pv.bounds];
+            NSGraphicsContext* gc = [NSGraphicsContext graphicsContextWithBitmapImageRep:outRep];
+            [NSGraphicsContext saveGraphicsState];
+            [NSGraphicsContext setCurrentContext:gc];
+            [[NSColor colorWithWhite:0.16 alpha:1] setFill];
+            NSRectFill(pv.bounds);
+            [NSGraphicsContext restoreGraphicsState];
+            [pv cacheDisplayInRect:pv.bounds toBitmapImageRep:outRep];
+            NSString* path = [@(png) stringByReplacingOccurrencesOfString:@".png" withString:[NSString stringWithFormat:@"_panel%d.png", t]];
+            [[outRep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:path atomically:YES];
+        }
     }
     printf("selftest: engine load mean %.0f %%, worst block %.0f %%\n", gEngine.load.load() * 100, gEngine.loadPeak.load() * 100);
     printf("selftest: 8 s of the first demo rendered through the callback path, peak %.3f, awake %d, wrote %s\n", peak, gEngine.piano->awakeStrings(), png);

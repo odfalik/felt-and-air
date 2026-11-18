@@ -25,11 +25,17 @@ PianoDesign makeGrand(const GrandOptions& o) {
     b.outline = {{0, 0},       {1.40, 0},    {1.40, 0.42}, {1.33, 0.62}, {1.20, 0.82},
                  {1.02, 1.02}, {0.82, 1.22}, {0.62, 1.38}, {0.45, 1.50}, {0, 1.50}};
     b.grainAngle = 130.0 * M_PI / 180.0;  // roughly parallel to the long bridge
-    b.thickness *= o.boardThickness;
-    b.lossFactor *= o.boardLoss;
-    b.ribHeight *= o.ribHeight;
-    d.room.Lx *= o.roomSize; d.room.Ly *= o.roomSize; d.room.Lz *= std::sqrt(o.roomSize);
-    d.room.pianoX *= o.roomSize; d.room.pianoY *= o.roomSize;
+    b.thickness = o.boardThicknessMm * 1e-3;
+    b.lossFactor = o.boardLossPercent * 1e-2;
+    b.ribHeight = o.ribHeightMm * 1e-3;
+    b.ribSpacing = o.ribSpacingMm * 1e-3;
+    b.crownRadius = o.crownRadiusM;
+    b.rimClamp = o.rimClamp;
+    b.bridgeHeight = o.bridgeHeightMm * 1e-3;
+    d.damperStrength = o.damperStrength;
+    d.room.enabled = o.roomEnabled;
+    d.room.Lx = o.roomLx; d.room.Ly = o.roomLy; d.room.Lz = o.roomLz;
+    d.room.pianoX = o.pianoX; d.room.pianoY = o.pianoY;
     d.room.absorption = o.roomAbsorption;
     d.lid.open = o.lidAngleDeg > 1;
     d.lid.angleDeg = o.lidAngleDeg;
@@ -59,7 +65,7 @@ PianoDesign makeGrand(const GrandOptions& o) {
 
     // The wire of one key, before tuning: length, mass and stiffness follow from the scale
     // design at the nominal pitch.
-    auto equal = [](int key) { return 440.0 * std::pow(2.0, (key - 49) / 12.0); };
+    auto equal = [&](int key) { return o.a4Hz * std::pow(2.0, (key - 49) / 12.0); };
     auto wire = [&](int key) {
         StringDesign s;
         double f0 = equal(key);
@@ -69,13 +75,13 @@ PianoDesign makeGrand(const GrandOptions& o) {
             s.T = lerp(750, 1000, t);
             s.rhoA = s.T / std::pow(2 * s.L * f0, 2);
             double core = lerp(1.0e-3, 1.5e-3, t);
-            s.EI = steelE * M_PI * std::pow(core, 4) / 64.0;
+            s.EI = steelE * M_PI * std::pow(core, 4) / 64.0 * o.stringStiffness;
         } else {
             s.L = plainLength(key);
             s.T = 720;
             s.rhoA = s.T / std::pow(2 * s.L * f0, 2);
             double dia = std::sqrt(4 * s.rhoA / (M_PI * steelRho));
-            s.EI = steelE * M_PI * std::pow(dia, 4) / 64.0;
+            s.EI = steelE * M_PI * std::pow(dia, 4) / 64.0 * o.stringStiffness;
         }
         return s;
     };
@@ -149,12 +155,15 @@ PianoDesign makeGrand(const GrandOptions& o) {
         d.notes.push_back(n);
     }
 
-    if (o.playerPerspective) {  // seated at the keyboard
-        d.ears[0] = {0.61, -0.45, 0.45};
-        d.ears[1] = {0.79, -0.45, 0.45};
-    } else {  // a listener two metres off the treble side, facing the open lid
-        d.ears[0] = {3.4, 0.45, 0.45};
-        d.ears[1] = {3.4, 0.95, 0.45};
+    // Ears: a spaced pair centred on the listener, turned to face the middle of the board.
+    {
+        double hx = o.listenerX - o.pianoX, hy = o.listenerY - o.pianoY;  // head, piano coordinates
+        double fx = 0.70 - hx, fy = 0.60 - hy, len = std::hypot(fx, fy);
+        if (len < 1e-6) { fx = 0; fy = 1; len = 1; }
+        fx /= len; fy /= len;
+        double z = o.earHeightM - d.room.boardHeight, half = 0.5 * o.earSpacingM;
+        d.ears[0] = {hx - fy * half, hy + fx * half, z};  // left ear is to the left of the facing direction
+        d.ears[1] = {hx + fy * half, hy - fx * half, z};
     }
     return d;
 }
