@@ -139,7 +139,7 @@ struct GrandOptions {
     bool duplex = true;              // free string lengths behind the bridge in the treble
     bool dampedStringsRing = true;   // damped strings stay in the simulation
     double downbearingDeg = 1.5;     // angle the strings make over the bridge, each side
-    bool twoPolarisations = true;
+    bool twoPolarisations = false;   // sideways string motion; doubles the string work
     double bridgeTiltDeg = 6.0;      // assumed; see docs/MODEL.md
     double hammerTiltDeg = 4.0;      // assumed
 

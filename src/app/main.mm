@@ -55,7 +55,6 @@ struct Engine {
     std::atomic<bool> mute{false};  // write silence (used to measure on the real audio thread without sound)
     double sampleRate = 48000, gridScale = 1.5;
     os_workgroup_t workgroup = nullptr;  // the audio device's realtime thread group
-    bool sideways = false;
     GrandOptions voicing;  // what the Instrument window edits
     double lastPedal = 0;
     int framesSinceSnap = 0;
@@ -89,7 +88,6 @@ struct Engine {
 
     void build() {
         GrandOptions g = voicing;
-        g.twoPolarisations = sideways;
         design = makeGrand(g);
         PianoOptions o;
         o.sampleRate = sampleRate;
@@ -553,15 +551,13 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     NSTimer* _timer;
     NSButton* _audioButton;
     NSButton* _playButton;
-    NSButton* _sidewaysBox;
     NSPopUpButton* _demoMenu;
     NSPopUpButton* _gridMenu;
     NSPanel* _panel;
     NSMutableArray<NSSlider*>* _sliders;
     NSMutableArray<NSTextField*>* _values;
     NSPopUpButton* _presetMenu;
-    NSButton* _roomBox;
-    NSButton* _stretchBox;
+    NSMutableArray<NSButton*>* _boxes;
     RoomPlanView* _plan;
     NSSlider* _volume;
 }
@@ -610,7 +606,6 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     if (was) [self toggleAudio:nil];
     const double scales[] = {1.0, 1.25, 1.5};
     gEngine.gridScale = scales[std::clamp((int)_gridMenu.indexOfSelectedItem, 0, 2)];
-    gEngine.sideways = _sidewaysBox.state == NSControlStateValueOn;
     gEngine.build();
     [_view rebuildMap];
     [_view clearKeys];
@@ -636,11 +631,15 @@ static const Knob kKnobs[] = {
     {kHammers, "Felt damping", &GrandOptions::feltDamping, 0.0, 5.0, false, "x %.2f", "Energy the felt loses as it is squeezed."},
     {kHammers, "Strike point", &GrandOptions::strikePosition, 0.5, 1.8, false, "x %.2f", "Distance from the agraffe; the reference is about 1/8 of the string."},
     {kHammers, "Key knock", &GrandOptions::keyThump, 0.0, 30.0, false, "x %.1f", "Knock of the key landing on the keybed."},
+    {kHammers, "Shank springiness", &GrandOptions::shankHz, 80.0, 2000.0, true, "%.0f Hz", "The wooden shank flexes at impact. High is a rigid hammer."},
     {kHammers, "Damper strength", &GrandOptions::damperStrength, 0.2, 4.0, true, "x %.2f", "How fast a released note is stopped."},
+    {kHammers, "Damper weight", &GrandOptions::damperPressN, 0.0, 0.6, false, "%.2f N", "Force each damper rests on its string with. Lifting it lets the string stir."},
+    {kHammers, "Pedal and key noise", &GrandOptions::mechanismNoise, 0.0, 10.0, false, "x %.1f", "Knocks and friction of the pedal work and returning keys."},
     {kStrings, "Pitch of A4", &GrandOptions::a4Hz, 415.0, 466.0, false, "%.1f Hz", ""},
     {kStrings, "Unison detune", &GrandOptions::unisonDetuneCents, 0.0, 6.0, false, "%.2f cents", "Spread between the strings of one note. More gives beating, then honky-tonk."},
     {kStrings, "Internal loss", &GrandOptions::stringLoss, 0.25, 5.0, true, "x %.2f", "The string's own damping, apart from what the board takes."},
     {kStrings, "Wire stiffness", &GrandOptions::stringStiffness, 0.25, 4.0, true, "x %.2f", "Bending stiffness. More makes the overtones sharper."},
+    {kStrings, "Downbearing angle", &GrandOptions::downbearingDeg, 0.0, 5.0, false, "%.1f deg", "Bend of the strings over the bridge; sets how hard stretching presses on the board."},
     {kStrings, "Bridge axis tilt", &GrandOptions::bridgeTiltDeg, 0.0, 30.0, false, "%.0f deg", "Couples sideways string motion to the board (needs sideways motion on)."},
     {kBoard, "Thickness", &GrandOptions::boardThicknessMm, 5.0, 13.0, false, "%.1f mm", ""},
     {kBoard, "Loss factor", &GrandOptions::boardLossPercent, 0.5, 8.0, true, "%.1f %%", "Internal damping of the wood."},
@@ -655,6 +654,18 @@ static const int kKnobCount = sizeof(kKnobs) / sizeof(kKnobs[0]);
 static double GrandOptions::* const kPlanFields[] = {&GrandOptions::pianoX, &GrandOptions::pianoY, &GrandOptions::listenerX, &GrandOptions::listenerY};
 static double knobToSlider(const Knob& k, double v) { return k.logScale ? std::log(v / k.lo) / std::log(k.hi / k.lo) : (v - k.lo) / (k.hi - k.lo); }
 static double sliderToKnob(const Knob& k, double t) { return k.logScale ? k.lo * std::pow(k.hi / k.lo, t) : k.lo + t * (k.hi - k.lo); }
+
+struct Toggle { int tab; const char* name; bool GrandOptions::* field; };
+static const Toggle kToggles[] = {
+    {kSpace, "Room (walls, floor, ceiling, reverberation)", &GrandOptions::roomEnabled},
+    {kStrings, "Stretch tuning (octaves tuned by matching overtones)", &GrandOptions::stretchTuning},
+    {kStrings, "Longitudinal motion (stretching: phantom partials, bass ring)", &GrandOptions::longitudinal},
+    {kStrings, "Duplex lengths behind the bridge (treble shimmer)", &GrandOptions::duplex},
+    {kStrings, "Damped strings keep ringing faintly (needed for the pedal stir)", &GrandOptions::dampedStringsRing},
+    {kStrings, "Sideways string motion (doubles the string work)", &GrandOptions::twoPolarisations},
+    {kBoard, "Air loading (the air's mass and drag on the board)", &GrandOptions::airLoading},
+};
+static const int kToggleCount = sizeof(kToggles) / sizeof(kToggles[0]);
 
 struct Preset { const char* name; void (*apply)(GrandOptions&); };
 static const Preset kPresets[] = {
@@ -681,8 +692,7 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
         _sliders[i].doubleValue = knobToSlider(kKnobs[i], v);
         _values[i].stringValue = [NSString stringWithFormat:@(kKnobs[i].format), v];
     }
-    _roomBox.state = gEngine.voicing.roomEnabled ? NSControlStateValueOn : NSControlStateValueOff;
-    _stretchBox.state = gEngine.voicing.stretchTuning ? NSControlStateValueOn : NSControlStateValueOff;
+    for (int i = 0; i < kToggleCount; i++) _boxes[i].state = gEngine.voicing.*(kToggles[i].field) ? NSControlStateValueOn : NSControlStateValueOff;
     _plan.needsDisplay = YES;
 }
 
@@ -709,8 +719,7 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
     [self applyVoicing];
 }
 - (void)boxChanged:(id)sender {
-    gEngine.voicing.roomEnabled = _roomBox.state == NSControlStateValueOn;
-    gEngine.voicing.stretchTuning = _stretchBox.state == NSControlStateValueOn;
+    for (int i = 0; i < kToggleCount; i++) gEngine.voicing.*(kToggles[i].field) = _boxes[i].state == NSControlStateValueOn;
     [self applyVoicing];
 }
 - (void)planChanged { [self applyVoicing]; }
@@ -740,8 +749,7 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
         for (int i = 0; i < kKnobCount; i++) if (d[@(kKnobs[i].name)]) o.*(kKnobs[i].field) = [d[@(kKnobs[i].name)] doubleValue];
         const char* planNames[] = {"pianoX", "pianoY", "listenerX", "listenerY"};
         for (int i = 0; i < 4; i++) if (d[@(planNames[i])]) o.*(kPlanFields[i]) = [d[@(planNames[i])] doubleValue];
-        if (d[@"room"]) o.roomEnabled = [d[@"room"] boolValue];
-        if (d[@"stretch"]) o.stretchTuning = [d[@"stretch"] boolValue];
+        for (int i = 0; i < kToggleCount; i++) if (d[@(kToggles[i].name)]) o.*(kToggles[i].field) = [d[@(kToggles[i].name)] boolValue];
     } else if ([title isEqualToString:@"Reset everything"]) {
         o = GrandOptions();
     } else if ([title hasPrefix:@"Save current"]) {
@@ -756,7 +764,7 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
             for (int i = 0; i < kKnobCount; i++) d[@(kKnobs[i].name)] = @(o.*(kKnobs[i].field));
             const char* planNames[] = {"pianoX", "pianoY", "listenerX", "listenerY"};
             for (int i = 0; i < 4; i++) d[@(planNames[i])] = @(o.*(kPlanFields[i]));
-            d[@"room"] = @(o.roomEnabled); d[@"stretch"] = @(o.stretchTuning);
+            for (int i = 0; i < kToggleCount; i++) d[@(kToggles[i].name)] = @(o.*(kToggles[i].field));
             NSMutableDictionary* all = [[self savedSetups] mutableCopy];
             all[field.stringValue] = d;
             [[NSUserDefaults standardUserDefaults] setObject:all forKey:@"setups"];
@@ -813,19 +821,22 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
     __weak AppDelegate* me = self;
     _plan.changed = ^{ [me planChanged]; };
     [pages[kSpace] addSubview:_plan];
-    _roomBox = [NSButton checkboxWithTitle:@"Room (walls, floor, ceiling, reverberation)" target:self action:@selector(boxChanged:)];
-    _roomBox.frame = NSMakeRect(12, H - 100 - 290, 400, 20);
-    [pages[kSpace] addSubview:_roomBox];
-    rowY[kSpace] = H - 100 - 322;
-    _stretchBox = [NSButton checkboxWithTitle:@"Stretch tuning (octaves tuned by matching overtones)" target:self action:@selector(boxChanged:)];
-    _stretchBox.frame = NSMakeRect(12, rowY[kStrings], 420, 20);
-    [pages[kStrings] addSubview:_stretchBox];
-    rowY[kStrings] -= 34;
+    rowY[kSpace] = H - 100 - 290;
+    _boxes = [NSMutableArray new];
+    for (int i = 0; i < kToggleCount; i++) {
+        const Toggle& t = kToggles[i];
+        NSButton* box = [NSButton checkboxWithTitle:@(t.name) target:self action:@selector(boxChanged:)];
+        box.frame = NSMakeRect(12, rowY[t.tab], 520, 20);
+        [pages[t.tab] addSubview:box];
+        [_boxes addObject:box];
+        rowY[t.tab] -= 24;
+    }
+    for (int t = 0; t < kTabCount; t++) rowY[t] -= 8;
 
     for (int i = 0; i < kKnobCount; i++) {
         const Knob& k = kKnobs[i];
         CGFloat y = rowY[k.tab];
-        rowY[k.tab] -= k.tab == kSpace ? 27 : 44;
+        rowY[k.tab] -= k.tab == kSpace ? 27 : (k.tab == kHammers ? 40 : 42);
         NSTextField* name = [NSTextField labelWithString:@(k.name)];
         name.frame = NSMakeRect(12, y, 130, 18);
         NSSlider* sl = [NSSlider sliderWithValue:0 minValue:0 maxValue:1 target:self action:@selector(knobChanged:)];
@@ -843,7 +854,7 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
             NSTextField* help = [NSTextField labelWithString:@(k.help)];
             help.textColor = [NSColor secondaryLabelColor];
             help.font = [NSFont systemFontOfSize:10.5];
-            help.frame = NSMakeRect(148, y - 18, 400, 14);
+            help.frame = NSMakeRect(148, y - 18, 420, 14);
             [pages[k.tab] addSubview:help];
         }
         [_sliders addObject:sl];
@@ -891,10 +902,6 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
     [_gridMenu selectItemAtIndex:2];
     _gridMenu.target = self; _gridMenu.action = @selector(rebuild:);
     [_view addSubview:_gridMenu];
-    _sidewaysBox = [NSButton checkboxWithTitle:@"Sideways string motion (2x string cost)" target:self action:@selector(rebuild:)];
-    _sidewaysBox.frame = NSMakeRect(468, 372, 340, 20);
-    _sidewaysBox.contentTintColor = [NSColor whiteColor];
-    [_view addSubview:_sidewaysBox];
 }
 
 - (void)openMIDI {
@@ -956,8 +963,8 @@ static int selfTest(const char* png) {
     BOOL audio = [d openAudio];  // opened but never started, so helpers get the real thread group and nothing sounds
     PianoView* view = [d setUp];  // window is built but never shown
     // Rebuild the engine the way the grid and string controls do.
-    for (double g : {1.0, 1.25, 1.5}) { gEngine.gridScale = g; gEngine.sideways = g == 1.25; gEngine.build(); [view rebuildMap]; }
-    gEngine.sideways = false;
+    for (double g : {1.0, 1.25, 1.5}) { gEngine.gridScale = g; gEngine.voicing.twoPolarisations = g == 1.25; gEngine.build(); [view rebuildMap]; }
+    gEngine.voicing.twoPolarisations = false;
     gEngine.build(); [view rebuildMap];
     printf("selftest: engine rebuilt 4 times, audio device %s, thread group %s\n", audio ? "opened" : "unavailable", gEngine.workgroup ? "joined" : "none");
     printf("selftest: %zu demo recordings loaded\n", gEngine.demos.size());
@@ -999,13 +1006,14 @@ static int selfTest(const char* png) {
 
 // Measures the engine on the real audio thread, with the output forced to silence.
 static int loadTest(int demo, double seconds, double grid, bool sideways) {
+    gEngine.voicing.twoPolarisations = sideways;
     [NSApplication sharedApplication];
     AppDelegate* d = [AppDelegate new];
     gEngine.mute = true;
-    gEngine.gridScale = grid; gEngine.sideways = sideways;
+    gEngine.gridScale = grid;
     if (![d openAudio]) { printf("loadtest: no audio device\n"); return 1; }
     [d setUp];
-    gEngine.gridScale = grid; gEngine.sideways = sideways;
+    gEngine.gridScale = grid;
     gEngine.build();
     [d toggleAudio:nil];
     gEngine.uiEvents.push({4, demo, 0});
