@@ -65,7 +65,7 @@ Counted in processor cycles, which do not depend on how busy the machine is. One
 | 1.5x (45 x 23 mm) | 1,635 | 41 % | 48 % | 96 % |
 
 These figures predate the second polarisation, which doubles the string work: at 1.25x a
-six-note chord is now about 66 % and pedal down about 160 %. The app defaults to 1.25x. **Pedal down with every string ringing does not fit in one core
+six-note chord is now about 72 % and pedal down about 167 %. The app defaults to 1.25x. **Pedal down with every string ringing does not fit in one core
 at any setting.** Sustained thermal behaviour on the fanless Air has not been measured.
 
 Single precision was tried and rejected for now: it saves about 27 % but adds noise at
