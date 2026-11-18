@@ -8,7 +8,7 @@ FAST     := -DPP_PLATE_REAL=float -DPP_STRING_REAL=float
 FAST_OBJ := $(patsubst src/core/%.cpp,build/fast/%.o,$(CORE_SRC))
 
 .PHONY: all test clean app
-all: build/tests build/render build/bench build/render-fast build/bench-fast app
+all: build/tests build/render build/bench build/report build/render-fast build/bench-fast app
 
 build/core/%.o: src/core/%.cpp $(CORE_HDR)
 	@mkdir -p build/core
@@ -24,6 +24,8 @@ build/bench-fast: src/tools/bench.cpp $(FAST_OBJ)
 build/tests: tests/tests.cpp $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 build/render: src/tools/render.cpp $(CORE_OBJ)
+	$(CXX) $(CXXFLAGS) $^ -o $@
+build/report: src/tools/report.cpp $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 build/bench: src/tools/bench.cpp $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@

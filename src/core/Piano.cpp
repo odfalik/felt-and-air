@@ -29,6 +29,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     std::fill(noteOfMidi_, noteOfMidi_ + 128, -1);
 
     std::vector<Attachment> att;
+    std::vector<double> endScale;
     int offset = 0, maxN = 0;
     for (const NoteDesign& nd : d.notes) {
         NoteRT n;
@@ -112,11 +113,32 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
             if (s.dmp0 >= s.dmp1) s.hasDamper = false;
             s.dampRate = s.dampTarget = s.hasDamper ? dampMax_ : 0.0;
 
+            s.bridge = sd.bridge;
             s.off = offset + 1;
             offset += N + 3;
             maxN = std::max(maxN, N);
-            if (s.attached) att.push_back({sd.bridge, 0.5 * s.mNode, s.z0});
             strings_.push_back(s);
+        }
+        // Second polarisation: the same string moving parallel to the soundboard. The bridge
+        // yields along one tilted axis, so the upright motion sees cos(tilt) of it and the
+        // sideways motion sin(tilt). The interpolation weights carry that factor (set below).
+        n.twin = nd.twoPolarisations;
+        n.total = n.count * (n.twin ? 2 : 1);
+        for (int i = 0; i < n.count; i++) strings_[n.first + i].hamW = n.twin ? std::cos(nd.hammerTilt) : 1.0;
+        if (n.twin)
+            for (int i = 0; i < n.count; i++) {
+                StringRT t = strings_[n.first + i];
+                t.hamW = std::sin(nd.hammerTilt);
+                t.off = offset + 1;
+                offset += t.N + 3;
+                strings_.push_back(t);
+            }
+        for (int i = 0; i < n.total; i++) {
+            const StringDesign& sd = nd.strings[i % n.count];
+            const StringRT& s = strings_[n.first + i];
+            double es = !n.twin ? 1.0 : i < n.count ? std::cos(sd.bridgeTilt) : std::sin(sd.bridgeTilt);
+            if (s.attached) att.push_back({sd.bridge, 0.5 * s.mNode * es * es, s.z0 * es * es});
+            endScale.push_back(es);
         }
         noteOfMidi_[nd.midi & 127] = (int)notes_.size();
         notes_.push_back(n);
@@ -132,7 +154,10 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
         size_t ai = 0;
         for (size_t i = 0; i < strings_.size(); i++) {
             StringRT& s = strings_[i];
-            if (s.attached) s.at = P.interp(att[ai++].pos);
+            if (s.attached) {
+                s.at = P.interp(att[ai++].pos);
+                for (double& wq : s.at.w) wq *= endScale[i];
+            }
             // Strings without a damper (top treble, detached test strings) never sleep.
             s.awake = !s.hasDamper || !s.attached;
         }
@@ -217,26 +242,31 @@ void Piano::noteOn(int midi, double speed) {
     if (ni < 0) return;
     NoteRT& n = notes_[ni];
     n.keyDown = true;
-    double top = -1e30;
-    for (int i = 0; i < n.count; i++) {
+    for (int i = 0; i < n.total; i++) {
         StringRT& s = strings_[n.first + i];
         wake(s);
         s.dampTarget = s.dampRate = 0;  // the key lifts the damper well before the hammer arrives
-        const RealS* u = &u_[s.off];
-        top = std::max(top, s.hamG[0] * u[s.hamL] + s.hamG[1] * u[s.hamL + 1]);
     }
     if (!(speed > 0)) return;
+    // Position and speed of each string along the strike direction, at the hammer.
+    auto along = [&](int i, const std::vector<RealS>& f) {
+        double g = 0;
+        for (int pol = 0; pol < (n.twin ? 2 : 1); pol++) {
+            const StringRT& s = strings_[n.first + i + pol * n.count];
+            const RealS* x = &f[s.off];
+            g += s.hamW * (s.hamG[0] * x[s.hamL] + s.hamG[1] * x[s.hamL + 1]);
+        }
+        return g;
+    };
+    double top = -1e30;
+    for (int i = 0; i < n.count; i++) top = std::max(top, along(i, u_));
     n.eta = top - 1e-5;
     n.veta = speed * k_;
     n.hammerActive = true;
     for (int i = 0; i < n.count; i++) {
         StringRT& s = strings_[n.first + i];
-        const RealS* u = &u_[s.off];
-        const RealS* v = &v_[vb_][s.off];
-        double gu = s.hamG[0] * u[s.hamL] + s.hamG[1] * u[s.hamL + 1];
-        double gv = s.hamG[0] * v[s.hamL] + s.hamG[1] * v[s.hamL + 1];
-        s.zeta = n.eta - gu;
-        s.zetaPrev = s.zeta - (n.veta - gv);
+        s.zeta = n.eta - along(i, u_);
+        s.zetaPrev = s.zeta - (n.veta - along(i, v_[vb_]));
         s.force = 0;
     }
 }
@@ -247,7 +277,7 @@ void Piano::noteOff(int midi) {
     NoteRT& n = notes_[ni];
     n.keyDown = false;
     if (!sustain_)
-        for (int i = 0; i < n.count; i++) {
+        for (int i = 0; i < n.total; i++) {
             StringRT& s = strings_[n.first + i];
             if (s.hasDamper) s.dampTarget = dampMax_;
         }
@@ -256,7 +286,7 @@ void Piano::noteOff(int midi) {
 void Piano::setSustain(bool down) {
     sustain_ = down;
     for (NoteRT& n : notes_)
-        for (int i = 0; i < n.count; i++) {
+        for (int i = 0; i < n.total; i++) {
             StringRT& s = strings_[n.first + i];
             if (!s.hasDamper) continue;
             if (down) { wake(s); s.dampTarget = 0; }
@@ -319,10 +349,15 @@ void Piano::stepHammer(NoteRT& n) {
     bool contact = false;
     for (int i = 0; i < ns; i++) {
         StringRT& s = strings_[n.first + i];
-        const RealS* u = &u_[s.off];
-        const RealS* v = &v_[vb_ ^ 1][s.off];  // increments the string would make without the hammer
-        double gu = s.hamG[0] * u[s.hamL] + s.hamG[1] * u[s.hamL + 1];
-        double gv = s.hamG[0] * v[s.hamL] + s.hamG[1] * v[s.hamL + 1];
+        // Along the strike direction; v holds the increments the string would make without the hammer.
+        double gu = 0, gv = 0;
+        for (int pol = 0; pol < (n.twin ? 2 : 1); pol++) {
+            const StringRT& sp = strings_[n.first + i + pol * n.count];
+            const RealS* u = &u_[sp.off];
+            const RealS* v = &v_[vb_ ^ 1][sp.off];
+            gu += sp.hamW * (sp.hamG[0] * u[sp.hamL] + sp.hamG[1] * u[sp.hamL + 1]);
+            gv += sp.hamW * (sp.hamG[0] * v[sp.hamL] + sp.hamG[1] * v[sp.hamL + 1]);
+        }
         zn[i] = n.eta - gu;
         zm[i] = s.zetaPrev;
         c[i] = zn[i] + n.veta - gv - zm[i];
@@ -398,10 +433,13 @@ void Piano::stepHammer(NoteRT& n) {
     bool away = true;
     for (int i = 0; i < ns; i++) {
         StringRT& s = strings_[n.first + i];
-        RealS* v = &v_[vb_ ^ 1][s.off];
-        double q = k_ * k_ * F[i] / (s.mNode * (1 + s.s0k));
-        v[s.hamL] += (RealS)(s.hamG[0] * q);
-        v[s.hamL + 1] += (RealS)(s.hamG[1] * q);
+        for (int pol = 0; pol < (n.twin ? 2 : 1); pol++) {
+            const StringRT& sp = strings_[n.first + i + pol * n.count];
+            RealS* v = &v_[vb_ ^ 1][sp.off];
+            double q = sp.hamW * k_ * k_ * F[i] / (sp.mNode * (1 + sp.s0k));
+            v[sp.hamL] += (RealS)(sp.hamG[0] * q);
+            v[sp.hamL + 1] += (RealS)(sp.hamG[1] * q);
+        }
         s.force = F[i];
         s.zetaPrev = zn[i];
         s.zeta = zm[i] + r[i];
@@ -437,6 +475,10 @@ void Piano::step(double& pL, double& pR) {
     RealP* __restrict vw = vw_.data();
 
     P.apply(w, vw, r);  // plate internal forces, scaled by dt^2
+    if (extF_ != 0) {
+        for (int q = 0; q < 4; q++) r[extAt_.idx[q]] += (RealP)(extAt_.w[q] * extF_ * k_ * k_);
+        extF_ = 0;
+    }
 
     for (StringRT& s : strings_) stepString(s);
     for (NoteRT& n : notes_)

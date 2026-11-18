@@ -17,6 +17,9 @@ struct StringDesign {
     double sigma1 = 0;  // frequency dependent loss, m^2/s
     Vec2 bridge;        // where the string meets the bridge, piano coordinates
     bool attached = true;  // false: rigid termination (used by validation tests)
+    // The bridge yields along one axis only. This is the tilt of that axis away from the
+    // soundboard normal, as seen by this string; it is what couples the two polarisations.
+    double bridgeTilt = 0;
 };
 
 struct NoteDesign {
@@ -28,6 +31,8 @@ struct NoteDesign {
     double hammerP = 2.5;       // felt exponent
     double hammerMu = 0.1;      // Hunt-Crossley felt damping, s/m
     bool hasDamper = true;
+    double hammerTilt = 0;      // strike direction away from the soundboard normal, rad
+    bool twoPolarisations = true;
 };
 
 struct BoardDesign {
@@ -64,6 +69,8 @@ struct PianoDesign {
 struct GrandOptions {
     int firstKey = 1, lastKey = 88;  // piano key numbers, A0 = 1, C4 = 40
     double unisonDetuneCents = 0.6;  // spread of the strings inside one note
+    double bridgeTiltDeg = 6.0;      // assumed; see docs/MODEL.md
+    double hammerTiltDeg = 4.0;      // assumed
 };
 
 // A generic 2 m class grand. Not a model of any specific instrument.

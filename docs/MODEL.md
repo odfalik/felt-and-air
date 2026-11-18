@@ -11,8 +11,9 @@ part consistently.
 
 | Part | Model |
 |---|---|
-| Strings | Stiff string (tension + bending), one transverse polarisation, 228 strings for 88 keys, grid of 5 to 200 nodes each |
-| String loss | Constant plus frequency-squared decay rate (Chaigne and Askenfelt 1994 form) |
+| Strings | Stiff string (tension + bending), both transverse polarisations, 228 strings for 88 keys, grid of 5 to 200 nodes each |
+| Polarisation coupling | The bridge yields along one tilted axis, so upright and sideways motion share it. The hammer strikes slightly off the upright |
+| String loss | Constant plus frequency-squared decay rate (Chaigne and Askenfelt 1994 form). The constant is 0.12 /s, not their 0.5 /s, which was fitted with a rigid bridge and so already contained the soundboard's share |
 | Hammer | Point mass, nonlinear felt `F = K z^p` with Hunt-Crossley damping, one hammer striking all strings of its note |
 | Dampers | Viscous felt over a short length of string, lifted by key or pedal |
 | Soundboard | Orthotropic Kirchhoff plate on a grain-aligned grid, grand-shaped outline, simply supported rim |
@@ -63,7 +64,8 @@ Counted in processor cycles, which do not depend on how busy the machine is. One
 | 1.25x (38 x 19 mm) | 2,354 | 54 % | 60 % | 107 % |
 | 1.5x (45 x 23 mm) | 1,635 | 41 % | 48 % | 96 % |
 
-The app defaults to 1.25x. **Pedal down with every string ringing does not fit in one core
+These figures predate the second polarisation, which doubles the string work: at 1.25x a
+six-note chord is now about 66 % and pedal down about 160 %. The app defaults to 1.25x. **Pedal down with every string ringing does not fit in one core
 at any setting.** Sustained thermal behaviour on the fanless Air has not been measured.
 
 Single precision was tried and rejected for now: it saves about 27 % but adds noise at
@@ -75,8 +77,11 @@ per-sample coupled update (a few thousand nodes, 48,000 dispatches a second) and
 
 ## Not modelled, or guessed
 
-- **Second string polarisation and longitudinal string motion.** No phantom partials, and
-  the two-stage decay comes only from unison detuning.
+- **Longitudinal string motion.** No phantom partials.
+- **Polarisation coupling strength.** Bridge tilt (6 degrees) and hammer tilt (4 degrees)
+  are assumptions. With them the sideways motion is too weak to hear; the two-stage decay
+  that is there comes from unison detuning. A C4 now falls 14 dB in the first second and
+  about 2 dB per second after that.
 - **Air.** No air loading on the board, no room, lid, case or floor. The baffled-plate
   integral over-radiates at low frequency; levels come out roughly 10 dB hot.
 - **Soundboard crown, downbearing and prestress.**
@@ -92,3 +97,10 @@ per-sample coupled update (a few thousand nodes, 48,000 dispatches a second) and
 - **Sleeping strings.** A fully damped string that has stopped moving is replaced by a
   dashpot at the bridge until it is played or the pedal lifts.
 - **Listening.** Nothing here has been auditioned. All checks so far are numerical.
+
+## Sympathetic resonance without the pedal
+
+Modelled: the top 19 notes have no dampers and always ring; strings of held keys ring.
+Not modelled: duplex and back-string lengths, and imperfect damping (a damped string here
+is silent once it has settled). Bridge impedance measured in the model (`./build/report`)
+is 400 to 2000 kg/s across the compass, in the range reported for real instruments.

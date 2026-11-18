@@ -72,7 +72,10 @@ PianoDesign makeGrand(const GrandOptions& o) {
         }
         // Loss law of Chaigne & Askenfelt (1994): rate = b1 + b3 * omega^2.
         double b3 = key <= 40 ? 6.25e-9 : 6.25e-9 * std::pow(1.0e-9 / 6.25e-9, (key - 40) / 48.0);
-        s.sigma0 = 0.5;
+        // Their constant term (0.5 /s) was fitted with a rigid bridge, so it contains the energy
+        // the soundboard takes. Here the board takes that energy itself, and only the string's
+        // own loss (air and internal friction) belongs in the constant. 0.12 /s is an estimate.
+        s.sigma0 = 0.12;
         s.sigma1 = b3 * s.T / s.rhoA;
 
         Vec2 bp = bridgePoint(key);
@@ -83,6 +86,8 @@ PianoDesign makeGrand(const GrandOptions& o) {
             double cents = o.unisonDetuneCents * (offset + 0.15 * offset * offset);
             si.f0 = f0 * std::pow(2.0, cents / 1200.0);
             si.bridge = {bp.x + 0.006 * offset, bp.y};
+            // Alternate the sign from string to string so unisons do not all lean one way.
+            si.bridgeTilt = o.bridgeTiltDeg * M_PI / 180.0 * (((key + i) & 1) ? 1.0 : -0.7);
             n.strings.push_back(si);
         }
 
@@ -94,6 +99,7 @@ PianoDesign makeGrand(const GrandOptions& o) {
         n.hammerP = std::clamp(anchors(key, 2.3, 2.5, 3.0), 2.2, 3.1);
         n.hammerMu = 0.1;
         n.hasDamper = key <= 69;
+        n.hammerTilt = o.hammerTiltDeg * M_PI / 180.0;
         d.notes.push_back(n);
     }
 

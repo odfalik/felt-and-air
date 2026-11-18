@@ -48,6 +48,7 @@ public:
     void prepareSnapshot(Snapshot& s) const;
     void fillSnapshot(Snapshot& s, int focusMidi) const;
     int stringMidi(int index) const { return notes_[strings_[index].note].midi; }
+    Vec2 stringBridge(int index) const { return strings_[index].bridge; }
 
     // ---- diagnostics (not for the audio thread) ----
     double energy() const;
@@ -74,6 +75,9 @@ public:
     RealS* stringU(int index) { return &u_[strings_[index].off]; }
     RealS* stringV(int index) { return &v_[vb_][strings_[index].off]; }
     double stringNodeMass(int index) const { return strings_[index].mNode; }
+    // External point force on the board for the next step only (measurement hook).
+    void pushBoard(Vec2 pianoXY, double newtons) { extAt_ = plate_->interp(pianoXY); extF_ = newtons; }
+    double boardVelocity(Vec2 pianoXY) const { return plate_->interp(pianoXY).eval(vw_.data()) / k_; }
     std::vector<RealP>& plateU() { return w_; }
     std::vector<RealP>& plateV() { return vw_; }
 
@@ -83,6 +87,8 @@ private:
         double h = 0, aT = 0, aB = 0, aD = 0, s0k = 0, mNode = 0, z0 = 0, tension = 0;
         double T_h = 0, EI_h3 = 0, damp_h = 0;  // energy coefficients
         bool attached = true, awake = false, hasDamper = false;
+        double hamW = 1;   // share of the hammer direction seen by this polarisation
+        Vec2 bridge;
         Interp at;
         int hamL = 0; double hamG[2] = {0, 0}; double hamA = 0;
         int dmp0 = 0, dmp1 = 0; double dampRate = 0, dampTarget = 0;
@@ -92,7 +98,9 @@ private:
         double zeta = 0, zetaPrev = 0, force = 0;
     };
     struct NoteRT {
-        int midi = 0, first = 0, count = 0;
+        int midi = 0, first = 0, count = 0;  // count contacts; each may have a second polarisation
+        int total = 0;                       // strings owned, both polarisations
+        bool twin = false;                   // string first+count+i is the sideways motion of first+i
         double hMass = 0, hK = 0, hP = 0, hMu = 0;
         double eta = 0, veta = 0;
         bool hammerActive = false, keyDown = false, hasDamper = false;
@@ -131,6 +139,7 @@ private:
     std::vector<double> fir_, hist_[2];
     int histPos_ = 0;
 
+    Interp extAt_; double extF_ = 0;
     long stepCount_ = 0;
     int hammerItersMax_ = 0;
     double dampMax_ = 1500.0;

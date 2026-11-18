@@ -205,16 +205,14 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
         [path stroke];
     }
     // Where each ringing string meets the bridge.
-    int si = 0;
-    for (const NoteDesign& n : E.design.notes)
-        for (const StringDesign& sd : n.strings) {
-            float lv = S.stringLevel[si++];
-            if (lv < 2e-7f) continue;
-            float a = std::min(1.0f, 0.25f + 0.12f * std::log10(lv / 2e-7f));
-            [[NSColor colorWithRed:1 green:0.95 blue:0.6 alpha:a] setFill];
-            NSPoint c = toView(sd.bridge);
-            [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - 3, c.y - 3, 6, 6)] fill];
-        }
+    for (int si = 0; si < E.piano->stringCount() && si < (int)S.stringLevel.size(); si++) {
+        float lv = S.stringLevel[si];
+        if (lv < 2e-7f) continue;
+        float a = std::min(1.0f, 0.25f + 0.12f * std::log10(lv / 2e-7f));
+        [[NSColor colorWithRed:1 green:0.95 blue:0.6 alpha:a] setFill];
+        NSPoint c = toView(E.piano->stringBridge(si));
+        [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - 3, c.y - 3, 6, 6)] fill];
+    }
     const Plate& P = E.piano->plate();
     [@"Soundboard displacement" drawAtPoint:NSMakePoint(20, 14) withAttributes:title];
     [[NSString stringWithFormat:@"%d nodes  %.0f x %.0f mm  full scale %.2f um", P.n, P.hx * 1e3, P.hy * 1e3, _boardScale * 1e6]
