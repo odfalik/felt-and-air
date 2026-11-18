@@ -3,6 +3,7 @@ pub mod acoustics;
 pub mod design;
 pub mod ffi;
 pub mod midi;
+pub mod params;
 pub mod piano;
 pub mod plate;
 pub mod util;

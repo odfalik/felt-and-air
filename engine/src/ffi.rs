@@ -274,3 +274,46 @@ pub extern "C" fn pp_midi_get(m: *const Vec<MidiEvent>, index: i32, seconds: *mu
         *b = e.b;
     }
 }
+
+#[repr(C)]
+pub struct ParamInfo {
+    /// 0 slider, 1 switch, 2 position on the floor plan.
+    kind: i32,
+    tab: i32,
+    name: *const c_char,
+    lo: f64,
+    hi: f64,
+    log: bool,
+    format: *const c_char,
+    help: *const c_char,
+}
+
+#[no_mangle]
+pub extern "C" fn pp_param_count() -> i32 {
+    crate::params::PARAMS.len() as i32
+}
+#[no_mangle]
+pub extern "C" fn pp_param_info(index: i32, out: *mut ParamInfo) {
+    let p = &crate::params::PARAMS[index as usize];
+    unsafe {
+        *out = ParamInfo {
+            kind: p.kind as i32,
+            tab: p.tab as i32,
+            name: p.c_name.as_ptr() as *const c_char,
+            lo: p.lo,
+            hi: p.hi,
+            log: p.log,
+            format: p.c_format.as_ptr() as *const c_char,
+            help: p.c_help.as_ptr() as *const c_char,
+        }
+    };
+}
+#[no_mangle]
+pub extern "C" fn pp_param_get(options: *const GrandOptions, index: i32) -> f64 {
+    (crate::params::PARAMS[index as usize].get)(unsafe { &*options })
+}
+/// The value is held inside the parameter's range.
+#[no_mangle]
+pub extern "C" fn pp_param_set(options: *mut GrandOptions, index: i32, value: f64) {
+    crate::params::PARAMS[index as usize].write(unsafe { &mut *options }, value);
+}

@@ -58,6 +58,22 @@ int pp_outline(const PPOptions* options, double* xy, int max_points);
 int pp_bridge(const PPOptions* options, int which, double* xy, int max_points);
 void pp_ears(const PPOptions* options, double* xyz);
 
+/* The adjustable quantities, as one table (engine/src/params.rs): sliders first, then
+   switches, then positions on the floor plan. Values are read and written on a PPOptions. */
+typedef struct PPParam {
+    int kind;            /* 0 slider, 1 switch, 2 position on the floor plan */
+    int tab;             /* 0 Space, 1 Hammers, 2 Strings, 3 Soundboard */
+    const char* name;
+    double lo, hi;
+    bool log;            /* best shown on a logarithmic slider */
+    const char* format;  /* printf format of the value with its unit */
+    const char* help;
+} PPParam;
+int pp_param_count(void);
+void pp_param_info(int index, PPParam* out);
+double pp_param_get(const PPOptions* options, int index);
+void pp_param_set(PPOptions* options, int index, double value);
+
 /* A copy of what a display needs. Filling and copying do not allocate. */
 typedef struct PPSnapshotView {
     const float* board;        /* plate displacement, grid storage, metres */

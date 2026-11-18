@@ -19,25 +19,10 @@ using namespace pp;
 
 namespace {
 
-// Parameter numbers: 0 is the volume, then the sliders of the shared table, the switches,
-// and the positions of piano and listener on the floor plan.
-const UInt32 kParamVolume = 0, kFirstKnob = 1, kFirstToggle = 100, kFirstPlan = 200;
-const char* const kPlanNames[4] = {"Piano position, along the keyboard", "Piano position, along the strings", "Listener position, along the keyboard", "Listener position, along the strings"};
+// Parameter 0 is the volume; parameter 1 + i is entry i of the engine's parameter table.
+const UInt32 kParamVolume = 0, kFirstOption = 1;
 
-bool isParameter(UInt32 id) {
-    return id == kParamVolume || (id >= kFirstKnob && id < kFirstKnob + (UInt32)kKnobCount) || (id >= kFirstToggle && id < kFirstToggle + (UInt32)kToggleCount) ||
-           (id >= kFirstPlan && id < kFirstPlan + 4);
-}
-double readOption(const PPOptions& o, UInt32 id) {
-    if (id >= kFirstPlan) return o.*(kPlanFields[id - kFirstPlan]);
-    if (id >= kFirstToggle) return o.*(kToggles[id - kFirstToggle].field) ? 1.0 : 0.0;
-    return o.*(kKnobs[id - kFirstKnob].field);
-}
-void writeOption(PPOptions& o, UInt32 id, double v) {
-    if (id >= kFirstPlan) o.*(kPlanFields[id - kFirstPlan]) = std::fmin(30.0, std::fmax(0.2, v));
-    else if (id >= kFirstToggle) o.*(kToggles[id - kFirstToggle].field) = v >= 0.5;
-    else { const Knob& k = kKnobs[id - kFirstKnob]; o.*(k.field) = std::fmin(k.hi, std::fmax(k.lo, v)); }
-}
+bool isParameter(UInt32 id) { return id < kFirstOption + (UInt32)pp_param_count(); }
 
 struct Listener { AudioUnitPropertyID id; AudioUnitPropertyListenerProc proc; void* user; };
 struct Notify { AURenderCallback proc; void* user; };
@@ -163,7 +148,7 @@ OSStatus Info(Unit* u, AudioUnitPropertyID id, AudioUnitScope scope, AudioUnitEl
     switch (id) {
         case kAudioUnitProperty_ClassInfo: if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope; size = sizeof(CFPropertyListRef); writable = true; return noErr;
         case kAudioUnitProperty_SampleRate: if (scope == kAudioUnitScope_Input) return kAudioUnitErr_InvalidScope; if (elem != 0) return kAudioUnitErr_InvalidElement; size = sizeof(Float64); writable = true; return noErr;
-        case kAudioUnitProperty_ParameterList: size = scope == kAudioUnitScope_Global ? sizeof(AudioUnitParameterID) * (1 + kKnobCount + kToggleCount + 4) : 0; return noErr;
+        case kAudioUnitProperty_ParameterList: size = scope == kAudioUnitScope_Global ? sizeof(AudioUnitParameterID) * (1 + pp_param_count()) : 0; return noErr;
         case kAudioUnitProperty_ParameterInfo: if (scope != kAudioUnitScope_Global || !isParameter(elem)) return kAudioUnitErr_InvalidParameter; size = sizeof(AudioUnitParameterInfo); return noErr;
         case kAudioUnitProperty_StreamFormat: if (scope != kAudioUnitScope_Output) return kAudioUnitErr_InvalidScope; if (elem != 0) return kAudioUnitErr_InvalidElement; size = sizeof(AudioStreamBasicDescription); writable = true; return noErr;
         case kAudioUnitProperty_ElementCount: size = sizeof(UInt32); return noErr;
@@ -223,9 +208,7 @@ OSStatus GetProperty(void* self, AudioUnitPropertyID id, AudioUnitScope scope, A
             if (!size) return noErr;
             AudioUnitParameterID* ids = (AudioUnitParameterID*)out;
             *ids++ = kParamVolume;
-            for (int i = 0; i < kKnobCount; i++) *ids++ = kFirstKnob + i;
-            for (int i = 0; i < kToggleCount; i++) *ids++ = kFirstToggle + i;
-            for (int i = 0; i < 4; i++) *ids++ = kFirstPlan + i;
+            for (int i = 0; i < pp_param_count(); i++) *ids++ = kFirstOption + i;
             return noErr;
         }
         case kAudioUnitProperty_ParameterInfo: {
@@ -237,22 +220,14 @@ OSStatus GetProperty(void* self, AudioUnitPropertyID id, AudioUnitScope scope, A
             if (elem == kParamVolume) {
                 info.unit = kAudioUnitParameterUnit_LinearGain;
                 info.minValue = 0; info.maxValue = 3; info.defaultValue = 0.8f;
-            } else if (elem >= kFirstPlan) {
-                name = kPlanNames[elem - kFirstPlan];
-                info.unit = kAudioUnitParameterUnit_Meters;
-                info.minValue = 0.2f; info.maxValue = 30;
-                info.defaultValue = (float)readOption(reference, elem);
-            } else if (elem >= kFirstToggle) {
-                name = kToggles[elem - kFirstToggle].name;
-                info.unit = kAudioUnitParameterUnit_Boolean;
-                info.minValue = 0; info.maxValue = 1;
-                info.defaultValue = (float)readOption(reference, elem);
             } else {
-                const Knob& k = kKnobs[elem - kFirstKnob];
-                name = k.name;
-                info.minValue = (float)k.lo; info.maxValue = (float)k.hi;
-                info.defaultValue = (float)readOption(reference, elem);
-                if (k.logScale) info.flags |= kAudioUnitParameterFlag_DisplayLogarithmic;
+                PPParam p;
+                pp_param_info((int)(elem - kFirstOption), &p);
+                name = p.name;
+                info.unit = p.kind == 1 ? kAudioUnitParameterUnit_Boolean : p.kind == 2 ? kAudioUnitParameterUnit_Meters : kAudioUnitParameterUnit_Generic;
+                info.minValue = (float)p.lo; info.maxValue = (float)p.hi;
+                info.defaultValue = (float)pp_param_get(&reference, (int)(elem - kFirstOption));
+                if (p.log) info.flags |= kAudioUnitParameterFlag_DisplayLogarithmic;
             }
             info.cfNameString = CFStringCreateWithCString(nullptr, name, kCFStringEncodingUTF8);
             strlcpy(info.name, name, sizeof(info.name));
@@ -365,7 +340,7 @@ OSStatus GetParameter(void* self, AudioUnitParameterID id, AudioUnitScope scope,
     if (!isParameter(id)) return kAudioUnitErr_InvalidParameter;
     if (id == kParamVolume) { *out = u->volume.load(); return noErr; }
     std::lock_guard<std::mutex> g(u->optionsLock);
-    *out = (AudioUnitParameterValue)readOption(u->options, id);
+    *out = (AudioUnitParameterValue)pp_param_get(&u->options, (int)(id - kFirstOption));
     return noErr;
 }
 OSStatus SetParameter(void* self, AudioUnitParameterID id, AudioUnitScope scope, AudioUnitElement, AudioUnitParameterValue v, UInt32) {
@@ -374,7 +349,7 @@ OSStatus SetParameter(void* self, AudioUnitParameterID id, AudioUnitScope scope,
     if (!isParameter(id)) return kAudioUnitErr_InvalidParameter;
     if (id == kParamVolume) { u->volume = std::fmin(3.0f, std::fmax(0.0f, v)); return noErr; }
     // Hosts may call this from the render thread; the lock is held only for a few stores.
-    { std::lock_guard<std::mutex> g(u->optionsLock); writeOption(u->options, id, v); u->dirty = true; }
+    { std::lock_guard<std::mutex> g(u->optionsLock); pp_param_set(&u->options, (int)(id - kFirstOption), v); u->dirty = true; }
     u->optionsChanged.notify_all();
     return noErr;
 }

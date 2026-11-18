@@ -643,11 +643,11 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
 
 - (void)refreshKnobs {
     for (int i = 0; i < kKnobCount; i++) {
-        double v = gEngine.voicing.*(kKnobs[i].field);
+        double v = kKnobs[i].get(gEngine.voicing);
         _sliders[i].doubleValue = knobToSlider(kKnobs[i], v);
         _values[i].stringValue = [NSString stringWithFormat:@(kKnobs[i].format), v];
     }
-    for (int i = 0; i < kToggleCount; i++) _boxes[i].state = gEngine.voicing.*(kToggles[i].field) ? NSControlStateValueOn : NSControlStateValueOff;
+    for (int i = 0; i < kToggleCount; i++) _boxes[i].state = kToggles[i].get(gEngine.voicing) ? NSControlStateValueOn : NSControlStateValueOff;
     _plan.needsDisplay = YES;
 }
 
@@ -670,11 +670,11 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
 // Sliders act when released: every change builds a new instrument.
 - (void)knobChanged:(NSSlider*)sender {
     const Knob& k = kKnobs[sender.tag];
-    gEngine.voicing.*(k.field) = sliderToKnob(k, sender.doubleValue);
+    k.set(gEngine.voicing, sliderToKnob(k, sender.doubleValue));
     [self applyVoicing];
 }
 - (void)boxChanged:(id)sender {
-    for (int i = 0; i < kToggleCount; i++) gEngine.voicing.*(kToggles[i].field) = _boxes[i].state == NSControlStateValueOn;
+    for (int i = 0; i < kToggleCount; i++) kToggles[i].set(gEngine.voicing, _boxes[i].state == NSControlStateValueOn);
     [self applyVoicing];
 }
 - (void)planChanged { [self applyVoicing]; }
@@ -701,10 +701,10 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
         kPresets[idx - 1].apply(o);
     } else if ([title hasPrefix:@"Saved: "]) {
         NSDictionary* d = [self savedSetups][[title substringFromIndex:7]];
-        for (int i = 0; i < kKnobCount; i++) if (d[@(kKnobs[i].name)]) o.*(kKnobs[i].field) = [d[@(kKnobs[i].name)] doubleValue];
+        for (int i = 0; i < kKnobCount; i++) if (d[@(kKnobs[i].name)]) kKnobs[i].set(o, [d[@(kKnobs[i].name)] doubleValue]);
         const char* planNames[] = {"pianoX", "pianoY", "listenerX", "listenerY"};
-        for (int i = 0; i < 4; i++) if (d[@(planNames[i])]) o.*(kPlanFields[i]) = [d[@(planNames[i])] doubleValue];
-        for (int i = 0; i < kToggleCount; i++) if (d[@(kToggles[i].name)]) o.*(kToggles[i].field) = [d[@(kToggles[i].name)] boolValue];
+        for (int i = 0; i < 4; i++) if (d[@(planNames[i])]) kPlan[i].set(o, [d[@(planNames[i])] doubleValue]);
+        for (int i = 0; i < kToggleCount; i++) if (d[@(kToggles[i].name)]) kToggles[i].set(o, [d[@(kToggles[i].name)] boolValue]);
     } else if ([title isEqualToString:@"Reset everything"]) {
         o = GrandOptions();
     } else if ([title hasPrefix:@"Save current"]) {
@@ -716,10 +716,10 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
         [alert addButtonWithTitle:@"Cancel"];
         if ([alert runModal] == NSAlertFirstButtonReturn && field.stringValue.length) {
             NSMutableDictionary* d = [NSMutableDictionary new];
-            for (int i = 0; i < kKnobCount; i++) d[@(kKnobs[i].name)] = @(o.*(kKnobs[i].field));
+            for (int i = 0; i < kKnobCount; i++) d[@(kKnobs[i].name)] = @(kKnobs[i].get(o));
             const char* planNames[] = {"pianoX", "pianoY", "listenerX", "listenerY"};
-            for (int i = 0; i < 4; i++) d[@(planNames[i])] = @(o.*(kPlanFields[i]));
-            for (int i = 0; i < kToggleCount; i++) d[@(kToggles[i].name)] = @(o.*(kToggles[i].field));
+            for (int i = 0; i < 4; i++) d[@(planNames[i])] = @(kPlan[i].get(o));
+            for (int i = 0; i < kToggleCount; i++) d[@(kToggles[i].name)] = @(kToggles[i].get(o));
             NSMutableDictionary* all = [[self savedSetups] mutableCopy];
             all[field.stringValue] = d;
             [[NSUserDefaults standardUserDefaults] setObject:all forKey:@"setups"];
