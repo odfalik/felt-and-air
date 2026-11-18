@@ -134,6 +134,7 @@ private:
         bool twin = false;                   // string first+count+i is the sideways motion of first+i
         double hMass = 0, hK = 0, hP = 0, hMu = 0;
         double eta = 0, veta = 0;
+        double sMass = 0, sK = 0, sC = 0, xi = 0, vxi = 0;  // shank: mass behind the spring, stiffness, damping, position, increment
         bool hammerActive = false, keyDown = false, hasDamper = false;
         double thump = 0; Interp thumpAt;
     };

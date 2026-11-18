@@ -195,7 +195,13 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
         n.first = (int)strings_.size();
         n.count = (int)nd.strings.size();
         if (n.count > 3) throw std::runtime_error("at most three strings per note");
-        n.hMass = nd.hammerMass; n.hK = nd.hammerK; n.hP = nd.hammerP; n.hMu = nd.hammerMu;
+        n.hMass = nd.hammerMass * (1 - nd.shankShare); n.hK = nd.hammerK; n.hP = nd.hammerP; n.hMu = nd.hammerMu;
+        n.sMass = nd.hammerMass * nd.shankShare;
+        if (n.sMass > 0) {
+            double mu = n.hMass * n.sMass / (n.hMass + n.sMass), om = 2 * M_PI * nd.shankHz;
+            n.sK = mu * om * om;
+            n.sC = 2 * nd.shankLoss * mu * om;
+        }
         n.hasDamper = nd.hasDamper;
         n.thump = nd.keyThump;
         auto buildString = [&](const StringDesign& sd, bool duplex) -> bool {
@@ -459,6 +465,7 @@ void Piano::noteOn(int midi, double speed) {
     for (int i = 0; i < n.count; i++) top = std::max(top, along(i, u_));
     n.eta = top - 1e-5;
     n.veta = speed * k_;
+    n.xi = n.eta; n.vxi = n.veta;  // head and shank arrive together, the shank unbent
     n.hammerActive = true;
     for (int i = 0; i < n.count; i++) {
         StringRT& s = strings_[n.first + i];
@@ -612,6 +619,12 @@ void Piano::stepString(StringRT& s) {
 void Piano::stepHammer(NoteRT& n) {
     const int ns = n.count;
     const double K = n.hK, p = n.hP, b = k_ * k_ / n.hMass;
+    if (n.sMass > 0) {  // the shank pulls the head and the head pulls the shank
+        double f = n.sK * (n.xi - n.eta) + n.sC * (n.vxi - n.veta) / k_;
+        n.veta += k_ * k_ * f / n.hMass;
+        n.vxi -= k_ * k_ * f / n.sMass;
+        n.xi += n.vxi;
+    }
     double zm[3], zn[3], c[3], a[3], psi[3], r[3], F[3] = {0, 0, 0}, dF[3] = {0, 0, 0};
     bool contact = false;
     for (int i = 0; i < ns; i++) {
@@ -884,6 +897,10 @@ double Piano::energy() const {
     for (const NoteRT& n : notes_) {
         if (!n.hammerActive) continue;
         H += 0.5 * n.hMass * (n.veta / k) * (n.veta / k);
+        if (n.sMass > 0) {
+            double dNew = n.xi - n.eta, dOld = dNew - (n.vxi - n.veta);
+            H += 0.5 * n.sMass * (n.vxi / k) * (n.vxi / k) + 0.5 * n.sK * dNew * dOld;
+        }
         for (int i = 0; i < n.count; i++) {
             const StringRT& s = strings_[n.first + i];
             auto phi = [&](double z) { return z > 0 ? n.hK / (n.hP + 1) * std::pow(z, n.hP + 1) : 0.0; };

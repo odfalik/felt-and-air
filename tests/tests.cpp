@@ -36,6 +36,7 @@ static void makeLossless(PianoDesign& d) {
     d.board.sigma0 = 0;
     for (auto& n : d.notes) {
         n.hammerMu = 0;
+        n.shankLoss = 0;
         n.keyThump = 0;  // an outside force: it would add energy
         for (auto& s : n.strings) s.sigma0 = s.sigma1 = 0;
     }

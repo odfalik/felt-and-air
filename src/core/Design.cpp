@@ -163,6 +163,7 @@ PianoDesign makeGrand(const GrandOptions& o) {
         n.hammerK = std::exp(anchors(key, std::log(4.0e8), std::log(4.5e9), std::log(1.0e11))) * o.hammerHardness;
         n.hammerP = std::clamp(anchors(key, 2.3, 2.5, 3.0), 2.2, 3.1);
         n.hammerMu = 0.1 * o.feltDamping;
+        n.shankHz = o.shankHz;
         // About 50 g of key and finger landing at a fifth of the hammer's speed, of which an
         // assumed 15 % reaches the board through keybed and case.
         n.keyThump = 0.05 / 5.0 * 0.15 * o.keyThump;

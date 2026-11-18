@@ -34,6 +34,9 @@ struct NoteDesign {
     double hammerK = 4.5e9;     // felt stiffness per string contact, N/m^p
     double hammerP = 2.5;       // felt exponent
     double hammerMu = 0.1;      // Hunt-Crossley felt damping, s/m
+    // The hammer head rides on a springy wooden shank. shankShare of the hammer's mass sits
+    // behind that spring; head and shank together swing at shankHz when free.
+    double shankShare = 0.2, shankHz = 300, shankLoss = 0.05;
     bool hasDamper = true;
     double hammerTilt = 0;      // strike direction away from the soundboard normal, rad
     bool twoPolarisations = true;
@@ -146,6 +149,7 @@ struct GrandOptions {
     double feltDamping = 1.0;        // x reference
     double strikePosition = 1.0;     // x reference: strike point along the string
     double keyThump = 1.0;           // x reference: knock of the key on the keybed
+    double shankHz = 300;            // springiness of the hammer shank; high = rigid
     double damperStrength = 1.0;     // x reference
     double damperPressN = 0.12;      // resting force of a damper on one string
     double mechanismNoise = 1.0;     // x reference: pedal work and key return
