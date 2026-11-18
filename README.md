@@ -60,3 +60,8 @@ python3 tools/compare_wav.py a.wav b.wav # level of the difference between two r
 - `src/app` standalone app (AppKit, CoreAudio, CoreMIDI)
 - `src/tools` offline renderer and benchmark
 - `tests` validation suite
+
+## Licence
+
+MIT. The demo recordings fetched by `tools/fetch_demos.py` are not part of this repository
+and carry their own licence (CC BY-NC-SA 4.0).

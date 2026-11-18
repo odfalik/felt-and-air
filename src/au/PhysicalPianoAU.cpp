@@ -140,7 +140,7 @@ OSStatus GetProperty(void* self, AudioUnitPropertyID id, AudioUnitScope scope, A
             put(CFSTR(kAUPresetVersionKey), 0);
             put(CFSTR(kAUPresetTypeKey), kAudioUnitType_MusicDevice);
             put(CFSTR(kAUPresetSubtypeKey), 'PhPn');
-            put(CFSTR(kAUPresetManufacturerKey), 'Strd');
+            put(CFSTR(kAUPresetManufacturerKey), 'Odfk');
             CFDictionarySetValue(d, CFSTR(kAUPresetNameKey), u->presetName);
             Float32 vol = u->volume.load();
             CFDataRef data = CFDataCreate(nullptr, (const UInt8*)&vol, sizeof(vol));
@@ -192,7 +192,7 @@ OSStatus SetProperty(void* self, AudioUnitPropertyID id, AudioUnitScope scope, A
                 return n && CFGetTypeID(n) == CFNumberGetTypeID() && CFNumberGetValue(n, kCFNumberSInt32Type, &v) && v == want;
             };
             if (!match(CFSTR(kAUPresetTypeKey), kAudioUnitType_MusicDevice) || !match(CFSTR(kAUPresetSubtypeKey), 'PhPn') ||
-                !match(CFSTR(kAUPresetManufacturerKey), 'Strd'))
+                !match(CFSTR(kAUPresetManufacturerKey), 'Odfk'))
                 return kAudioUnitErr_InvalidPropertyValue;
             CFDataRef data = (CFDataRef)CFDictionaryGetValue(d, CFSTR(kAUPresetDataKey));
             if (data && CFGetTypeID(data) == CFDataGetTypeID() && CFDataGetLength(data) == sizeof(Float32)) {

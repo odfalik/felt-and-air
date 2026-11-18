@@ -137,7 +137,7 @@ budget. A real-time air simulation on this GPU is limited to roughly a 7 m room 
 
 ## Plug-in
 
-`make au` builds an Audio Unit instrument (`aumu` / `PhPn` / `Strd`) with one parameter
+`make au` builds an Audio Unit instrument (`aumu` / `PhPn` / `Odfk`) with one parameter
 (volume), MIDI notes, release velocity and a continuous sustain pedal. `make install-au`
 copies it to `~/Library/Audio/Plug-Ins/Components`. It has no editor window, so the
 Instrument settings are those of the reference grand. Apple's `auval` has not been run on

@@ -12,8 +12,8 @@ int main(int argc, char** argv) {
     if (!lib) { std::printf("cannot load %s: %s\n", path, dlerror()); return 1; }
     auto factory = (AudioComponentFactoryFunction)dlsym(lib, "PhysicalPianoFactory");
     if (!factory) { std::printf("factory not found\n"); return 1; }
-    AudioComponentDescription desc = {kAudioUnitType_MusicDevice, 'PhPn', 'Strd', 0, 0};
-    AudioComponent comp = AudioComponentRegister(&desc, CFSTR("Strand: Physical Piano"), 0x10000, factory);
+    AudioComponentDescription desc = {kAudioUnitType_MusicDevice, 'PhPn', 'Odfk', 0, 0};
+    AudioComponent comp = AudioComponentRegister(&desc, CFSTR("odfalik: Physical Piano"), 0x10000, factory);
     AudioUnit au = nullptr;
     if (!comp || AudioComponentInstanceNew(comp, &au) != noErr) { std::printf("cannot instantiate\n"); return 1; }
 
