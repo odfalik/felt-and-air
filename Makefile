@@ -6,17 +6,18 @@ ENGINE   := engine/target/release/libpiano_engine.a
 APP      := build/PhysicalPiano.app
 AU       := build/PhysicalPiano.component
 
-.PHONY: all engine test app au install-au clean
-all: engine app au build/autest build/metalbench
+.PHONY: all engine test app au clap install-au install-clap clean
+all: engine app au clap build/autest build/claptest build/metalbench
 
 # cargo decides what is out of date.
 engine:
 	cd engine && cargo build --release
 $(ENGINE): engine
 
-test: engine build/autest au
+test: engine build/autest build/claptest au clap
 	cd engine && cargo test --release -- --nocapture --test-threads=1
 	./build/autest
+	./build/claptest
 
 app: $(APP)/Contents/MacOS/PhysicalPiano
 $(APP)/Contents/MacOS/PhysicalPiano: src/app/main.mm src/app/Info.plist src/shared/Engine.h $(ENGINE)
@@ -39,6 +40,24 @@ install-au: au
 	rm -rf "$(HOME)/Library/Audio/Plug-Ins/Components/PhysicalPiano.component"
 	cp -R $(AU) "$(HOME)/Library/Audio/Plug-Ins/Components/"
 
+# The CLAP plug-in is a second crate (plugin/), on nih-plug, with its own pinned toolchain.
+# `make clap VST3=1` would also need the bundle step for a .vst3; note the licence remark in
+# plugin/Cargo.toml before distributing one.
+CLAP := build/PhysicalPiano.clap
+clap:
+	cd plugin && cargo build --release
+	@mkdir -p $(CLAP)/Contents/MacOS
+	cp plugin/Info.plist $(CLAP)/Contents/Info.plist
+	cp plugin/target/release/libphysical_piano_plugin.dylib $(CLAP)/Contents/MacOS/PhysicalPiano
+	codesign --force --sign - $(CLAP) >/dev/null 2>&1 || true
+install-clap: clap
+	mkdir -p "$(HOME)/Library/Audio/Plug-Ins/CLAP"
+	rm -rf "$(HOME)/Library/Audio/Plug-Ins/CLAP/PhysicalPiano.clap"
+	cp -R $(CLAP) "$(HOME)/Library/Audio/Plug-Ins/CLAP/"
+
+build/claptest: src/tools/claptest.cpp
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) $< -o $@
 build/autest: src/tools/autest.cpp
 	@mkdir -p build
 	$(CXX) $(CXXFLAGS) $< -o $@ -framework AudioToolbox -framework CoreFoundation
@@ -49,3 +68,4 @@ build/metalbench: src/tools/metalbench.mm
 clean:
 	rm -rf build
 	cd engine && cargo clean
+	cd plugin && cargo clean

@@ -1,0 +1,25 @@
+[package]
+name = "physical_piano_plugin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+description = "Physical Piano as a CLAP (and optionally VST3) instrument"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+piano_engine = { path = "../engine" }
+# nih-plug is not on crates.io; pinned to the commit this was written against.
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a", default-features = false }
+
+[features]
+# VST3 goes through the vst3-sys bindings, which are GPLv3: a binary built with this
+# feature has to be distributed under the GPL. CLAP has no such condition.
+vst3 = ["nih_plug/vst3"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

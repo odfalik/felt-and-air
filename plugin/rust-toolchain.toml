@@ -1,0 +1,3 @@
+# nih-plug's dependencies need the 2024 edition.
+[toolchain]
+channel = "1.85.0"

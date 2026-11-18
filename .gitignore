@@ -6,3 +6,4 @@ out/
 demos/*.mid
 demos/demos.txt
 engine/target/
+plugin/target/

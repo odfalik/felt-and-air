@@ -1,0 +1,5 @@
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+[resolver]
+incompatible-rust-versions = "fallback"
