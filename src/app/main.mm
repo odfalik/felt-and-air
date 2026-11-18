@@ -76,6 +76,7 @@ struct Engine {
             std::string file, title, note;
             std::getline(ss, file, '|'); std::getline(ss, title, '|'); std::getline(ss, note, '|');
             Demo d{title, note, readMidiFile(dir + "/" + file)};
+            leadNotesByFlight(d.events, voicing.letOffMm * 1e-3, midiVelocityToHammerSpeed);
             if (!d.events.empty()) demos.push_back(std::move(d));
         }
     }
@@ -123,6 +124,8 @@ struct Engine {
         if (e.type == 1) { piano->noteOn(e.a, midiVelocityToHammerSpeed(e.b)); focus = e.a; }
         else if (e.type == 0) piano->noteOff(e.a, e.b > 0 ? e.b / 64.0 : 1.0);
         else if (e.type == 2) { lastPedal = e.a / 127.0; piano->setPedal(lastPedal); }
+        else if (e.type == 6) piano->setSoftPedal(e.a >= 64);
+        else if (e.type == 7) piano->setSostenuto(e.a >= 64);
         else if (e.type == 4 && e.a >= 0 && e.a < (int)demos.size()) { silence(); demoIndex = e.a; demoNext = 0; demoFrame = 0; demoPlaying = e.a; }
         else if (e.type == 5) { silence(); demoIndex = -1; demoPlaying = -1; }
     }
@@ -140,7 +143,7 @@ struct Engine {
                 const auto& ev = demos[demoIndex].events;
                 while (demoNext < ev.size() && (long)(ev[demoNext].seconds * sampleRate) <= demoFrame) {
                     const MidiEvent& m = ev[demoNext++];
-                    handle({m.type, m.a, m.b});
+                    handle({m.type == 3 ? 6 : m.type == 4 ? 7 : m.type, m.a, m.b});
                 }
                 if (demoNext < ev.size()) until = (int)std::min<long>(n, done + (long)(ev[demoNext].seconds * sampleRate) - demoFrame);
                 else if (demoFrame > (long)((ev.back().seconds + 4.0) * sampleRate)) { demoIndex = -1; demoPlaying = -1; }
@@ -342,7 +345,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     line([NSString stringWithFormat:@"strings awake %d / %d    output peak %.2f    %.0f Hz", S.awake, E.piano->stringCount(), E.level.load(), E.sampleRate], small);
     y += 6;
     line(@"Play:  A W S E D F T G Y H U J K O L P ;    mouse on the keys    MIDI", small);
-    line([NSString stringWithFormat:@"Z / X octave (now %d)    C / V velocity (now %d)    Space sustain    Return audio", self.octave, self.velocity], small);
+    line([NSString stringWithFormat:@"Z / X octave (now %d)    C / V velocity (now %d)    Space sustain   , soft   . sostenuto", self.octave, self.velocity], small);
     if (dp >= 0 && dp < (int)E.demos.size()) line([NSString stringWithFormat:@"%s, MAESTRO dataset (CC BY-NC-SA)", E.demos[dp].note.c_str()], small);
 
     // Keyboard.
@@ -413,6 +416,8 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
         case 'c': self.velocity = std::max(10, self.velocity - 15); break;
         case 'v': self.velocity = std::min(127, self.velocity + 15); break;
         case ' ': gEngine.uiEvents.push({2, 127, 0}); break;
+        case ',': gEngine.uiEvents.push({6, 127, 0}); break;
+        case '.': gEngine.uiEvents.push({7, 127, 0}); break;
         case '\r': [NSApp sendAction:@selector(toggleAudio:) to:nil from:self]; break;
         default: break;
     }
@@ -421,6 +426,8 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     if (e.characters.length == 0) return;
     unichar c = [e.charactersIgnoringModifiers characterAtIndex:0];
     if (c == ' ') { gEngine.uiEvents.push({2, 0, 0}); return; }
+    if (c == ',') { gEngine.uiEvents.push({6, 0, 0}); return; }
+    if (c == '.') { gEngine.uiEvents.push({7, 0, 0}); return; }
     // Release against every octave, in case it was shifted while a key was held.
     static const char* keys = "awsedftgyhujkolp;";
     const char* f = strchr(keys, tolower(c));
@@ -631,6 +638,7 @@ static const Knob kKnobs[] = {
     {kHammers, "Felt damping", &GrandOptions::feltDamping, 0.0, 5.0, false, "x %.2f", "Energy the felt loses as it is squeezed."},
     {kHammers, "Strike point", &GrandOptions::strikePosition, 0.5, 1.8, false, "x %.2f", "Distance from the agraffe; the reference is about 1/8 of the string."},
     {kHammers, "Key knock", &GrandOptions::keyThump, 0.0, 30.0, false, "x %.1f", "Knock of the key landing on the keybed."},
+    {kHammers, "Let-off distance", &GrandOptions::letOffMm, 0.5, 5.0, false, "%.1f mm", "Gap to the string when the hammer is let go. It flies the rest, slowed by gravity."},
     {kHammers, "Shank springiness", &GrandOptions::shankHz, 80.0, 2000.0, true, "%.0f Hz", "The wooden shank flexes at impact. High is a rigid hammer."},
     {kHammers, "Damper strength", &GrandOptions::damperStrength, 0.2, 4.0, true, "x %.2f", "How fast a released note is stopped."},
     {kHammers, "Damper weight", &GrandOptions::damperPressN, 0.0, 0.6, false, "%.2f N", "Force each damper rests on its string with. Lifting it lets the string stir."},
@@ -836,7 +844,7 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
     for (int i = 0; i < kKnobCount; i++) {
         const Knob& k = kKnobs[i];
         CGFloat y = rowY[k.tab];
-        rowY[k.tab] -= k.tab == kSpace ? 27 : (k.tab == kHammers ? 40 : 42);
+        rowY[k.tab] -= k.tab == kSpace ? 27 : (k.tab == kHammers ? 37 : 42);
         NSTextField* name = [NSTextField labelWithString:@(k.name)];
         name.frame = NSMakeRect(12, y, 130, 18);
         NSSlider* sl = [NSSlider sliderWithValue:0 minValue:0 maxValue:1 target:self action:@selector(knobChanged:)];
@@ -917,6 +925,8 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
                 if (status == 9 && d2 > 0) gEngine.midiEvents.push({1, d1, d2});
                 else if (status == 8 || status == 9) gEngine.midiEvents.push({0, d1, status == 8 ? d2 : 0});
                 else if (status == 0xB && d1 == 64) gEngine.midiEvents.push({2, d2, 0});
+                else if (status == 0xB && d1 == 67) gEngine.midiEvents.push({6, d2, 0});
+                else if (status == 0xB && d1 == 66) gEngine.midiEvents.push({7, d2, 0});
                 if (status == 8 || status == 9) {
                     BOOL on = status == 9 && d2 > 0;
                     dispatch_async(dispatch_get_main_queue(), ^{ [view midiNote:d1 on:on]; });

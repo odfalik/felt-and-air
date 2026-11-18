@@ -45,6 +45,12 @@ public:
     // Sustain pedal position, 0 (up) to 1 (down). Between about 0.34 and 0.47 the dampers only
     // graze the strings (half pedal).
     void setPedal(double position);
+    // Una corda: the action shifts so each hammer misses one string of its three.
+    void setSoftPedal(bool down) { soft_ = down; }
+    // Sostenuto: dampers of the keys held at this moment stay up until the pedal is released.
+    void setSostenuto(bool down);
+    // Time from let-off to the hammer reaching the string, for a given hammer speed.
+    double strikeDelay(double hammerSpeed) const { return hammerSpeed > 0 ? action_.letOff / hammerSpeed : 0; }
 
     // Renders n stereo frames. Allocation and lock free.
     void process(float* left, float* right, int n);
@@ -135,6 +141,13 @@ private:
         double eta = 0, veta = 0;
         double sMass = 0, sK = 0, sC = 0, xi = 0, vxi = 0;  // shank: mass behind the spring, stiffness, damping, position, increment
         bool hammerActive = false, keyDown = false, hasDamper = false;
+        bool sost = false;                       // damper held up by the sostenuto pedal
+        // Key front: 0 at rest, positive down. Phase 0 at rest, 1 going down, 2 held, 3 coming up.
+        int keyPhase = 0;
+        double ky = 0, kv = 0, kForce = 0, kSlow = 0;
+        // Hammer on its way back: distance below the string and speed downward.
+        bool returning = false, checked = false;
+        double hy = 0, hv = 0, hSlow = 0, hTotal = 0;
         double thump = 0; Interp thumpAt;
     };
 
@@ -143,6 +156,9 @@ private:
     void stepString(int index);
     void stepHammer(NoteRT& n);
     void housekeeping();
+    void stepAction(NoteRT& n, RealP* r);
+    PianoDesign::Action action_;
+    bool soft_ = false;
     struct Pool;
     std::unique_ptr<Pool> pool_;
     // Units of work that threads can take independently: the radiation task, ranges of

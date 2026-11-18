@@ -32,6 +32,8 @@ static void makeLossless(PianoDesign& d) {
     d.airLoading = false;    // the air carries energy away
     d.damperPress = 0;       // outside forces
     d.mechanismNoise = 0;
+    d.action.letOff = 1e-5;  // start at the string, with no gravity doing work on the way
+    d.action.gravity = false;
     d.board.lossFactor = 0;
     d.board.sigma0 = 0;
     for (auto& n : d.notes) {
@@ -132,6 +134,7 @@ static void testPassivity() {
     pd.airLoading = false;     // acts through delays, outside the step-by-step energy argument
     pd.damperPress = 0;        // the damper's weight and the key's return are outside forces
     pd.mechanismNoise = 0;
+    pd.action.gravity = false;
     pd.dampedStringsRing = false;  // so that the sleep check below applies
     Piano p(pd, {48000, 1, 0.5});
     p.noteOn(60, 4.0);

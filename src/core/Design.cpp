@@ -38,6 +38,8 @@ PianoDesign makeGrand(const GrandOptions& o) {
     d.dampedStringsRing = o.dampedStringsRing;
     d.damperPress = o.damperPressN;
     d.mechanismNoise = o.mechanismNoise;
+    d.action.letOff = o.letOffMm * 1e-3;
+    d.action.caseShare = 0.15 * o.keyThump;
     d.downbearingDeg = o.downbearingDeg;
     d.room.enabled = o.roomEnabled;
     d.room.Lx = o.roomLx; d.room.Ly = o.roomLy; d.room.Lz = o.roomLz;
@@ -162,9 +164,7 @@ PianoDesign makeGrand(const GrandOptions& o) {
         n.hammerP = std::clamp(anchors(key, 2.3, 2.5, 3.0), 2.2, 3.1);
         n.hammerMu = 0.1 * o.feltDamping;
         n.shankHz = o.shankHz;
-        // About 50 g of key and finger landing at a fifth of the hammer's speed, of which an
-        // assumed 15 % reaches the board through keybed and case.
-        n.keyThump = 0.05 / 5.0 * 0.15 * o.keyThump;
+        n.keyThump = o.keyThump;
         n.keyThumpAt = {keyX(key), 0.06};
         n.hasDamper = key <= 69;
         n.hammerTilt = o.hammerTiltDeg * M_PI / 180.0;

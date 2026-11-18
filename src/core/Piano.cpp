@@ -172,6 +172,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     dampMax_ = 1500.0 * d.damperStrength;
     neverSleep_ = d.dampedStringsRing;
     mechNoise_ = d.mechanismNoise;
+    action_ = d.action;
 
     std::vector<Attachment> att;
     int offset = 0, maxN = 0;
@@ -183,6 +184,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
         if (n.count > 3) throw std::runtime_error("at most three strings per note");
         n.hMass = nd.hammerMass * (1 - nd.shankShare); n.hK = nd.hammerK; n.hP = nd.hammerP; n.hMu = nd.hammerMu;
         n.sMass = nd.hammerMass * nd.shankShare;
+        n.hTotal = nd.hammerMass;
         if (n.sMass > 0) {
             double mu = n.hMass * n.sMass / (n.hMass + n.sMass), om = 2 * M_PI * nd.shankHz;
             n.sK = mu * om * om;
@@ -449,7 +451,13 @@ void Piano::noteOn(int midi, double speed) {
         if (s.lCells > 0) { s.lOn = true; s.lPeak = 1; }
     }
     if (!(speed > 0)) return;
-    knock(n.thumpAt, n.thump * speed, 0.003);
+    // The key: at let-off it is most of the way down, moving at the hammer's speed over the
+    // action ratio, pushed by the force that got the hammer up to that speed.
+    n.keyPhase = 1;
+    n.ky = action_.keyAtLetOff;
+    n.kv = speed / action_.ratio;
+    n.kForce = std::clamp((action_.keyMass + n.hTotal * action_.ratio * action_.ratio) * n.kv * n.kv / (2 * action_.keyAtLetOff) + 0.5, 0.6, 40.0);
+    n.returning = n.checked = false;
     // Position and speed of each string along the strike direction, at the hammer.
     auto along = [&](int i, const std::vector<RealS>& f) {
         double g = 0;
@@ -462,7 +470,7 @@ void Piano::noteOn(int midi, double speed) {
     };
     double top = -1e30;
     for (int i = 0; i < n.count; i++) top = std::max(top, along(i, u_));
-    n.eta = top - 1e-5;
+    n.eta = top - std::max(1e-5, action_.letOff);
     n.veta = speed * k_;
     n.xi = n.eta; n.vxi = n.veta;  // head and shank arrive together, the shank unbent
     n.hammerActive = true;
@@ -471,6 +479,63 @@ void Piano::noteOn(int midi, double speed) {
         s.zeta = n.eta - along(i, u_);
         s.zetaPrev = s.zeta - (n.veta - along(i, v_[vb_]));
         s.force = 0;
+    }
+}
+
+void Piano::setSostenuto(bool down) {
+    for (NoteRT& n : notes_) {
+        if (down) { n.sost = n.keyDown; continue; }
+        if (n.sost && !n.keyDown)
+            for (int i = 0; i < n.total; i++) {
+                StringRT& s = strings_[n.first + i];
+                if (s.hasDamper) { s.dampTarget = dampMax_ * pedalDamping_; s.dampLand = 1; }
+            }
+        n.sost = false;
+    }
+}
+
+// The parts of the action that move after let-off, as bodies meeting felt: the key on its
+// rails and the hammer on its way back. Felt is a stiffening spring with loss; what it pushes
+// on is the case, and a share of the changing part of that force reaches the soundboard.
+void Piano::stepAction(NoteRT& n, RealP* r) {
+    const PianoDesign::Action& A = action_;
+    auto felt = [](double z, double zdot, double K, double p, double drag) {
+        if (z <= 0) return 0.0;
+        double f = K * std::pow(z, p) + drag * zdot;
+        return f > 0 ? f : 0.0;
+    };
+    double toCase = 0;
+    if (n.keyPhase == 1 || n.keyPhase == 3) {
+        double bottom = felt(n.ky - A.keyTravel, n.kv, A.feltK, A.feltP, A.feltC);
+        double rest = felt(-n.ky, -n.kv, A.feltK, A.feltP, A.feltC);
+        double f = n.kForce - A.upWeight - bottom + rest;
+        n.kv += k_ * f / A.keyMass;
+        n.ky += k_ * n.kv;
+        double stop = bottom + rest;
+        n.kSlow += (stop - n.kSlow) * k_ / 0.02;  // the steady part is carried by the case without sound
+        toCase += stop - n.kSlow;
+        // Settled on a felt: stop following it.
+        if (std::fabs(n.kv) < 1e-4 && std::fabs(stop - n.kSlow) < 1e-3 * (1 + stop) && (n.ky > A.keyTravel || n.ky < 1e-4)) {
+            n.keyPhase = n.ky > A.keyTravel ? 2 : 0;
+            n.kSlow = 0;
+        }
+    }
+    if (n.returning) {
+        double where = n.keyDown ? A.checkDistance : A.restDistance;
+        double stop = felt(n.hy - where, n.hv, A.stopK, A.stopP, A.stopC);
+        n.hv += k_ * ((A.gravity ? 9.81 : 0.0) - stop / n.hTotal);
+        n.hy += k_ * n.hv;
+        n.hSlow += (stop - n.hSlow) * k_ / 0.02;
+        toCase += stop - n.hSlow;
+        if (std::fabs(n.hv) < 1e-3 && n.hy > where && std::fabs(stop - n.hSlow) < 1e-3 * (1 + stop)) {
+            n.returning = false;
+            n.checked = n.keyDown;
+            n.hSlow = 0;
+        }
+    }
+    if (n.thump > 0 && toCase != 0) {
+        double f = A.caseShare * toCase * k_ * k_;
+        for (int q = 0; q < 4; q++) r[n.thumpAt.idx[q]] += (RealP)(n.thumpAt.w[q] * f);
     }
 }
 
@@ -490,11 +555,15 @@ void Piano::noteOff(int midi, double releaseSpeed) {
     releaseSpeed = std::clamp(releaseSpeed, 0.25, 4.0);
     for (int i = 0; i < n.total; i++) {
         StringRT& s = strings_[n.first + i];
-        if (s.hasDamper) { s.dampTarget = dampMax_ * pedalDamping_; s.dampLand = releaseSpeed; }
+        if (s.hasDamper && !n.sost) { s.dampTarget = dampMax_ * pedalDamping_; s.dampLand = releaseSpeed; }
     }
-    // The key landing back on its rest, and the hammer on its own: a softer knock than the
-    // one going down. Speed here is the hammer speed that an ordinary release corresponds to.
-    knock(n.thumpAt, 0.3 * n.thump * mechNoise_ * releaseSpeed, 0.004);
+    // The key on its way up: a note-off is taken as the moment the damper meets the string,
+    // which happens about half way up. The key then travels on to its rest.
+    n.keyPhase = 3;
+    n.ky = std::min(n.ky, action_.keyAtDamper);
+    n.kv = -0.15 * releaseSpeed;
+    n.kForce = 0;
+    if (n.checked) { n.checked = false; n.returning = true; }  // the backcheck lets the hammer go
 }
 
 void Piano::setPedal(double position) {
@@ -525,7 +594,7 @@ void Piano::setPedal(double position) {
             StringRT& s = strings_[n.first + i];
             if (!s.hasDamper) continue;
             if (damping < 1.0 && !s.sideways) wake(s);
-            if (!n.keyDown) { s.dampTarget = dampMax_ * damping; s.dampLand = 1; }
+            if (!n.keyDown && !n.sost) { s.dampTarget = dampMax_ * damping; s.dampLand = 1; }
         }
 }
 
@@ -619,7 +688,9 @@ void Piano::stepString(int index) {
 // resulting nonlinear system is monotone and solved by a damped Newton iteration.
 void Piano::stepHammer(NoteRT& n) {
     const int ns = n.count;
-    const double K = n.hK, p = n.hP, b = k_ * k_ / n.hMass;
+    const double K = n.hK * (soft_ ? action_.softPedalHardness : 1.0), p = n.hP, b = k_ * k_ / n.hMass;
+    const int skip = soft_ && ns == 3 ? 0 : -1;  // una corda: the shifted hammer misses the first string
+    if (action_.gravity) { n.veta -= 9.81 * k_ * k_; if (n.sMass > 0) n.vxi -= 9.81 * k_ * k_; }
     if (n.sMass > 0) {  // the shank pulls the head and the head pulls the shank
         double f = n.sK * (n.xi - n.eta) + n.sC * (n.vxi - n.veta) / k_;
         n.veta += k_ * k_ * f / n.hMass;
@@ -645,7 +716,7 @@ void Piano::stepHammer(NoteRT& n) {
         a[i] = s.hamA;
         psi[i] = n.hMu * K * std::pow(pos(zn[i]), p) / (2 * k_);
         r[i] = c[i] - a[i] * s.force;
-        if (zm[i] > 0 || zn[i] > 0 || zm[i] + c[i] > 0) contact = true;
+        if (i != skip && (zm[i] > 0 || zn[i] > 0 || zm[i] + c[i] > 0)) contact = true;
     }
     double S = 0;
     if (contact) {
@@ -664,6 +735,7 @@ void Piano::stepHammer(NoteRT& n) {
                     dsec = (dphi(zp) - sec) / rr[i];
                 }
                 double f = sec + psi[i] * rr[i];
+                if (i == skip) f = 0;
                 if (f > 0) { F[i] = f; dF[i] = dsec + psi[i]; }
                 else { F[i] = 0; dF[i] = 0; }  // felt cannot pull on the string
                 S += F[i];
@@ -728,8 +800,13 @@ void Piano::stepHammer(NoteRT& n) {
     }
     n.veta -= b * S;
     n.eta += n.veta;
-    if (away && n.veta < 0) {  // the hammer has fallen back; the action catches it
+    if (away && n.veta < 0) {  // the hammer is on its way down, clear of the strings
         n.hammerActive = false;
+        n.returning = true;
+        n.checked = false;
+        n.hy = -strings_[n.first].zeta;
+        n.hv = -n.veta / k_;
+        n.hSlow = 0;
         for (int i = 0; i < ns; i++) strings_[n.first + i].force = 0;
     }
 }
@@ -825,8 +902,10 @@ void Piano::step(double& pL, double& pR) {
             for (int q = 0; q < at.n; q++) r[at.idx[q]] += (RealP)(at.w[q] * f);
         }
     }
-    for (NoteRT& n : notes_)
+    for (NoteRT& n : notes_) {
         if (n.hammerActive) stepHammer(n);
+        if (n.keyPhase == 1 || n.keyPhase == 3 || n.returning) stepAction(n, r);
+    }
     vb_ ^= 1;
     runChunks(1);  // advance the string displacements while this thread solves for the stiffeners
     P.solveStiff(r);

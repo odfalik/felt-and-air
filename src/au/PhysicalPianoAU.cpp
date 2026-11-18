@@ -54,6 +54,8 @@ struct Unit {
         else if (m.type == 0) piano->noteOff(m.a, m.b > 0 ? m.b / 64.0 : 1.0);
         else if (m.type == 2) piano->setPedal(m.a / 127.0);
         else if (m.type == 3) { for (int k = 21; k <= 108; k++) piano->noteOff(k); piano->setPedal(0); }
+        else if (m.type == 4) piano->setSoftPedal(m.a >= 64);
+        else if (m.type == 5) piano->setSostenuto(m.a >= 64);
     }
 };
 
@@ -290,6 +292,8 @@ OSStatus MIDIEvent(void* self, UInt32 status, UInt32 d1, UInt32 d2, UInt32 offse
     else if (kind == 0x80 || kind == 0x90) { m.type = 0; if (kind == 0x90) m.b = 0; }
     else if (kind == 0xB0 && d1 == 64) { m.type = 2; m.a = (int)d2; }
     else if (kind == 0xB0 && (d1 == 120 || d1 == 123)) m.type = 3;
+    else if (kind == 0xB0 && d1 == 67) { m.type = 4; m.a = (int)d2; }
+    else if (kind == 0xB0 && d1 == 66) { m.type = 5; m.a = (int)d2; }
     if (m.type >= 0 && u->midi.size() < u->midi.capacity()) u->midi.push_back(m);
     return noErr;
 }

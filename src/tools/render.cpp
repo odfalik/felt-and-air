@@ -55,7 +55,9 @@ int main(int argc, char** argv) {
         ev = {{0.05, 1, 60, 80}, {4.0, 0, 60, 0}};
         seconds = 5.0;
     } else if (score.size() > 4 && score.substr(score.size() - 4) == ".mid") {
-        for (const MidiEvent& m : readMidiFile(score)) ev.push_back({m.seconds, m.type, m.type == 2 ? 0 : m.a, m.type == 2 ? m.a : m.b});
+        std::vector<MidiEvent> midi = readMidiFile(score);
+        leadNotesByFlight(midi, GrandOptions().letOffMm * 1e-3, midiVelocityToHammerSpeed);
+        for (const MidiEvent& m : midi) if (m.type <= 2) ev.push_back({m.seconds, m.type, m.type == 2 ? 0 : m.a, m.type == 2 ? m.a : m.b});
         if (ev.empty()) { std::fprintf(stderr, "no notes in %s\n", score.c_str()); return 1; }
         seconds = ev.back().t + 4.0;
     } else {

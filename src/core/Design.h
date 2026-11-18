@@ -112,6 +112,27 @@ struct PianoDesign {
     // Knocks and friction of the pedal work and the returning keys, as forces on the case
     // that reach the board. 1 is the reference guess; 0 turns them off.
     double mechanismNoise = 1.0;
+    // The action, from the moment the hammer leaves the jack (let-off). Before that the key,
+    // wippen and jack only accelerate the hammer, and their result, the hammer's speed, is
+    // what a note-on carries.
+    struct Action {
+        double letOff = 0.002;        // hammer to string at let-off, m
+        double checkDistance = 0.015; // where the backcheck catches the returning hammer, below the string
+        double restDistance = 0.047;  // hammer at rest, below the string
+        bool gravity = true;          // the hammer flies and falls under gravity
+        double keyTravel = 0.010;     // key front, m
+        double keyAtLetOff = 0.0092;  // key position when the jack lets go
+        double keyAtDamper = 0.0045;  // key position at which the damper meets the string
+        double keyMass = 0.10;        // key and wippen as felt at the key front, kg
+        double ratio = 5.5;           // hammer speed over key speed
+        double upWeight = 0.25;       // force returning the key, N
+        // Felts: a stiffening spring K z^p plus a drag C dz/dt. The drag is what makes them
+        // swallow a blow instead of bouncing it back.
+        double feltK = 4.5e5, feltP = 1.5, feltC = 50.0;      // key rail felts
+        double stopK = 6.3e4, stopP = 1.5, stopC = 3.0;       // backcheck and hammer rest
+        double caseShare = 0.15;      // share of these stop forces that reaches the soundboard
+        double softPedalHardness = 0.6;  // felt hardness under the shifted (una corda) hammer, x normal
+    } action;
     double damperStrength = 1.0;
     std::vector<NoteDesign> notes;
     Listener ears[2];
@@ -146,6 +167,7 @@ struct GrandOptions {
     double strikePosition = 1.0;     // x reference: strike point along the string
     double keyThump = 1.0;           // x reference: knock of the key on the keybed
     double shankHz = 300;            // springiness of the hammer shank; high = rigid
+    double letOffMm = 2.0;           // hammer to string when the jack lets go
     double damperStrength = 1.0;     // x reference
     double damperPressN = 0.12;      // resting force of a damper on one string
     double mechanismNoise = 1.0;     // x reference: pedal work and key return

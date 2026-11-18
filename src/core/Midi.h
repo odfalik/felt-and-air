@@ -9,7 +9,7 @@
 
 namespace pp {
 
-struct MidiEvent { double seconds; int type, a, b; };  // 1 note on (a note, b velocity), 0 note off (b release velocity, 0 unknown), 2 pedal (a = position 0..127)
+struct MidiEvent { double seconds; int type, a, b; };  // 1 note on (a note, b velocity), 0 note off (b release velocity, 0 unknown), 2 sustain pedal (a = position 0..127), 3 soft pedal (a), 4 sostenuto (a)
 
 inline std::vector<MidiEvent> readMidiFile(const std::string& path) {
     std::vector<MidiEvent> out;
@@ -59,6 +59,8 @@ inline std::vector<MidiEvent> readMidiFile(const std::string& path) {
                 if (hi == 0x90 && b > 0) raw.push_back({tick, 1, a, b});
                 else if (hi == 0x80 || hi == 0x90) raw.push_back({tick, 0, a, hi == 0x80 ? b : 0});  // b: release velocity
                 else if (hi == 0xB0 && a == 64) raw.push_back({tick, 2, b, 0});
+                else if (hi == 0xB0 && a == 67) raw.push_back({tick, 5, b, 0});
+                else if (hi == 0xB0 && a == 66) raw.push_back({tick, 6, b, 0});
             }
         }
         p = end;
@@ -72,9 +74,17 @@ inline std::vector<MidiEvent> readMidiFile(const std::string& path) {
         last = r.tick;
         if (r.type == 3) { usPerQuarter = r.a; continue; }
         if (r.type == 2) { if (r.a == pedal) continue; pedal = r.a; }
-        out.push_back({seconds, r.type, r.a, r.b});
+        out.push_back({seconds, r.type == 5 ? 3 : r.type == 6 ? 4 : r.type, r.a, r.b});
     }
     return out;
+}
+
+// A recorded note-on marks the hammer reaching the string. The simulated hammer is let go a
+// little earlier and flies there, so start each note early by its flight time.
+inline void leadNotesByFlight(std::vector<MidiEvent>& events, double letOffMetres, double (*speedOf)(int)) {
+    for (MidiEvent& e : events)
+        if (e.type == 1) e.seconds = std::max(0.0, e.seconds - letOffMetres / speedOf(e.b));
+    std::stable_sort(events.begin(), events.end(), [](const MidiEvent& a, const MidiEvent& b) { return a.seconds < b.seconds; });
 }
 
 }  // namespace pp
