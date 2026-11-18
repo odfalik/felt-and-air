@@ -93,10 +93,12 @@ struct Engine {
         // Helpers join the audio thread's workgroup so the system schedules them as one
         // realtime unit instead of preempting them mid-step.
         os_workgroup_t wg = workgroup;
-        piano->setHelperThreads(3, [wg] {
-            static thread_local os_workgroup_join_token_s token;
-            if (wg) os_workgroup_join(wg, &token);
-        });
+        // A thread must leave the group before it ends, or the system aborts the process.
+        static thread_local os_workgroup_join_token_s token;
+        static thread_local bool joined = false;
+        piano->setHelperThreads(
+            3, [wg] { joined = wg && os_workgroup_join(wg, &token) == 0; },
+            [wg] { if (joined) os_workgroup_leave(wg, &token); joined = false; });
         piano->prepareSnapshot(snap);
         piano->prepareSnapshot(snapUI);
         l.assign(8192, 0); r.assign(8192, 0);
@@ -166,6 +168,7 @@ static OSStatus renderCallback(void*, AudioUnitRenderActionFlags*, const AudioTi
 // ------------------------------------------------------------------------------ view
 
 @interface PianoView : NSView
+- (void)rebuildMap;
 @property(nonatomic) int octave;
 @property(nonatomic) int velocity;
 @property(nonatomic) BOOL audioOn;
@@ -413,6 +416,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 - (PianoView*)setUp;
+- (BOOL)openAudio;
 @end
 
 @implementation AppDelegate {
@@ -576,7 +580,13 @@ static int selfTest(const char* png) {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // stand in for the audio thread's priority
     [NSApplication sharedApplication];
     AppDelegate* d = [AppDelegate new];
+    BOOL audio = [d openAudio];  // opened but never started, so helpers get the real thread group and nothing sounds
     PianoView* view = [d setUp];  // window is built but never shown
+    // Rebuild the engine the way the grid and string controls do.
+    for (double g : {1.0, 1.25, 1.5}) { gEngine.gridScale = g; gEngine.sideways = g == 1.25; gEngine.build(); [view rebuildMap]; }
+    gEngine.sideways = false;
+    gEngine.build(); [view rebuildMap];
+    printf("selftest: engine rebuilt 4 times, audio device %s, thread group %s\n", audio ? "opened" : "unavailable", gEngine.workgroup ? "joined" : "none");
     printf("selftest: %zu demo recordings loaded\n", gEngine.demos.size());
     std::vector<float> L(256), R(256);
     float peak = 0;

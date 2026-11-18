@@ -65,7 +65,7 @@ struct Piano::Pool {
 
 Piano::~Piano() { setHelperThreads(0); }
 
-void Piano::setHelperThreads(int count, std::function<void()> onStart) {
+void Piano::setHelperThreads(int count, std::function<void()> onStart, std::function<void()> onExit) {
     if (pool_) {
         pool_->stop = true;
         { std::lock_guard<std::mutex> g(pool_->m); }
@@ -78,7 +78,7 @@ void Piano::setHelperThreads(int count, std::function<void()> onStart) {
     Pool* p = pool_.get();
     p->chunks = (int)chunks_.size();
     for (int i = 0; i < count; i++)
-        p->threads.emplace_back([this, p, onStart] {
+        p->threads.emplace_back([this, p, onStart, onExit] {
 #if defined(__APPLE__)
             pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
@@ -100,6 +100,7 @@ void Piano::setHelperThreads(int count, std::function<void()> onStart) {
 #endif
                 }
             }
+            if (onExit) onExit();
         });
 }
 

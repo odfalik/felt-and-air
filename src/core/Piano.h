@@ -29,8 +29,9 @@ public:
 
     // Helper threads that share the string work when many strings are ringing. They idle
     // (asleep) until then. Call before audio starts.
-    // onStart runs once on each helper thread (for example to join an audio workgroup).
-    void setHelperThreads(int count, std::function<void()> onStart = {});
+    // onStart and onExit run once on each helper thread, at its start and just before it
+    // ends (for example to join and leave an audio workgroup).
+    void setHelperThreads(int count, std::function<void()> onStart = {}, std::function<void()> onExit = {});
     bool helpersBusy() const;
 
     // Control. Call from the same thread as process(); none of these allocate.
