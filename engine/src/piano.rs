@@ -369,18 +369,7 @@ impl Shared {
             let (ua, ub, va) = (u[n], u[n - 1], v[n]);
             *end_force = s.m_node * (-(s.a_t * (u_n - ua) + s.a_d * (v_n - va)) - s.a_b * (ub - 2.0 * ua + u_n));
         }
-        let (cu0, cu1, cu2, cv0, cv1) = (s.cu0, s.cu1, s.cu2, s.cv0, s.cv1);
-        {
-            let (u, v, vn) = (&u[..n + 3], &v[..n + 3], &mut vn[..n + 3]);
-            for l in 2..=n {
-                // node l-1
-                *vn.get_unchecked_mut(l) = cv0 * *v.get_unchecked(l)
-                    + cv1 * (*v.get_unchecked(l - 1) + *v.get_unchecked(l + 1))
-                    + cu0 * *u.get_unchecked(l)
-                    + cu1 * (*u.get_unchecked(l - 1) + *u.get_unchecked(l + 1))
-                    + cu2 * (*u.get_unchecked(l - 2) + *u.get_unchecked(l + 2));
-            }
-        }
+        string_kernel(u, v, vn, [s.cu0, s.cu1, s.cu2, s.cv0, s.cv1]);
         vn[1] = 0.0;
 
         // Stretching. The strain of a cell is its end-to-end stretch plus the extra length the
@@ -1005,6 +994,34 @@ impl Piano {
     }
 }
 
+/// Stiff string update. Slices hold nodes -1..=N+1; nodes 1..N-1 are written.
+#[inline]
+fn string_kernel(u: &[f64], v: &[f64], vn: &mut [f64], c: [f64; 5]) {
+    let [cu0, cu1, cu2, cv0, cv1] = c;
+    let len = vn.len();
+    assert!(len >= 5 && u.len() == len && v.len() == len);
+    for l in 2..len - 1 {
+        unsafe {
+            let (ul, vl) = (|j: usize| *u.get_unchecked(j), |j: usize| *v.get_unchecked(j));
+            *vn.get_unchecked_mut(l) = cu2.mul_add(ul(l - 2) + ul(l + 2), cu1.mul_add(ul(l - 1) + ul(l + 1), cu0.mul_add(ul(l), cv1.mul_add(vl(l - 1) + vl(l + 1), cv0 * vl(l)))));
+        }
+    }
+}
+
+/// Plate update over one span: scale the right hand side into the change of the increment,
+/// advance increment and displacement, and keep the change for the radiation task.
+#[inline]
+fn plate_advance(r: &[f64], scale: &[f64], vw: &mut [f64], w: &mut [f64], keep: &mut [f64]) {
+    let n = r.len();
+    assert!(scale.len() == n && vw.len() == n && w.len() == n && keep.len() == n);
+    for t in 0..n {
+        let dv = r[t] * scale[t]; // dt^2 * acceleration
+        vw[t] += dv;
+        w[t] += vw[t];
+        keep[t] = dv;
+    }
+}
+
 fn felt(z: f64, zdot: f64, k: f64, p: f64, drag: f64) -> f64 {
     if z <= 0.0 {
         return 0.0;
@@ -1519,7 +1536,8 @@ impl Piano {
 
     /// One internal time step; returns the two ear pressures in pascal at the internal rate.
     pub fn step(&mut self) -> (f64, f64) {
-        let sh = self.sh.clone();
+        // A plain reference that does not tie up `self`: the shared state outlives this call.
+        let sh: &Shared = unsafe { &*Arc::as_ptr(&self.sh) };
         let k = self.k;
         let shared = !self.threads.is_empty() && sh.active.load(Ordering::Relaxed);
         // Start a pass over all chunks of a phase. With helpers active the caller may do other
@@ -1622,13 +1640,7 @@ impl Piano {
             let scale = sh.plate.diag_scale();
             for sp in &sh.plate.spans {
                 let range = sp.start..sp.start + sp.len;
-                let (rs, ss, vs, ws, ks) = (&r[range.clone()], &scale[range.clone()], &mut vw[range.clone()], &mut w[range.clone()], &mut keep[range]);
-                for t in 0..rs.len() {
-                    let dv = rs[t] * ss[t]; // change of the increment, dt^2 * acceleration
-                    vs[t] += dv;
-                    ws[t] += vs[t];
-                    ks[t] = dv;
-                }
+                plate_advance(&r[range.clone()], &scale[range.clone()], &mut vw[range.clone()], &mut w[range.clone()], &mut keep[range]);
             }
             let (live, eu, ev) = unsafe { (sh.end_live.all(), sh.end_u.all_mut(), sh.end_v.all_mut()) };
             for i in 0..live.len() {

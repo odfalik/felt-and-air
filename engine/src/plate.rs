@@ -265,6 +265,25 @@ impl Triplets {
     }
 }
 
+/// The 13 point plate stencil on w and its 5 point damping twin on v, for one span.
+#[inline]
+fn span_kernel(w: &[f64], v: &[f64], c0: &[f64], rs: &mut [f64], start: usize, s: usize, c: &[f64; 9]) {
+    let [a0, a1x, a1y, a2x, a2y, a11, b0, bx, by] = *c;
+    assert!(start >= 2 * s + 2 && start + rs.len() + 2 * s + 2 <= w.len() && v.len() == w.len() && c0.len() == w.len());
+    for (t, out) in rs.iter_mut().enumerate() {
+        let i = start + t;
+        unsafe {
+            let g = |x: &[f64], j: usize| *x.get_unchecked(j);
+            let kw = a11.mul_add(
+                g(w, i - s - 1) + g(w, i - s + 1) + g(w, i + s - 1) + g(w, i + s + 1),
+                a2y.mul_add(g(w, i - 2) + g(w, i + 2), a2x.mul_add(g(w, i - 2 * s) + g(w, i + 2 * s), a1y.mul_add(g(w, i - 1) + g(w, i + 1), a1x.mul_add(g(w, i - s) + g(w, i + s), a0 * g(w, i))))),
+            );
+            let dv = by.mul_add(g(v, i - 1) + g(v, i + 1), bx.mul_add(g(v, i - s) + g(v, i + s), (b0 + g(c0, i)) * g(v, i)));
+            *out = -(kw + dv);
+        }
+    }
+}
+
 fn resample(line: &[Vec2], ds: f64) -> Vec<Vec2> {
     let mut cum = vec![0.0; line.len()];
     for i in 1..line.len() {
@@ -920,25 +939,13 @@ impl Plate {
     /// `w`, `v`, `r` must point to `grid_size` elements; no other thread may write the spans
     /// in the range or read `r` there while this runs.
     pub unsafe fn apply_stencil(&self, w: *const f64, v: *const f64, r: *mut f64, span_from: usize, span_to: usize) {
-        let s = self.stride as isize;
-        let (a0, a1x, a1y, a2x, a2y, a11) = (self.a0, self.a1x, self.a1y, self.a2x, self.a2y, self.a11);
-        let (b0, bx, by) = (self.b0, self.bx, self.by);
-        let c0 = self.c0dt.as_ptr();
+        let coef = [self.a0, self.a1x, self.a1y, self.a2x, self.a2y, self.a11, self.b0, self.bx, self.by];
+        let n = self.grid_size;
         for sp in &self.spans[span_from..span_to] {
-            let ws = w.add(sp.start);
-            let vs = v.add(sp.start);
-            let cs = c0.add(sp.start);
-            let rs = r.add(sp.start);
-            for t in 0..sp.len as isize {
-                let kw = a0 * *ws.offset(t)
-                    + a1x * (*ws.offset(t - s) + *ws.offset(t + s))
-                    + a1y * (*ws.offset(t - 1) + *ws.offset(t + 1))
-                    + a2x * (*ws.offset(t - 2 * s) + *ws.offset(t + 2 * s))
-                    + a2y * (*ws.offset(t - 2) + *ws.offset(t + 2))
-                    + a11 * (*ws.offset(t - s - 1) + *ws.offset(t - s + 1) + *ws.offset(t + s - 1) + *ws.offset(t + s + 1));
-                let dv = (b0 + *cs.offset(t)) * *vs.offset(t) + bx * (*vs.offset(t - s) + *vs.offset(t + s)) + by * (*vs.offset(t - 1) + *vs.offset(t + 1));
-                *rs.offset(t) = -(kw + dv);
-            }
+            // The output span is handed over as its own exclusive slice. Spans never overlap, and
+            // the inputs are only read, so the compiler may vectorise without overlap checks.
+            let rs = std::slice::from_raw_parts_mut(r.add(sp.start), sp.len);
+            span_kernel(std::slice::from_raw_parts(w, n), std::slice::from_raw_parts(v, n), &self.c0dt, rs, sp.start, self.stride, &coef);
         }
     }
 
