@@ -55,6 +55,7 @@ struct Engine {
     os_workgroup_t workgroup = nullptr;  // the audio device's realtime thread group
     bool sideways = false;
     int listener = 0;  // 0 in the room, 1 at the keyboard, 2 no room
+    GrandOptions voicing;  // what the Instrument panel edits
     int framesSinceSnap = 0;
 
     // Demo recordings, loaded once at start. The audio thread only reads them.
@@ -84,7 +85,7 @@ struct Engine {
     mach_timebase_info_data_t tb;
 
     void build() {
-        GrandOptions g;
+        GrandOptions g = voicing;
         g.twoPolarisations = sideways;
         g.playerPerspective = listener == 1;
         design = makeGrand(g);
@@ -424,6 +425,9 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 - (PianoView*)setUp;
 - (BOOL)openAudio;
 - (void)toggleAudio:(id)sender;
+- (void)showPanel:(id)sender;
+- (void)buildPanel;
+- (NSPanel*)panel;
 @end
 
 @implementation AppDelegate {
@@ -439,6 +443,9 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     NSPopUpButton* _demoMenu;
     NSPopUpButton* _gridMenu;
     NSPopUpButton* _listenerMenu;
+    NSPanel* _panel;
+    NSMutableArray<NSSlider*>* _sliders;
+    NSMutableArray<NSTextField*>* _values;
     NSSlider* _volume;
 }
 
@@ -495,6 +502,94 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     [_window makeFirstResponder:_view];
 }
 
+// One row of the Instrument panel: a physical quantity of the design.
+struct Knob { const char* name; double GrandOptions::* field; double lo, hi; bool logScale; const char* format; };
+static const Knob kKnobs[] = {
+    {"Hammer felt hardness", &GrandOptions::hammerHardness, 0.25, 4.0, true, "x %.2f"},
+    {"Hammer mass", &GrandOptions::hammerMass, 0.5, 2.0, true, "x %.2f"},
+    {"Felt damping", &GrandOptions::feltDamping, 0.0, 4.0, false, "x %.2f"},
+    {"Strike point along string", &GrandOptions::strikePosition, 0.6, 1.6, false, "x %.2f"},
+    {"Unison detune", &GrandOptions::unisonDetuneCents, 0.0, 3.0, false, "%.2f cents"},
+    {"String internal loss", &GrandOptions::stringLoss, 0.3, 4.0, true, "x %.2f"},
+    {"Soundboard thickness", &GrandOptions::boardThickness, 0.6, 1.6, false, "x %.2f (8 mm)"},
+    {"Soundboard loss", &GrandOptions::boardLoss, 0.3, 4.0, true, "x %.2f"},
+    {"Rib height", &GrandOptions::ribHeight, 0.5, 1.6, false, "x %.2f (22 mm)"},
+    {"Key knock on keybed", &GrandOptions::keyThump, 0.0, 20.0, false, "x %.1f"},
+    {"Room size", &GrandOptions::roomSize, 0.5, 2.0, true, "x %.2f (9 x 7 x 4 m)"},
+    {"Room absorption", &GrandOptions::roomAbsorption, 0.05, 0.6, false, "%.2f"},
+    {"Lid angle", &GrandOptions::lidAngleDeg, 0.0, 60.0, false, "%.0f deg (0 = closed)"},
+};
+static const int kKnobCount = sizeof(kKnobs) / sizeof(kKnobs[0]);
+static double knobToSlider(const Knob& k, double v) { return k.logScale ? std::log(v / k.lo) / std::log(k.hi / k.lo) : (v - k.lo) / (k.hi - k.lo); }
+static double sliderToKnob(const Knob& k, double t) { return k.logScale ? k.lo * std::pow(k.hi / k.lo, t) : k.lo + t * (k.hi - k.lo); }
+
+- (void)refreshKnobs {
+    for (int i = 0; i < kKnobCount; i++) {
+        double v = gEngine.voicing.*(kKnobs[i].field);
+        _sliders[i].doubleValue = knobToSlider(kKnobs[i], v);
+        _values[i].stringValue = [NSString stringWithFormat:@(kKnobs[i].format), v];
+    }
+}
+
+// Sliders act when released: every change builds a new instrument.
+- (void)knobChanged:(NSSlider*)sender {
+    const Knob& k = kKnobs[sender.tag];
+    gEngine.voicing.*(k.field) = sliderToKnob(k, sender.doubleValue);
+    [self refreshKnobs];
+    [self rebuild:nil];
+}
+
+- (void)resetKnobs:(id)sender {
+    gEngine.voicing = GrandOptions();
+    [self refreshKnobs];
+    [self rebuild:nil];
+}
+
+- (void)showPanel:(id)sender {
+    [self buildPanel];
+    [_panel orderFront:nil];
+}
+
+- (void)buildPanel {
+    if (!_panel) {
+        CGFloat h = 60 + 30 * kKnobCount;
+        _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 560, h)
+                                            styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskUtilityWindow
+                                              backing:NSBackingStoreBuffered defer:NO];
+        _panel.title = @"Instrument";
+        _panel.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+        _panel.floatingPanel = YES;
+        _panel.releasedWhenClosed = NO;
+        _sliders = [NSMutableArray new];
+        _values = [NSMutableArray new];
+        for (int i = 0; i < kKnobCount; i++) {
+            CGFloat y = h - 36 - 30 * i;
+            NSTextField* name = [NSTextField labelWithString:@(kKnobs[i].name)];
+            name.frame = NSMakeRect(16, y, 170, 18);
+            NSSlider* sl = [NSSlider sliderWithValue:0 minValue:0 maxValue:1 target:self action:@selector(knobChanged:)];
+            sl.frame = NSMakeRect(190, y - 2, 200, 22);
+            sl.tag = i;
+            sl.continuous = NO;
+            NSTextField* val = [NSTextField labelWithString:@""];
+            val.frame = NSMakeRect(398, y, 156, 18);
+            val.font = [NSFont monospacedDigitSystemFontOfSize:11 weight:NSFontWeightRegular];
+            [_panel.contentView addSubview:name];
+            [_panel.contentView addSubview:sl];
+            [_panel.contentView addSubview:val];
+            [_sliders addObject:sl];
+            [_values addObject:val];
+        }
+        NSButton* reset = [NSButton buttonWithTitle:@"Reset to reference" target:self action:@selector(resetKnobs:)];
+        reset.frame = NSMakeRect(12, 10, 160, 28);
+        [_panel.contentView addSubview:reset];
+        [self refreshKnobs];
+        NSRect f = _window.frame;
+        [_panel setFrameOrigin:NSMakePoint(NSMaxX(f) + 8, NSMaxY(f) - _panel.frame.size.height)];
+    }
+}
+
+- (NSPanel*)panel { return _panel; }
+
 - (void)volumeChanged:(id)sender { gEngine.volume = (float)_volume.doubleValue; [_window makeFirstResponder:_view]; }
 
 - (void)buildControls {
@@ -520,6 +615,9 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     _playButton = [NSButton buttonWithTitle:@"Play / stop" target:self action:@selector(toggleDemo:)];
     _playButton.frame = NSMakeRect(892, 345, 110, 28);
     [_view addSubview:_playButton];
+    NSButton* inst = [NSButton buttonWithTitle:@"Instrument..." target:self action:@selector(showPanel:)];
+    inst.frame = NSMakeRect(1004, 345, 92, 28);
+    [_view addSubview:inst];
 
     label(@"Board grid", 820, 314);
     _gridMenu = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(886, 312, 116, 26) pullsDown:NO];
@@ -613,6 +711,14 @@ static int selfTest(const char* png) {
     NSBitmapImageRep* rep = [view bitmapImageRepForCachingDisplayInRect:view.bounds];
     [view cacheDisplayInRect:view.bounds toBitmapImageRep:rep];
     [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:@(png) atomically:YES];
+    {   // The Instrument panel, built but not shown on screen.
+        gEngine.voicing.hammerHardness = 2.0;
+        [d buildPanel];
+        NSView* pv = [d panel].contentView;
+        NSBitmapImageRep* pr = [pv bitmapImageRepForCachingDisplayInRect:pv.bounds];
+        [pv cacheDisplayInRect:pv.bounds toBitmapImageRep:pr];
+        [[pr representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[@(png) stringByReplacingOccurrencesOfString:@".png" withString:@"_panel.png"] atomically:YES];
+    }
     printf("selftest: engine load mean %.0f %%, worst block %.0f %%\n", gEngine.load.load() * 100, gEngine.loadPeak.load() * 100);
     printf("selftest: 8 s of the first demo rendered through the callback path, peak %.3f, awake %d, wrote %s\n", peak, gEngine.piano->awakeStrings(), png);
     return peak > 0.001f && std::isfinite(peak) ? 0 : 1;
