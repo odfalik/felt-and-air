@@ -46,6 +46,13 @@ struct BoardDesign {
     double Gxy = 0.70e9;
     double nuxy = 0.37;
     double lossFactor = 0.02;  // structural loss factor eta
+    // The board is glued up as a shallow dome (the crown). Pushing a dome flat stretches it,
+    // which resists normal motion like a spring bed of stiffness sqrt(Ex Ey) H / R^2 per unit
+    // area. That is the long-wavelength limit of shallow shell theory with the rim holding the
+    // edge; it stiffens the lowest modes and fades out above them. 0 means a flat board.
+    double crownRadius = 18.0;
+    // How firmly the rim holds the board's edge slope: 0 simply supported, 1 clamped.
+    double rimClamp = 1.0;
     double sigma0 = 2.0;       // broadband loss, 1/s
     // Ribs run across the grain.
     double ribSpacing = 0.125, ribWidth = 0.024, ribHeight = 0.022;

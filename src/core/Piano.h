@@ -107,6 +107,7 @@ private:
         int hamL = 0; double hamG[2] = {0, 0}; double hamA = 0;
         int dmp0 = 0, dmp1 = 0; double dampRate = 0, dampTarget = 0;
         int dampedSteps = 0;   // steps spent fully damped
+        double endPeak = 0;    // recent size of the bridge motion at this string
         int fitPartial = 1;    // partial used to fit the grid dispersion
         double f0 = 0, inharm = 0;
         double zeta = 0, zetaPrev = 0, force = 0;

@@ -143,6 +143,8 @@ static void testPlateAnalytic() {
     d.board.outline = {{0, 0}, {1.2, 0}, {1.2, 0.8}, {0, 0.8}};
     d.board.grainAngle = 0;
     d.board.ribs = false;
+    d.board.crownRadius = 0;
+    d.board.rimClamp = 0;
     d.board.bridges.clear();
     for (auto& s : d.notes[0].strings) s.attached = false;
     for (int os : {1, 2}) {

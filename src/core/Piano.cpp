@@ -550,7 +550,9 @@ void Piano::stepHammer(NoteRT& n) {
 
 void Piano::housekeeping() {
     // A string that has sat under its damper for a while and has stopped moving on its own
-    // is put to sleep. From then on the bridge sees it as a plain dashpot.
+    // is put to sleep. From then on the bridge sees it as a plain dashpot. "On its own" matters:
+    // while the board still rings it keeps shaking the damped string by about the bridge's own
+    // displacement, and that forced motion is exactly what the dashpot stands for.
     const int settle = (int)(0.15 * fs_ / 64);
     for (StringRT& s : strings_) {
         if (!s.awake || !s.hasDamper || !s.attached) continue;
@@ -558,8 +560,9 @@ void Piano::housekeeping() {
         if (++s.dampedSteps < settle) continue;
         const RealS* u = &u_[s.off];
         double uN = u[s.N], m = 0;
-        for (int l = 1; l < s.N; l++) m = std::max(m, std::fabs(u[l] - uN * l / s.N));
-        if (m < 1e-8) sleep(s);
+        s.endPeak = std::max(std::fabs(uN), 0.97 * s.endPeak);
+        for (int l = 1; l < s.N; l++) m = std::max(m, std::fabs((double)u[l] - uN * l / s.N));
+        if (m < 1e-8 + 3 * s.endPeak) sleep(s);
     }
     // Bring the helpers in only when there is enough string work to share.
     if (pool_) {

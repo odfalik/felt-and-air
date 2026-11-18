@@ -204,6 +204,7 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
     const double Dx = board.Ex * H * H * H / den, Dy = board.Ey * H * H * H / den;
     const double D1 = nuyx * Dx, Dk = board.Gxy * H * H * H / 12.0;
 
+    const double shell = board.crownRadius > 0 ? std::sqrt(board.Ex * board.Ey) * H / (board.crownRadius * board.crownRadius) : 0.0;
     mass.assign(n, rhoH * area);
     Triplets tk, ti, td, tp;  // full stiffness, implicit part, damping, bare plate
     std::vector<double> ribEI(n, 0.0);
@@ -242,6 +243,7 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
         fx.add(id(i - 1, j), 1 / (hx * hx)); fx.add(a, -2 / (hx * hx)); fx.add(id(i + 1, j), 1 / (hx * hx));
         fy.add(id(i, j - 1), 1 / (hy * hy)); fy.add(a, -2 / (hy * hy)); fy.add(id(i, j + 1), 1 / (hy * hy));
         for (Triplets* t : {&tk, &tp}) {
+            if (shell > 0) { Form self; self.add(a, 1.0); t->quad(self, shell * area); }
             t->quad(fx, Dx * area);
             t->quad(fy, Dy * area);
             t->outer(fx, fy, D1 * area);
@@ -263,6 +265,21 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
             mass[a] += board.ribRho * bw * h * hy;
         }
     }
+    // Clamped rim: the slope is zero at the edge, so the board bends right at the rim. With
+    // the mirror condition the curvature at a rim point is twice the value a zero outside
+    // would give, over half a cell.
+    if (board.rimClamp > 0)
+        for (int j = -1; j <= Ny; j++)
+            for (int i = -1; i <= Nx; i++) {
+                if (id(i, j) >= 0) continue;
+                Form fx, fy;
+                fx.add(id(i - 1, j), 1 / (hx * hx)); fx.add(id(i + 1, j), 1 / (hx * hx));
+                fy.add(id(i, j - 1), 1 / (hy * hy)); fy.add(id(i, j + 1), 1 / (hy * hy));
+                for (Triplets* t : {&tk, &tp}) {
+                    if (fx.n == 1) t->quad(fx, 2 * Dx * area * board.rimClamp);
+                    if (fy.n == 1) t->quad(fy, 2 * Dy * area * board.rimClamp);
+                }
+            }
     // Twist energy lives on cells.
     for (int j = -1; j < Ny; j++)
         for (int i = -1; i < Nx; i++) {
@@ -348,7 +365,7 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
     // Uniform interior stencil of the bare plate, and its damping twin.
     const double Dm = 2 * D1 + 4 * Dk, q = dt * dt * area;
     const double x4 = 1 / (hx * hx * hx * hx), y4 = 1 / (hy * hy * hy * hy), xy = 1 / (hx * hx * hy * hy);
-    a0_ = q * (6 * Dx * x4 + 6 * Dy * y4 + 4 * Dm * xy);
+    a0_ = q * (6 * Dx * x4 + 6 * Dy * y4 + 4 * Dm * xy + shell);
     a1x_ = q * (-4 * Dx * x4 - 2 * Dm * xy);
     a1y_ = q * (-4 * Dy * y4 - 2 * Dm * xy);
     a2x_ = q * Dx * x4;
