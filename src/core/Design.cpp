@@ -137,8 +137,13 @@ PianoDesign makeGrand(const GrandOptions& o) {
         d.notes.push_back(n);
     }
 
-    d.ears[0] = {0.35, 0.55, 0.9};
-    d.ears[1] = {1.05, 0.45, 0.9};
+    if (o.playerPerspective) {  // seated at the keyboard
+        d.ears[0] = {0.61, -0.45, 0.45};
+        d.ears[1] = {0.79, -0.45, 0.45};
+    } else {  // a listener two metres off the treble side, facing the open lid
+        d.ears[0] = {3.4, 0.45, 0.45};
+        d.ears[1] = {3.4, 0.95, 0.45};
+    }
     return d;
 }
 

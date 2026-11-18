@@ -57,12 +57,30 @@ struct BoardDesign {
     double bridgeE = 12.0e9, bridgeRho = 680;
 };
 
+// Ear position in piano coordinates, z measured upward from the soundboard.
 struct Listener { double x = 0, y = 0, z = 1; };
+
+// A rectangular room. The piano's coordinate origin (bass end of the keyboard side of the
+// board) sits at (pianoX, pianoY) on the floor plan, the board boardHeight above the floor.
+struct RoomDesign {
+    bool enabled = true;
+    double Lx = 9, Ly = 7, Lz = 4;
+    double pianoX = 3.0, pianoY = 2.2, boardHeight = 0.75;
+    double absorption = 0.18;  // mean absorption coefficient of all surfaces
+};
+
+// The grand's lid, hinged along the bass side.
+struct LidDesign {
+    bool open = true;
+    double angleDeg = 38, hingeHeight = 0.28, width = 1.45, length = 1.55, reflection = 0.9;
+};
 
 struct PianoDesign {
     BoardDesign board;
     std::vector<NoteDesign> notes;
     Listener ears[2];
+    RoomDesign room;
+    LidDesign lid;
     double airRho = 1.2, airC = 343.0;
 };
 
@@ -73,6 +91,7 @@ struct GrandOptions {
     double hammerTiltDeg = 4.0;      // assumed
     bool twoPolarisations = true;
     bool stretchTuning = true;       // octaves tuned by matching partials, as on a real piano
+    bool playerPerspective = false;  // ears at the keyboard instead of in the room
 };
 
 // A generic 2 m class grand. Not a model of any specific instrument.

@@ -54,6 +54,7 @@ struct Engine {
     double sampleRate = 48000, gridScale = 1.5;
     os_workgroup_t workgroup = nullptr;  // the audio device's realtime thread group
     bool sideways = false;
+    int listener = 0;  // 0 in the room, 1 at the keyboard, 2 no room
     int framesSinceSnap = 0;
 
     // Demo recordings, loaded once at start. The audio thread only reads them.
@@ -85,7 +86,9 @@ struct Engine {
     void build() {
         GrandOptions g;
         g.twoPolarisations = sideways;
+        g.playerPerspective = listener == 1;
         design = makeGrand(g);
+        if (listener == 2) { design.room.enabled = false; design.lid.open = false; }
         demoPlaying = -1; demoIndex = -1;
         PianoOptions o;
         o.sampleRate = sampleRate;
@@ -435,6 +438,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     NSButton* _sidewaysBox;
     NSPopUpButton* _demoMenu;
     NSPopUpButton* _gridMenu;
+    NSPopUpButton* _listenerMenu;
     NSSlider* _volume;
 }
 
@@ -483,6 +487,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     const double scales[] = {1.0, 1.25, 1.5};
     gEngine.gridScale = scales[std::clamp((int)_gridMenu.indexOfSelectedItem, 0, 2)];
     gEngine.sideways = _sidewaysBox.state == NSControlStateValueOn;
+    gEngine.listener = (int)_listenerMenu.indexOfSelectedItem;
     gEngine.build();
     [_view rebuildMap];
     [_view clearKeys];
@@ -522,8 +527,12 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     [_gridMenu selectItemAtIndex:2];
     _gridMenu.target = self; _gridMenu.action = @selector(rebuild:);
     [_view addSubview:_gridMenu];
-    _sidewaysBox = [NSButton checkboxWithTitle:@"Sideways string motion (2x string cost, barely audible)" target:self action:@selector(rebuild:)];
-    _sidewaysBox.frame = NSMakeRect(468, 372, 420, 20);
+    _listenerMenu = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(820, 370, 182, 26) pullsDown:NO];
+    [_listenerMenu addItemsWithTitles:@[@"Listener: in the room", @"Listener: at the keys", @"No room, lid off"]];
+    _listenerMenu.target = self; _listenerMenu.action = @selector(rebuild:);
+    [_view addSubview:_listenerMenu];
+    _sidewaysBox = [NSButton checkboxWithTitle:@"Sideways string motion (2x string cost)" target:self action:@selector(rebuild:)];
+    _sidewaysBox.frame = NSMakeRect(468, 372, 340, 20);
     _sidewaysBox.contentTintColor = [NSColor whiteColor];
     [_view addSubview:_sidewaysBox];
 }
@@ -587,7 +596,8 @@ static int selfTest(const char* png) {
     BOOL audio = [d openAudio];  // opened but never started, so helpers get the real thread group and nothing sounds
     PianoView* view = [d setUp];  // window is built but never shown
     // Rebuild the engine the way the grid and string controls do.
-    for (double g : {1.0, 1.25, 1.5}) { gEngine.gridScale = g; gEngine.sideways = g == 1.25; gEngine.build(); [view rebuildMap]; }
+    for (double g : {1.0, 1.25, 1.5}) { gEngine.gridScale = g; gEngine.sideways = g == 1.25; gEngine.listener = g == 1.0 ? 1 : 2; gEngine.build(); [view rebuildMap]; }
+    gEngine.listener = 0;
     gEngine.sideways = false;
     gEngine.build(); [view rebuildMap];
     printf("selftest: engine rebuilt 4 times, audio device %s, thread group %s\n", audio ? "opened" : "unavailable", gEngine.workgroup ? "joined" : "none");

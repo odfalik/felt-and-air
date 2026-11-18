@@ -1,5 +1,6 @@
 // Validation suite. Each test checks a physical or numerical property of the model and
 // prints the measured numbers, so the output doubles as a report.
+#include "Acoustics.h"
 #include "Piano.h"
 #include "Util.h"
 #include <cmath>
@@ -332,6 +333,62 @@ static void testRobustness() {
     CHECK(std::isfinite(e) && e < 10.0, "stored energy %.4f J stays bounded", e);
 }
 
+static void testRoom() {
+    std::printf("\n12. Room: arrival time, mirror images, reverberant decay\n");
+    PianoDesign d = oneNote();
+    Piano p(d, {48000, 1});
+    const Plate& P = p.plate();
+    Vec2 at = d.notes[0].strings[0].bridge;
+    Interp it = P.interp(at);
+    int node = it.idx[0];
+    double best = 0;
+    for (int q = 0; q < 4; q++) if (it.w[q] > best) { best = it.w[q]; node = it.idx[q]; }
+    int a = 0;
+    for (int i = 0; i < P.n; i++) if (P.gid[i] == node) a = i;
+    Vec2 pos = P.nodePosition(a);
+    auto response = [&](const PianoDesign& dd, int steps) {
+        Radiation rad;
+        rad.build(P, dd, 48000);
+        std::vector<RealP> r(P.gridSize, 0);
+        std::vector<double> out(steps);
+        double l, rr;
+        for (int n = 0; n < steps; n++) {
+            r[node] = n == 0 ? 1 : 0;
+            rad.step(r.data(), l, rr);
+            out[n] = l;
+        }
+        return std::make_pair(out, rad);
+    };
+    PianoDesign dry = d;
+    dry.room.enabled = false; dry.lid.open = false;
+    auto [h0, rad0] = response(dry, 4800);
+    int first = 0;
+    for (int n = 0; n < 4800; n++) if (h0[n] != 0) { first = n; break; }
+    double dist = std::sqrt(std::pow(pos.x - d.ears[0].x, 2) + std::pow(pos.y - d.ears[0].y, 2) + d.ears[0].z * d.ears[0].z);
+    CHECK(std::abs(first - dist / 343.0 * 48000) <= 1.0, "direct sound arrives after %.2f ms for a %.2f m path", first / 48.0, dist);
+
+    auto [h, rad] = response(d, 48000 * 3);
+    std::printf("      %d mirror images over %d board patches; Sabine reverberation time %.2f s\n", rad.imageCount, rad.patchCount, rad.reverbTime);
+    double direct = h0[first] * h0[first], early = 0, late = 0;
+    int split = first + (int)(0.08 * 48000);
+    for (int n = 0; n < (int)h.size(); n++) (n < split ? early : late) += h[n] * h[n];
+    std::printf("      energy relative to the direct sound: first 80 ms %+.1f dB, later %+.1f dB\n", 10 * std::log10(early / direct),
+                10 * std::log10(late / direct));
+    // Decay time from the backward integrated tail, fitted between -5 and -25 dB.
+    std::vector<double> sch(h.size());
+    double acc = 0;
+    for (int n = (int)h.size() - 1; n >= 0; n--) { acc += h[n] * h[n]; sch[n] = acc; }
+    int n5 = -1, n25 = -1;
+    for (int n = split; n < (int)h.size(); n++) {
+        double db = 10 * std::log10(sch[n] / sch[split]);
+        if (n5 < 0 && db <= -5) n5 = n;
+        if (n25 < 0 && db <= -25) { n25 = n; break; }
+    }
+    double t60 = n25 > n5 && n5 > 0 ? 3.0 * (n25 - n5) / 48000.0 : 0;
+    CHECK(std::fabs(t60 - rad.reverbTime) < 0.2 * rad.reverbTime, "measured decay time %.2f s against Sabine %.2f s", t60, rad.reverbTime);
+    CHECK(late > 0 && late < 30 * direct, "reverberant level is finite and plausible");
+}
+
 static void testThreads() {
     std::printf("\n11. Helper threads give bit-identical output\n");
     std::vector<float> ref, out;
@@ -360,7 +417,7 @@ int main(int argc, char** argv) {
         {"kernel", testKernelMatchesAssembly}, {"energy", testEnergyConservation}, {"free", testEnergyAfterRelease},
         {"passivity", testPassivity},          {"plate", testPlateAnalytic},       {"partials", testStringPartials},
         {"hammer", testHammer},                {"reciprocity", testReciprocity},   {"coupling", testCoupling},
-        {"robust", testRobustness},           {"threads", testThreads}};
+        {"robust", testRobustness},           {"threads", testThreads},           {"room", testRoom}};
     for (auto& t : tests)
         if (argc < 2 || t.first == argv[1]) t.second();
     std::printf("\n%s (%d failed checks)\n", failures ? "FAILED" : "ALL PASSED", failures);

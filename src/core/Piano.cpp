@@ -285,38 +285,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     }
     w_.assign(P.gridSize, 0); vw_.assign(P.gridSize, 0); r_.assign(P.gridSize, 0);
 
-    // Rayleigh integral over a baffled board: p = rho/(2 pi) * sum dS * accel(t - r/c) / r.
-    // Delays are rounded to the nearest step (a path error under 4 mm at 48 kHz, well below
-    // the grid spacing).
-    int ringLen = 1;
-    for (int e = 0; e < 2; e++) {
-        std::vector<int> delay(P.n);
-        std::vector<double> gain(P.n);
-        int lo = 1 << 30, hi = 0;
-        for (int a = 0; a < P.n; a++) {
-            Vec2 p = P.nodePosition(a);
-            double r = std::sqrt(std::pow(p.x - d.ears[e].x, 2) + std::pow(p.y - d.ears[e].y, 2) +
-                                 d.ears[e].z * d.ears[e].z);
-            delay[a] = (int)std::lround(r / d.airC * fs_);
-            gain[a] = d.airRho * P.hx * P.hy / (2 * M_PI * r) / (k * k);  // rhs is dt^2 * accel
-            lo = std::min(lo, delay[a]); hi = std::max(hi, delay[a]);
-        }
-        binFirst_[e] = lo;
-        binPtr_[e].assign(hi - lo + 2, 0);
-        for (int a = 0; a < P.n; a++) binPtr_[e][delay[a] - lo + 1]++;
-        for (int b = 0; b < hi - lo + 1; b++) binPtr_[e][b + 1] += binPtr_[e][b];
-        std::vector<int> fill(binPtr_[e].begin(), binPtr_[e].end() - 1);
-        tapIdx_[e].resize(P.n); tapGain_[e].resize(P.n);
-        for (int a = 0; a < P.n; a++) {
-            int q = fill[delay[a] - lo]++;
-            tapIdx_[e][q] = P.gid[a];
-            tapGain_[e][q] = (RealP)gain[a];
-        }
-        while (ringLen < hi + 4) ringLen <<= 1;
-    }
-    ringMask_ = ringLen - 1;
-    ring_[0].assign(ringLen, 0.0);
-    ring_[1].assign(ringLen, 0.0);
+    radiation_.build(P, d, fs_);
 
     if (os_ > 1) {  // Kaiser windowed sinc, cutoff at 0.45 of the output rate
         int half = 24 * os_, len = 2 * half + 1;
@@ -663,30 +632,7 @@ void Piano::step(double& pL, double& pR) {
         }
     }
 
-    for (int e = 0; e < 2; e++) {
-        double* __restrict ring = ring_[e].data();
-        const int* __restrict idx = tapIdx_[e].data();
-        const RealP* __restrict g = tapGain_[e].data();
-        const int* __restrict bp = binPtr_[e].data();
-        const int bins = (int)binPtr_[e].size() - 1, base = ringPos_ + binFirst_[e];
-        for (int b = 0; b < bins; b++) {
-            // Four independent partial sums, so the additions do not wait on each other.
-            RealP s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-            int q = bp[b];
-            const int end = bp[b + 1];
-            for (; q + 3 < end; q += 4) {
-                s0 += g[q] * r[idx[q]];
-                s1 += g[q + 1] * r[idx[q + 1]];
-                s2 += g[q + 2] * r[idx[q + 2]];
-                s3 += g[q + 3] * r[idx[q + 3]];
-            }
-            for (; q < end; q++) s0 += g[q] * r[idx[q]];
-            ring[(base + b) & ringMask_] += (double)((s0 + s1) + (s2 + s3));
-        }
-    }
-    pL = ring_[0][ringPos_]; ring_[0][ringPos_] = 0;
-    pR = ring_[1][ringPos_]; ring_[1][ringPos_] = 0;
-    ringPos_ = (ringPos_ + 1) & ringMask_;
+    radiation_.step(r, pL, pR);
 
     finish(1);
     if ((++stepCount_ & 63) == 0) housekeeping();

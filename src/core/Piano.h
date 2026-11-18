@@ -5,6 +5,7 @@
 // conserved to rounding error when all losses are switched off, and can only decrease
 // otherwise. docs/MODEL.md has the derivation.
 #pragma once
+#include "Acoustics.h"
 #include "Design.h"
 #include "Plate.h"
 #include <functional>
@@ -66,6 +67,7 @@ public:
     double energy() const;
     double dt() const { return k_; }
     const Plate& plate() const { return *plate_; }
+    const Radiation& radiation() const { return radiation_; }
     const std::vector<RealP>& plateDisplacement() const { return w_; }  // grid storage
     int stringCount() const { return (int)strings_.size(); }
     int awakeStrings() const;
@@ -145,13 +147,7 @@ private:
     int vb_ = 0;
     std::vector<RealP> w_, vw_, r_;      // plate displacement, increment, right hand side (grid storage)
 
-    // Radiation (Rayleigh integral): nodes are grouped by their delay to each ear, so one
-    // step is a short dot product per delay bin.
-    std::vector<int> tapIdx_[2], binPtr_[2];
-    std::vector<RealP> tapGain_[2];
-    int binFirst_[2] = {0, 0};
-    std::vector<double> ring_[2];
-    int ringPos_ = 0, ringMask_ = 0;
+    Radiation radiation_;
 
     // Decimation when oversampling.
     std::vector<double> fir_, hist_[2];
