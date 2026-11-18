@@ -33,6 +33,11 @@ python3 -I tools/fetch_demos.py
 | `C` / `V` | softer / harder |
 | `Space` | sustain pedal |
 
+Controls in the window: sound on/off, volume, a menu of demo recordings, board grid,
+listener position, and an **Instrument** panel of sliders (felt hardness, hammer mass, strike
+point, detune, losses, board thickness, rib height, key knock, room, lid). Sliders rebuild
+the instrument when released.
+
 MIDI keyboards are picked up automatically. The mouse plays the on-screen keys.
 
 ## Tools
@@ -41,6 +46,9 @@ MIDI keyboards are picked up automatically. The mouse plays the on-screen keys.
 ./build/render out/phrase.wav phrase     # offline render of a short phrase
 ./build/render out/c4.wav c4 2           # one note at 2x internal rate
 ./build/bench                            # processor budget per scenario
+./build/report                           # bridge impedance across the compass
+./build/metalbench                       # GPU against CPU for this kind of work
+./build/PhysicalPiano.app/Contents/MacOS/PhysicalPiano --loadtest 0 30   # load on the real audio thread, silent
 python3 tools/compare_wav.py a.wav b.wav # level of the difference between two renders
 ```
 
