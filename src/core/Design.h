@@ -18,9 +18,6 @@ struct StringDesign {
     double sigma1 = 0;  // frequency dependent loss, m^2/s
     Vec2 bridge;        // where the string meets the bridge, piano coordinates
     bool attached = true;  // false: rigid termination (used by validation tests)
-    // The bridge yields along one axis only. This is the tilt of that axis away from the
-    // soundboard normal, as seen by this string; it is what couples the two polarisations.
-    double bridgeTilt = 0;
 };
 
 struct NoteDesign {
@@ -139,9 +136,8 @@ struct GrandOptions {
     bool duplex = true;              // free string lengths behind the bridge in the treble
     bool dampedStringsRing = true;   // damped strings stay in the simulation
     double downbearingDeg = 1.5;     // angle the strings make over the bridge, each side
-    bool twoPolarisations = false;   // sideways string motion; doubles the string work
-    double bridgeTiltDeg = 6.0;      // assumed; see docs/MODEL.md
-    double hammerTiltDeg = 4.0;      // assumed
+    bool twoPolarisations = true;    // sideways string motion of struck strings
+    double hammerTiltDeg = 4.0;      // how far off the upright the hammer strikes; assumed
 
     // Hammers and action.
     double hammerHardness = 1.0;     // x reference: felt stiffness

@@ -80,6 +80,8 @@ void Piano::setHelperThreads(int count, std::function<void()> onStart, std::func
     pool_ = std::make_unique<Pool>();
     Pool* p = pool_.get();
     for (int ph = 0; ph < 3; ph++) p->count[ph] = (int)phaseChunks_[ph].size();
+    p->active = true;  // ready for the very first block
+    quietChecks_ = 0;
     for (int i = 0; i < count; i++)
         p->threads.emplace_back([this, p, onStart, onExit] {
 #if defined(__APPLE__)
@@ -133,24 +135,9 @@ void Piano::chunkWork(int phase, int index) {
                     for (int t = sp.start; t < sp.start + sp.len; t++) r[t] += air[patch[t]];
                 }
             }
-        } else if (phase == 2) {
-            RealP* __restrict w = w_.data();
-            RealP* __restrict vw = vw_.data();
-            RealP* __restrict r = r_.data();
-            RealP* __restrict keep = radIn_.data();
-            const RealP* __restrict scale = P.diagScale();
-            for (int si = c.from; si < c.to; si++) {
-                const Plate::Span& sp = P.spans[si];
-                for (int t = sp.start; t < sp.start + sp.len; t++) {
-                    RealP dv = r[t] * scale[t];  // change of the increment, dt^2 * acceleration
-                    vw[t] += dv;
-                    w[t] += vw[t];
-                    keep[t] = dv;  // what radiates; picked up by the next step's radiation task
-                }
-            }
         }
     } else if (phase == 0) {
-        for (int i = c.from; i < c.to; i++) stepString(strings_[i]);
+        for (int i = c.from; i < c.to; i++) stepString(i);
     } else if (phase == 1) {
         const int vb = vb_;
         for (int i = c.from; i < c.to; i++) {
@@ -187,7 +174,6 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     mechNoise_ = d.mechanismNoise;
 
     std::vector<Attachment> att;
-    std::vector<double> endScale;
     int offset = 0, maxN = 0;
     for (const NoteDesign& nd : d.notes) {
         NoteRT n;
@@ -324,23 +310,30 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
             for (int i = 0; i < n.count; i++) {
                 StringRT t = strings_[n.first + i];
                 t.hamW = std::sin(nd.hammerTilt);
+                t.sideways = true;
                 t.lCells = 0;  // stretching is computed once, on the upright motion
                 t.off = offset + 1;
                 offset += t.N + 3;
                 strings_.push_back(t);
             }
+        // How each string's end follows the board. The upright motion follows the board's
+        // displacement at the bridge. The sideways motion follows the bridge top as the board
+        // tilts under it: the board's slope across the string, times the height of the string
+        // above the board's middle. Nothing here is a free parameter.
+        const double lever = d.board.bridgeHeight + 0.5 * d.board.thickness, halfWidth = 0.5 * d.board.bridgeWidth;
         for (int i = 0; i < n.total; i++) {
             const StringDesign& sd = nd.strings[i % n.count];
             const StringRT& s = strings_[n.first + i];
-            double es = !n.twin ? 1.0 : i < n.count ? std::cos(sd.bridgeTilt) : std::sin(sd.bridgeTilt);
-            if (s.attached) att.push_back({sd.bridge, 0.5 * s.mNode * es * es, s.z0 * es * es});
-            endScale.push_back(es);
+            Attachment a;
+            if (i < n.count) a.points = {{sd.bridge, 1.0}};
+            else a.points = {{{sd.bridge.x + halfWidth, sd.bridge.y}, lever / (2 * halfWidth)}, {{sd.bridge.x - halfWidth, sd.bridge.y}, -lever / (2 * halfWidth)}};
+            a.mass = 0.5 * s.mNode; a.dashpot = s.z0;
+            if (s.attached) att.push_back(a);
         }
         for (const StringDesign& sd : nd.duplex)
             if (buildString(sd, true)) {
                 const StringRT& s = strings_.back();
-                if (s.attached) att.push_back({sd.bridge, 0.5 * s.mNode, s.z0});
-                endScale.push_back(1.0);
+                if (s.attached) att.push_back({{{sd.bridge, 1.0}}, 0.5 * s.mNode, s.z0});
             }
         noteOfMidi_[nd.midi & 127] = (int)notes_.size();
         notes_.push_back(n);
@@ -351,17 +344,22 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     (void)maxN;
 
     plate_ = std::make_unique<Plate>(d.board, att, k, std::max(1.0, o.boardGridScale));
+    endAt_.assign(strings_.size(), Coupling());
+    endLive_.assign(strings_.size(), 1);
+    endU_.assign(strings_.size(), 0.0); endV_.assign(strings_.size(), 0.0); endForce_.assign(strings_.size(), 0.0);
     const Plate& P = *plate_;
     {
         size_t ai = 0;
         for (size_t i = 0; i < strings_.size(); i++) {
             StringRT& s = strings_[i];
             if (s.attached) {
-                s.at = P.interp(att[ai++].pos);
-                for (double& wq : s.at.w) wq *= endScale[i];
+                endAt_[i] = P.couple(att[ai++].points);
             }
             // Strings without a damper (top treble, detached test strings) never sleep.
-            s.awake = !s.hasDamper || !s.attached || d.dampedStringsRing;
+            // Sideways motion is followed only for strings that have been struck: it starts asleep.
+            s.awake = !s.sideways && (!s.hasDamper || !s.attached || d.dampedStringsRing);
+            if (s.sideways && !s.attached) s.awake = true;
+            endLive_[i] = s.awake || !s.sideways;  // a string's sideways motion at rest neither moves nor loads the board
         }
     }
     w_.assign(P.gridSize, 0); vw_.assign(P.gridSize, 0); r_.assign(P.gridSize, 0);
@@ -384,7 +382,6 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
         for (int c = 0; c < (int)chunks_.size(); c++) {
             phaseChunks_[0].push_back(c);
             if (chunks_[c].kind == 2) phaseChunks_[1].push_back(c);
-            if (chunks_[c].kind == 1) phaseChunks_[2].push_back(c);
         }
     }
 
@@ -426,11 +423,13 @@ void Piano::wake(StringRT& s) {
         v[l] = (RealS)(vN * l / s.N);
     }
     s.awake = true;
+    endLive_[&s - strings_.data()] = 1;
 }
 
 void Piano::sleep(StringRT& s) {
     for (auto* a : {&u_, &v_[0], &v_[1]}) std::fill(a->begin() + s.off - 1, a->begin() + s.off + s.N + 2, (RealS)0);
     s.awake = false;
+    if (s.sideways) { endLive_[&s - strings_.data()] = 0; endForce_[&s - strings_.data()] = 0; }
     s.lOn = false; s.lPeak = 0; s.tensionChange = 0;
     if (s.lCells > 0) {
         std::fill(&xi_[s.lOff], &xi_[s.lOff] + StringRT::kLong + 1, 0.0);
@@ -525,7 +524,7 @@ void Piano::setPedal(double position) {
         for (int i = 0; i < n.total; i++) {
             StringRT& s = strings_[n.first + i];
             if (!s.hasDamper) continue;
-            if (damping < 1.0) wake(s);
+            if (damping < 1.0 && !s.sideways) wake(s);
             if (!n.keyDown) { s.dampTarget = dampMax_ * damping; s.dampLand = 1; }
         }
 }
@@ -533,16 +532,18 @@ void Piano::setPedal(double position) {
 // Explicit update of one string: reads displacement u and the current increments, writes
 // the next increments into the other buffer, and adds the bridge force to the plate right
 // hand side. Displacements are advanced later, after the hammer has had its say.
-void Piano::stepString(StringRT& s) {
+void Piano::stepString(int index) {
+    if (!endLive_[index]) return;
+    StringRT& s = strings_[index];
     const int N = s.N;
     RealS* __restrict u = &u_[s.off];
     RealS* __restrict v = &v_[vb_][s.off];
     RealS* __restrict vn = &v_[vb_ ^ 1][s.off];
-    const double uN = uEnd(s, w_.data()), vN = uEnd(s, vw_.data());
+    const double uN = endU_[index], vN = endV_[index];
 
     if (!s.awake) {
         // A damped string absorbs what the bridge sends into it: characteristic impedance.
-        s.endForce = -k_ * s.z0 * vN;
+        endForce_[index] = s.attached ? -k_ * s.z0 * vN : 0.0;
         return;
     }
     // Both ends are simply supported: zero bending moment, expressed through ghost nodes.
@@ -552,7 +553,7 @@ void Piano::stepString(StringRT& s) {
 
     if (s.attached) {
         double uA = u[N - 1], uB = u[N - 2], vA = v[N - 1];
-        s.endForce = s.mNode * (-(s.aT * (uN - uA) + s.aD * (vN - vA)) - s.aB * (uB - 2 * uA + uN));
+        endForce_[index] = s.mNode * (-(s.aT * (uN - uA) + s.aD * (vN - vA)) - s.aB * (uB - 2 * uA + uN));
     }
     const RealS cu0 = s.cu0, cu1 = s.cu1, cu2 = s.cu2, cv0 = s.cv0, cv1 = s.cv1;
     for (int l = 1; l < N; l++)
@@ -595,7 +596,7 @@ void Piano::stepString(StringRT& s) {
             std::fill(xi, xi + StringRT::kLong + 1, 0.0);
             std::fill(vxi, vxi + StringRT::kLong + 1, 0.0);
         }
-        if (s.attached) s.endForce += k_ * k_ * s.lBridge * s.tensionChange;
+        if (s.attached) endForce_[index] += k_ * k_ * s.lBridge * s.tensionChange;
     }
 
     // Damper felt: viscous, backward Euler so that it is stable at any strength.
@@ -740,7 +741,18 @@ void Piano::housekeeping() {
     // displacement, and that forced motion is exactly what the dashpot stands for.
     const int settle = (int)(0.15 * fs_ / 64);
     for (StringRT& s : strings_) {
-        if (!s.awake || !s.hasDamper || !s.attached) continue;
+        if (!s.awake || !s.attached) continue;
+        if (s.sideways) {
+            // The sideways motion of a string matters while it rings from a strike. Once it has
+            // died away it is put aside, damper or no damper, until the next strike.
+            if (notes_[s.note].hammerActive) continue;
+            const RealS* us = &u_[s.off];
+            double end = us[s.N], big = 0;
+            for (int l = 1; l < s.N; l++) big = std::max(big, std::fabs((double)us[l] - end * l / s.N));
+            if (big < 2e-8) sleep(s);
+            continue;
+        }
+        if (!s.hasDamper) continue;
         if (s.dampRate < dampMax_ || notes_[s.note].hammerActive) { s.dampedSteps = 0; continue; }
         if (++s.dampedSteps < settle) continue;
         const RealS* u = &u_[s.off];
@@ -803,19 +815,43 @@ void Piano::step(double& pL, double& pR) {
         for (int q = 0; q < 4; q++) r[extAt_.idx[q]] += (RealP)(extAt_.w[q] * extF_ * k_ * k_);
         extF_ = 0;
     }
-    for (const StringRT& s : strings_)
-        if (s.attached && s.endForce != 0)
-            for (int q = 0; q < 4; q++) r[s.at.idx[q]] += (RealP)(s.at.w[q] * s.endForce);
+    {
+        const int ns = (int)strings_.size();
+        const double* __restrict ef = endForce_.data();
+        for (int i = 0; i < ns; i++) {
+            const double f = ef[i];
+            if (f == 0) continue;
+            const Coupling& at = endAt_[i];
+            for (int q = 0; q < at.n; q++) r[at.idx[q]] += (RealP)(at.w[q] * f);
+        }
+    }
     for (NoteRT& n : notes_)
         if (n.hammerActive) stepHammer(n);
     vb_ ^= 1;
     runChunks(1);  // advance the string displacements while this thread solves for the stiffeners
     P.solveStiff(r);
     finish(1);
-    runChunks(2);  // advance the plate
-    finish(2);
+    {   // Advance the plate, keep what radiates for the next step's radiation task, and read
+        // off where every string's end now is.
+        RealP* __restrict keep = radIn_.data();
+        const RealP* __restrict scale = P.diagScale();
+        for (const Plate::Span& sp : P.spans)
+            for (int t = sp.start; t < sp.start + sp.len; t++) {
+                RealP dv = r[t] * scale[t];  // change of the increment, dt^2 * acceleration
+                vw[t] += dv;
+                w[t] += vw[t];
+                keep[t] = dv;
+            }
+        const int ns = (int)strings_.size();
+        for (int i = 0; i < ns; i++) {
+            if (!endLive_[i]) continue;
+            const Coupling& at = endAt_[i];
+            double eu = 0, ev = 0;
+            for (int q = 0; q < at.n; q++) { eu += at.w[q] * (double)w[at.idx[q]]; ev += at.w[q] * (double)vw[at.idx[q]]; }
+            endU_[i] = eu; endV_[i] = ev;
+        }
+    }
     pL = radL_; pR = radR_;
-    (void)vw;
     if ((++stepCount_ & 63) == 0) housekeeping();
 }
 

@@ -141,8 +141,6 @@ PianoDesign makeGrand(const GrandOptions& o) {
             double cents = o.unisonDetuneCents * (offset + 0.15 * offset * offset);
             si.f0 = f0 * std::pow(2.0, cents / 1200.0);
             si.bridge = {bp.x + 0.006 * offset, bp.y};
-            // Alternate the sign from string to string so unisons do not all lean one way.
-            si.bridgeTilt = o.bridgeTiltDeg * M_PI / 180.0 * (((key + i) & 1) ? 1.0 : -0.7);
             n.strings.push_back(si);
             if (o.duplex && key >= 52) {
                 // The same wire at the same tension, a third (or, in the top octaves, half) as

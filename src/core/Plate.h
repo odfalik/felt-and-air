@@ -41,7 +41,24 @@ struct Interp {  // bilinear interpolation onto plate nodes (grid storage index)
 
 // Something bolted to the board at a point: lumped mass and a viscous dashpot that may be
 // switched on at run time. Both enter the stability bound.
-struct Attachment { Vec2 pos; double mass = 0; double dashpot = 0; };
+struct Attachment {
+    // The attached point moves as sum(coefficient * board displacement at point).
+    std::vector<std::pair<Vec2, double>> points;
+    double mass = 0;
+    double dashpot = 0;
+};
+
+// The same combination expressed on plate nodes (grid storage index).
+struct Coupling {
+    int n = 0;
+    int idx[8] = {0};
+    double w[8] = {0};
+    template <class T> double eval(const T* f) const {
+        double s = 0;
+        for (int q = 0; q < n; q++) s += w[q] * (double)f[idx[q]];
+        return s;
+    }
+};
 
 class Plate {
 public:
@@ -80,6 +97,7 @@ public:
     int stiffNodes = 0, factorNnz = 0;
 
     Interp interp(Vec2 piano) const;
+    Coupling couple(const std::vector<std::pair<Vec2, double>>& points) const;
     Vec2 nodePosition(int node) const;  // piano coordinates
     std::vector<int> ribColumns;
 

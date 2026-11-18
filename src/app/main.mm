@@ -640,7 +640,7 @@ static const Knob kKnobs[] = {
     {kStrings, "Internal loss", &GrandOptions::stringLoss, 0.25, 5.0, true, "x %.2f", "The string's own damping, apart from what the board takes."},
     {kStrings, "Wire stiffness", &GrandOptions::stringStiffness, 0.25, 4.0, true, "x %.2f", "Bending stiffness. More makes the overtones sharper."},
     {kStrings, "Downbearing angle", &GrandOptions::downbearingDeg, 0.0, 5.0, false, "%.1f deg", "Bend of the strings over the bridge; sets how hard stretching presses on the board."},
-    {kStrings, "Bridge axis tilt", &GrandOptions::bridgeTiltDeg, 0.0, 30.0, false, "%.0f deg", "Couples sideways string motion to the board (needs sideways motion on)."},
+    {kStrings, "Strike angle", &GrandOptions::hammerTiltDeg, 0.0, 15.0, false, "%.1f deg", "How far off the upright the hammer hits; this is what sets strings moving sideways."},
     {kBoard, "Thickness", &GrandOptions::boardThicknessMm, 5.0, 13.0, false, "%.1f mm", ""},
     {kBoard, "Loss factor", &GrandOptions::boardLossPercent, 0.5, 8.0, true, "%.1f %%", "Internal damping of the wood."},
     {kBoard, "Rib height", &GrandOptions::ribHeightMm, 10.0, 36.0, false, "%.0f mm", ""},
@@ -662,7 +662,7 @@ static const Toggle kToggles[] = {
     {kStrings, "Longitudinal motion (stretching: phantom partials, bass ring)", &GrandOptions::longitudinal},
     {kStrings, "Duplex lengths behind the bridge (treble shimmer)", &GrandOptions::duplex},
     {kStrings, "Damped strings keep ringing faintly (needed for the pedal stir)", &GrandOptions::dampedStringsRing},
-    {kStrings, "Sideways string motion (doubles the string work)", &GrandOptions::twoPolarisations},
+    {kStrings, "Sideways string motion (of struck strings)", &GrandOptions::twoPolarisations},
     {kBoard, "Air loading (the air's mass and drag on the board)", &GrandOptions::airLoading},
 };
 static const int kToggleCount = sizeof(kToggles) / sizeof(kToggles[0]);

@@ -282,7 +282,7 @@ static void testReciprocity() {
         Piano p(d, {48000, 1, 0.5});
         p.setSustain(true);  // wakes the strings without a hammer
         double a, b, acc = 0;
-        for (int n = 0; n < 2000; n++) p.step(a, b);  // let the dampers finish lifting
+        for (int n = 0; n < 6000; n++) p.step(a, b);  // let the dampers finish lifting
         int from = dir == 0 ? 0 : 2, to = dir == 0 ? 2 : 0;
         int nf = dir == 0 ? 20 : 41, nt = dir == 0 ? 41 : 20;
         p.stringV(from)[nf] = (RealS)(1e-9 / p.stringNodeMass(from));  // unit momentum

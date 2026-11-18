@@ -121,6 +121,19 @@ Interp Plate::interp(Vec2 piano) const {
     return it;
 }
 
+Coupling Plate::couple(const std::vector<std::pair<Vec2, double>>& points) const {
+    std::map<int, double> c;
+    for (const auto& pt : points) {
+        Interp it = interpActive(pt.first);
+        for (int k = 0; k < 4; k++)
+            if (it.w[k] != 0) c[gid[it.idx[k]]] += pt.second * it.w[k];
+    }
+    Coupling out;
+    for (auto& kv : c)
+        if (out.n < 8 && kv.second != 0) { out.idx[out.n] = kv.first; out.w[out.n] = kv.second; out.n++; }
+    return out;
+}
+
 Interp Plate::interpActive(Vec2 piano) const {
     Vec2 g = toGrid(piano);
     double fx = (g.x - gx0_) / hx, fy = (g.y - gy0_) / hy;
@@ -337,10 +350,20 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
 
     std::vector<double> dash(n, 0.0);
     for (const Attachment& a : att) {
-        Interp it = interpActive(a.pos);
-        for (int k = 0; k < 4; k++) {
-            mass[it.idx[k]] += it.w[k] * a.mass;
-            dash[it.idx[k]] += it.w[k] * a.dashpot;
+        // A combination with mixed signs (a slope) cannot be lumped weight by weight. By
+        // Cauchy-Schwarz, mass * S * |c_j| on node j with S = sum |c| is never less than the
+        // true kinetic energy, which is what the stability argument needs.
+        std::map<int, double> c;
+        for (const auto& pt : a.points) {
+            Interp it = interpActive(pt.first);
+            for (int k = 0; k < 4; k++)
+                if (it.w[k] != 0) c[it.idx[k]] += pt.second * it.w[k];
+        }
+        double S = 0;
+        for (auto& kv : c) S += std::fabs(kv.second);
+        for (auto& kv : c) {
+            mass[kv.first] += a.mass * S * std::fabs(kv.second);
+            dash[kv.first] += a.dashpot * S * std::fabs(kv.second);
         }
     }
 

@@ -108,7 +108,7 @@ private:
         bool attached = true, awake = false, hasDamper = false;
         double hamW = 1;   // share of the hammer direction seen by this polarisation
         Vec2 bridge;
-        Interp at;
+        bool sideways = false;  // the second polarisation of another string
         int hamL = 0; double hamG[2] = {0, 0}; double hamA = 0;
         int dmp0 = 0, dmp1 = 0; double dampRate = 0, dampTarget = 0;
         int dampedSteps = 0;   // steps spent fully damped
@@ -118,7 +118,6 @@ private:
         int fitPartial = 1;    // partial used to fit the grid dispersion
         double f0 = 0, inharm = 0;
         double zeta = 0, zetaPrev = 0, force = 0;
-        double endForce = 0;  // dt^2 * force on the bridge from the latest step
         // Longitudinal motion on its own coarse grid (its waves are about 15 times faster).
         static const int kLong = 24;
         int lCells = 0;            // 0: off for this string
@@ -141,7 +140,7 @@ private:
 
     void wake(StringRT& s);
     void sleep(StringRT& s);
-    void stepString(StringRT& s);
+    void stepString(int index);
     void stepHammer(NoteRT& n);
     void housekeeping();
     struct Pool;
@@ -153,7 +152,13 @@ private:
     std::vector<int> phaseChunks_[3];
     void runChunks(int phase);
     void chunkWork(int phase, int chunk);
-    template <class T> double uEnd(const StringRT& s, const T* field) const { return s.attached ? s.at.eval(field) : 0.0; }
+    template <class T> double uEnd(const StringRT& s, const T* field) const { return s.attached ? endAt_[&s - strings_.data()].eval(field) : 0.0; }
+    // What passes between strings and board each step, kept in dense arrays of their own.
+    // Threads working on strings and the thread working on the board then exchange a handful
+    // of cache lines instead of one or two per string.
+    std::vector<Coupling> endAt_;                 // how each string's end follows the board (never changes)
+    std::vector<char> endLive_;                   // 0: this string takes no part at the moment (sideways motion at rest)
+    std::vector<double> endU_, endV_, endForce_;  // board displacement and increment at the string end; dt^2 * force back
 
     double k_ = 0, fs_ = 0, outGain_ = 0;
     int os_ = 1;
