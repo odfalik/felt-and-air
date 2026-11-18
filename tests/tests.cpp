@@ -28,6 +28,7 @@ static PianoDesign oneNote(int key = 40) {
 }
 
 static void makeLossless(PianoDesign& d) {
+    d.longitudinal = false;  // driven one-way by the transverse motion, so not part of the energy balance
     d.board.lossFactor = 0;
     d.board.sigma0 = 0;
     for (auto& n : d.notes) {
@@ -123,6 +124,7 @@ static void testPassivity() {
     std::printf("\n4. Lossy instrument: energy never increases (strike, hold, damper)\n");
     PianoDesign pd = oneNote();
     pd.notes[0].keyThump = 0;  // the key knock is an outside force and would add energy
+    pd.longitudinal = false;   // one-way drive, outside the energy balance
     Piano p(pd, {48000, 1, 0.5});
     p.noteOn(60, 4.0);
     double prev = p.energy(), worstRise = 0, a, b, e0 = prev;
@@ -394,6 +396,28 @@ static void testRoom() {
     CHECK(late > 0 && late < 30 * direct, "reverberant level is finite and plausible");
 }
 
+static void testLongitudinal() {
+    std::printf("\n13. Longitudinal string motion: phantom partial and longitudinal mode\n");
+    GrandOptions g;
+    g.firstKey = g.lastKey = 28;
+    g.twoPolarisations = false;
+    PianoDesign d = makeGrand(g);
+    Piano p(d, {48000, 1});
+    p.noteOn(d.notes[0].midi, 4.5);
+    const int n = 1 << 16;
+    std::vector<double> dT(n);
+    double a, b, peak = 0;
+    for (int i = 0; i < n; i++) { p.step(a, b); dT[i] = p.stringView(0).tensionChange; peak = std::max(peak, std::fabs(dT[i])); }
+    const StringDesign& sd = d.notes[0].strings[0];
+    double fL = std::sqrt(sd.EA / sd.rhoA) / (2 * sd.L);
+    double phantom = peakFrequency(dT, 48000, 1.9 * sd.f0, 2.1 * sd.f0), mode = peakFrequency(dT, 48000, 0.9 * fL, 1.1 * fL);
+    auto view = p.stringView(0);
+    std::printf("      %d longitudinal cells; tension swings %.1f N around %.0f N at fortissimo\n", view.longitudinalCells, peak, view.tension);
+    CHECK(std::fabs(phantom / (2 * sd.f0) - 1) < 0.01, "tension pulses at twice the fundamental: %.1f Hz against %.1f Hz", phantom, 2 * sd.f0);
+    CHECK(std::fabs(mode / fL - 1) < 0.03, "longitudinal mode at %.0f Hz against c_L / 2L = %.0f Hz", mode, fL);
+    CHECK(peak > 0.5 && peak < 0.2 * view.tension, "tension change is a small fraction of the tension");
+}
+
 static void testThreads() {
     std::printf("\n11. Helper threads give bit-identical output\n");
     std::vector<float> ref, out;
@@ -422,7 +446,8 @@ int main(int argc, char** argv) {
         {"kernel", testKernelMatchesAssembly}, {"energy", testEnergyConservation}, {"free", testEnergyAfterRelease},
         {"passivity", testPassivity},          {"plate", testPlateAnalytic},       {"partials", testStringPartials},
         {"hammer", testHammer},                {"reciprocity", testReciprocity},   {"coupling", testCoupling},
-        {"robust", testRobustness},           {"threads", testThreads},           {"room", testRoom}};
+        {"robust", testRobustness},           {"threads", testThreads},           {"room", testRoom},
+        {"longitudinal", testLongitudinal}};
     for (auto& t : tests)
         if (argc < 2 || t.first == argv[1]) t.second();
     std::printf("\n%s (%d failed checks)\n", failures ? "FAILED" : "ALL PASSED", failures);

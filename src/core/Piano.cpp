@@ -260,6 +260,21 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
             if (s.dmp0 >= s.dmp1) s.hasDamper = false;
             s.dampRate = s.dampTarget = s.hasDamper ? dampMax_ : 0.0;
 
+            // Longitudinal grid: the coarsest whole number of transverse segments per cell that
+            // keeps the (fast) longitudinal wave stable. Short strings get a single cell, which
+            // is the quasi-static limit: the tension follows the mean squared slope.
+            if (d.longitudinal && sd.EA > 0) {
+                double cL = std::sqrt(sd.EA / sd.rhoA);
+                int span = std::max(1, (int)std::ceil(cL * k * 1.03 / h));
+                int cells = std::max(1, std::min((int)StringRT::kLong, N / span));
+                if (cells == 1) span = N;
+                else span = std::max(span, N / cells);  // the last cell takes any remainder, so it is the longest
+                s.lCells = cells; s.lSpan = span; s.lEA = sd.EA;
+                double H = span * h;
+                s.lA = sd.EA * k * k / (sd.rhoA * H * H);
+                s.lDamp = 1.0 / (1.0 + 30.0 * k);  // longitudinal modes ring for a few tenths of a second
+                s.lBridge = 2 * std::sin(d.downbearingDeg * M_PI / 180.0);
+            }
             s.bridge = sd.bridge;
             s.off = offset + 1;
             offset += N + 3;
@@ -276,6 +291,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
             for (int i = 0; i < n.count; i++) {
                 StringRT t = strings_[n.first + i];
                 t.hamW = std::sin(nd.hammerTilt);
+                t.lCells = 0;  // stretching is computed once, on the upright motion
                 t.off = offset + 1;
                 offset += t.N + 3;
                 strings_.push_back(t);
@@ -374,6 +390,9 @@ void Piano::wake(StringRT& s) {
 void Piano::sleep(StringRT& s) {
     for (auto* a : {&u_, &v_[0], &v_[1]}) std::fill(a->begin() + s.off - 1, a->begin() + s.off + s.N + 2, (RealS)0);
     s.awake = false;
+    s.lOn = false; s.lPeak = 0; s.tensionChange = 0;
+    std::fill(s.xi, s.xi + StringRT::kLong + 1, 0.0);
+    std::fill(s.vxi, s.vxi + StringRT::kLong + 1, 0.0);
 }
 
 void Piano::noteOn(int midi, double speed) {
@@ -385,6 +404,7 @@ void Piano::noteOn(int midi, double speed) {
         StringRT& s = strings_[n.first + i];
         wake(s);
         s.dampTarget = s.dampRate = 0;  // the key lifts the damper well before the hammer arrives
+        if (s.lCells > 0) s.lOn = true;
     }
     if (!(speed > 0)) return;
     if (n.thump > 0 && pulseCount_ < kPulses) {
@@ -475,6 +495,38 @@ void Piano::stepString(StringRT& s) {
     for (int l = 1; l < N; l++)
         vn[l] = cv0 * v[l] + cv1 * (v[l - 1] + v[l + 1]) + cu0 * u[l] + cu1 * (u[l - 1] + u[l + 1]) + cu2 * (u[l - 2] + u[l + 2]);
     vn[0] = 0;
+
+    // Stretching. The strain of a cell is its end-to-end stretch plus the extra length the
+    // transverse wave takes up, half the mean squared slope. Tension follows the strain; where
+    // it differs between cells the string is pulled along its length. This is one-way: the
+    // tension change is not fed back into the transverse motion.
+    s.tensionChange = 0;
+    if (s.lOn) {
+        const int C = s.lCells, span = s.lSpan;
+        const double invh2 = 1.0 / (s.h * s.h);
+        double strain[StringRT::kLong];
+        double peak = 0;
+        for (int c = 0, l = 0; c < C; c++) {
+            int end = c == C - 1 ? N : l + span;
+            double sq = 0;
+            for (int j = l; j < end; j++) { double dq = (double)u[j + 1] - (double)u[j]; sq += dq * dq; }
+            double H = (end - l) * s.h;
+            strain[c] = (s.xi[c + 1] - s.xi[c]) / H + 0.5 * sq * invh2 / (end - l);
+            peak = std::max(peak, std::fabs(strain[c]));
+            l = end;
+        }
+        const double H = span * s.h;
+        const double lastScale = 2.0 * span / (span + (N - (C - 1) * span));  // the node next to the longer last cell is heavier
+        for (int c = 1; c < C; c++) {
+            double acc = s.lA * H * (strain[c] - strain[c - 1]);
+            if (c == C - 1) acc *= lastScale;
+            s.vxi[c] = (s.vxi[c] + acc) * s.lDamp;
+            s.xi[c] += s.vxi[c];
+        }
+        s.tensionChange = s.lEA * strain[C - 1];
+        s.lPeak = std::max(peak, 0.999 * s.lPeak);
+        if (s.attached) s.endForce += k_ * k_ * s.lBridge * s.tensionChange;
+    }
 
     // Damper felt: viscous, backward Euler so that it is stable at any strength.
     if (s.dampRate != s.dampTarget) {
@@ -816,7 +868,7 @@ int Piano::totalStringNodes() const {
 
 Piano::StringView Piano::stringView(int i) const {
     const StringRT& s = strings_[i];
-    return {notes_[s.note].midi, s.N + 1, s.h, &u_[s.off], s.force, s.awake, s.tension};
+    return {notes_[s.note].midi, s.N + 1, s.h, &u_[s.off], s.force, s.awake, s.tension, s.tensionChange, s.lOn ? s.lCells : 0};
 }
 
 std::vector<int> Piano::stringsOfNote(int midi) const {

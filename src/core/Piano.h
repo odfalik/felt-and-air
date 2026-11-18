@@ -77,6 +77,7 @@ public:
 
     struct StringView {
         int midi; int nodes; double h; const RealS* u; double hammerForce; bool awake; double tension;
+        double tensionChange; int longitudinalCells;
     };
     StringView stringView(int index) const;
     std::vector<int> stringsOfNote(int midi) const;
@@ -112,6 +113,14 @@ private:
         double f0 = 0, inharm = 0;
         double zeta = 0, zetaPrev = 0, force = 0;
         double endForce = 0;  // dt^2 * force on the bridge from the latest step
+        // Longitudinal motion on its own coarse grid (its waves are about 15 times faster).
+        static const int kLong = 24;
+        int lCells = 0;            // 0: off for this string
+        int lSpan = 0;             // transverse segments per longitudinal cell
+        bool lOn = false;          // only strings that have been struck stretch enough to matter
+        double lA = 0, lDamp = 0, lEA = 0, lBridge = 0, lPeak = 0;
+        double xi[kLong + 1] = {0}, vxi[kLong + 1] = {0};
+        double tensionChange = 0;  // at the bridge, N
     };
     struct NoteRT {
         int midi = 0, first = 0, count = 0;  // count contacts; each may have a second polarisation

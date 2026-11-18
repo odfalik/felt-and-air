@@ -33,6 +33,8 @@ PianoDesign makeGrand(const GrandOptions& o) {
     b.rimClamp = o.rimClamp;
     b.bridgeHeight = o.bridgeHeightMm * 1e-3;
     d.damperStrength = o.damperStrength;
+    d.longitudinal = o.longitudinal;
+    d.downbearingDeg = o.downbearingDeg;
     d.room.enabled = o.roomEnabled;
     d.room.Lx = o.roomLx; d.room.Ly = o.roomLy; d.room.Lz = o.roomLz;
     d.room.pianoX = o.pianoX; d.room.pianoY = o.pianoY;
@@ -76,12 +78,14 @@ PianoDesign makeGrand(const GrandOptions& o) {
             s.rhoA = s.T / std::pow(2 * s.L * f0, 2);
             double core = lerp(1.0e-3, 1.5e-3, t);
             s.EI = steelE * M_PI * std::pow(core, 4) / 64.0 * o.stringStiffness;
+            s.EA = steelE * M_PI * core * core / 4.0;
         } else {
             s.L = plainLength(key);
             s.T = 720;
             s.rhoA = s.T / std::pow(2 * s.L * f0, 2);
             double dia = std::sqrt(4 * s.rhoA / (M_PI * steelRho));
             s.EI = steelE * M_PI * std::pow(dia, 4) / 64.0 * o.stringStiffness;
+            s.EA = steelE * M_PI * dia * dia / 4.0;
         }
         return s;
     };

@@ -12,6 +12,7 @@ struct StringDesign {
     double L = 0;       // speaking length, m
     double rhoA = 0;    // linear mass density, kg/m
     double EI = 0;      // bending stiffness, N m^2
+    double EA = 0;      // axial stiffness of the load-bearing wire, N
     double T = 0;       // nominal tension, N (the solver retunes tension to hit f0)
     double sigma0 = 0;  // frequency independent loss, 1/s
     double sigma1 = 0;  // frequency dependent loss, m^2/s
@@ -88,6 +89,11 @@ struct LidDesign {
 
 struct PianoDesign {
     BoardDesign board;
+    // Longitudinal string motion: stretching driven by the transverse wave (the source of the
+    // 'phantom' partials and the bass strings' ring). The tension change it makes at the bridge
+    // presses on the board through the downbearing angles, front plus back.
+    bool longitudinal = true;
+    double downbearingDeg = 1.5;
     double damperStrength = 1.0;
     std::vector<NoteDesign> notes;
     Listener ears[2];
@@ -107,6 +113,8 @@ struct GrandOptions {
     double unisonDetuneCents = 0.6;  // spread of the strings inside one note
     double stringLoss = 1.0;         // x reference: the string's own damping
     double stringStiffness = 1.0;    // x reference: bending stiffness, sets the inharmonicity
+    bool longitudinal = true;        // stretching of the strings along their length
+    double downbearingDeg = 1.5;     // angle the strings make over the bridge, each side
     bool twoPolarisations = true;
     double bridgeTiltDeg = 6.0;      // assumed; see docs/MODEL.md
     double hammerTiltDeg = 4.0;      // assumed
