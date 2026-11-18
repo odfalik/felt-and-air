@@ -26,6 +26,9 @@ struct StringDesign {
 struct NoteDesign {
     int midi = 60;
     std::vector<StringDesign> strings;
+    // Lengths of the same wires behind the bridge that are left free to ring (rear duplex).
+    // Never struck, never damped; the bridge alone sets them going.
+    std::vector<StringDesign> duplex;
     double strikeRatio = 0.12;  // hammer position / speaking length
     double hammerMass = 0.003;  // kg, whole hammer
     double hammerK = 4.5e9;     // felt stiffness per string contact, N/m^p
@@ -97,6 +100,18 @@ struct PianoDesign {
     // The air pushes back on the moving board: it adds mass at low frequency and carries
     // energy away as sound.
     bool airLoading = true;
+    // Keep simulating strings that sit under their dampers, so that they answer faintly to
+    // the rest of the instrument as real damped strings do. Otherwise a settled damped
+    // string is replaced by a dashpot at the bridge, which is cheaper.
+    bool dampedStringsRing = true;
+    // What the player's hands and feet set in motion besides the hammers.
+    // Each damper rests on its string with this force (weight plus spring, per string). The
+    // string sits slightly deflected under it; lifting the damper lets it go, which is the
+    // faint stir of the strings when the pedal goes down.
+    double damperPress = 0.12;
+    // Knocks and friction of the pedal work and the returning keys, as forces on the case
+    // that reach the board. 1 is the reference guess; 0 turns them off.
+    double mechanismNoise = 1.0;
     double damperStrength = 1.0;
     std::vector<NoteDesign> notes;
     Listener ears[2];
@@ -118,6 +133,8 @@ struct GrandOptions {
     double stringStiffness = 1.0;    // x reference: bending stiffness, sets the inharmonicity
     bool longitudinal = true;        // stretching of the strings along their length
     bool airLoading = true;          // reaction of the air on the soundboard
+    bool duplex = true;              // free string lengths behind the bridge in the treble
+    bool dampedStringsRing = true;   // damped strings stay in the simulation
     double downbearingDeg = 1.5;     // angle the strings make over the bridge, each side
     bool twoPolarisations = true;
     double bridgeTiltDeg = 6.0;      // assumed; see docs/MODEL.md
@@ -130,6 +147,8 @@ struct GrandOptions {
     double strikePosition = 1.0;     // x reference: strike point along the string
     double keyThump = 1.0;           // x reference: knock of the key on the keybed
     double damperStrength = 1.0;     // x reference
+    double damperPressN = 0.12;      // resting force of a damper on one string
+    double mechanismNoise = 1.0;     // x reference: pedal work and key return
 
     // Soundboard.
     double boardThicknessMm = 8.0;

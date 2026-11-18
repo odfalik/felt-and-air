@@ -35,6 +35,9 @@ PianoDesign makeGrand(const GrandOptions& o) {
     d.damperStrength = o.damperStrength;
     d.longitudinal = o.longitudinal;
     d.airLoading = o.airLoading;
+    d.dampedStringsRing = o.dampedStringsRing;
+    d.damperPress = o.damperPressN;
+    d.mechanismNoise = o.mechanismNoise;
     d.downbearingDeg = o.downbearingDeg;
     d.room.enabled = o.roomEnabled;
     d.room.Lx = o.roomLx; d.room.Ly = o.roomLy; d.room.Lz = o.roomLz;
@@ -141,6 +144,16 @@ PianoDesign makeGrand(const GrandOptions& o) {
             // Alternate the sign from string to string so unisons do not all lean one way.
             si.bridgeTilt = o.bridgeTiltDeg * M_PI / 180.0 * (((key + i) & 1) ? 1.0 : -0.7);
             n.strings.push_back(si);
+            if (o.duplex && key >= 52) {
+                // The same wire at the same tension, a third (or, in the top octaves, half) as
+                // long: it sounds a twelfth or an octave above the speaking length.
+                StringDesign du = si;
+                double ratio = key < 65 ? 3.0 : 2.0;
+                double Bs = M_PI * M_PI * si.EI / (si.T * si.L * si.L);
+                du.L = si.L / ratio;
+                du.f0 = si.f0 * ratio * std::sqrt((1 + Bs * ratio * ratio) / (1 + Bs));
+                n.duplex.push_back(du);
+            }
         }
 
         n.strikeRatio = (key <= 50 ? 0.12 : lerp(0.12, 0.075, (key - 50) / 38.0)) * o.strikePosition;

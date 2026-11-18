@@ -173,6 +173,8 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     const double k = k_;
     std::fill(noteOfMidi_, noteOfMidi_ + 128, -1);
     dampMax_ = 1500.0 * d.damperStrength;
+    neverSleep_ = d.dampedStringsRing;
+    mechNoise_ = d.mechanismNoise;
 
     std::vector<Attachment> att;
     std::vector<double> endScale;
@@ -186,7 +188,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
         n.hMass = nd.hammerMass; n.hK = nd.hammerK; n.hP = nd.hammerP; n.hMu = nd.hammerMu;
         n.hasDamper = nd.hasDamper;
         n.thump = nd.keyThump;
-        for (const StringDesign& sd : nd.strings) {
+        auto buildString = [&](const StringDesign& sd, bool duplex) -> bool {
             StringRT s;
             s.note = (int)notes_.size();
             s.attached = sd.attached;
@@ -233,7 +235,10 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
                 }
                 if (found) break;
             }
-            if (N < 3) throw std::runtime_error("string cannot be resolved at this sample rate");
+            if (N < 3) {
+                if (duplex) return false;  // too short for the grid: its pitch is beyond hearing anyway
+                throw std::runtime_error("string cannot be resolved at this sample rate");
+            }
             s.fitPartial = fitQ; s.f0 = sd.f0; s.inharm = B;
             s.N = N; s.h = h;
             s.aT = c2 * k * k / (h * h);
@@ -259,6 +264,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
             s.dmp1 = std::min(N, s.dmp0 + std::max(2, (int)std::lround(dl / h)));
             if (s.dmp0 >= s.dmp1) s.hasDamper = false;
             s.dampRate = s.dampTarget = s.hasDamper ? dampMax_ : 0.0;
+            if (s.hasDamper) s.pressK = k * k * d.damperPress * d.damperStrength / (s.dmp1 - s.dmp0) / s.mNode;
 
             // Longitudinal grid: the coarsest whole number of transverse segments per cell that
             // keeps the (fast) longitudinal wave stable. Short strings get a single cell, which
@@ -279,8 +285,11 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
             s.off = offset + 1;
             offset += N + 3;
             maxN = std::max(maxN, N);
+            if (duplex) { s.hasDamper = false; s.dampRate = s.dampTarget = 0; s.lCells = 0; s.hamW = 0; }
             strings_.push_back(s);
-        }
+            return true;
+        };
+        for (const StringDesign& sd : nd.strings) buildString(sd, false);
         // Second polarisation: the same string moving parallel to the soundboard. The bridge
         // yields along one tilted axis, so the upright motion sees cos(tilt) of it and the
         // sideways motion sin(tilt). The interpolation weights carry that factor (set below).
@@ -303,6 +312,12 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
             if (s.attached) att.push_back({sd.bridge, 0.5 * s.mNode * es * es, s.z0 * es * es});
             endScale.push_back(es);
         }
+        for (const StringDesign& sd : nd.duplex)
+            if (buildString(sd, true)) {
+                const StringRT& s = strings_.back();
+                if (s.attached) att.push_back({sd.bridge, 0.5 * s.mNode, s.z0});
+                endScale.push_back(1.0);
+            }
         noteOfMidi_[nd.midi & 127] = (int)notes_.size();
         notes_.push_back(n);
     }
@@ -322,7 +337,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
                 for (double& wq : s.at.w) wq *= endScale[i];
             }
             // Strings without a damper (top treble, detached test strings) never sleep.
-            s.awake = !s.hasDamper || !s.attached;
+            s.awake = !s.hasDamper || !s.attached || d.dampedStringsRing;
         }
     }
     w_.assign(P.gridSize, 0); vw_.assign(P.gridSize, 0); r_.assign(P.gridSize, 0);
@@ -350,6 +365,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     }
 
     for (size_t i = 0; i < notes_.size(); i++) notes_[i].thumpAt = P.interp(d.notes[i].keyThumpAt);
+    pedalAt_ = P.interp({0.70, 0.06});  // the pedal work hangs under the middle of the keybed
     radiation_.build(P, d, fs_);
 
     if (os_ > 1) {  // Kaiser windowed sinc, cutoff at 0.45 of the output rate
@@ -407,11 +423,7 @@ void Piano::noteOn(int midi, double speed) {
         if (s.lCells > 0) s.lOn = true;
     }
     if (!(speed > 0)) return;
-    if (n.thump > 0 && pulseCount_ < kPulses) {
-        // A 3 ms half-sine carrying the key's impulse; its peak is impulse * pi / (2 T).
-        int len = std::max(2, (int)(0.003 * fs_));
-        pulses_[pulseCount_++] = {n.thumpAt, n.thump * speed * M_PI / (2 * len * k_), 0, len};
-    }
+    knock(n.thumpAt, n.thump * speed, 0.003);
     // Position and speed of each string along the strike direction, at the hammer.
     auto along = [&](int i, const std::vector<RealS>& f) {
         double g = 0;
@@ -435,15 +447,27 @@ void Piano::noteOn(int midi, double speed) {
     }
 }
 
-void Piano::noteOff(int midi) {
+// A short knock on the case: a half-sine force pulse carrying the given impulse.
+void Piano::knock(const Interp& at, double impulse, double seconds) {
+    if (!(impulse > 0) || pulseCount_ >= kPulses) return;
+    int len = std::max(2, (int)(seconds * fs_));
+    pulses_[pulseCount_++] = {at, impulse * M_PI / (2 * len * k_), 0, len};
+}
+
+void Piano::noteOff(int midi, double releaseSpeed) {
     int ni = noteOfMidi_[midi & 127];
     if (ni < 0) return;
     NoteRT& n = notes_[ni];
+    if (!n.keyDown) return;
     n.keyDown = false;
+    releaseSpeed = std::clamp(releaseSpeed, 0.25, 4.0);
     for (int i = 0; i < n.total; i++) {
         StringRT& s = strings_[n.first + i];
-        if (s.hasDamper) s.dampTarget = dampMax_ * pedalDamping_;
+        if (s.hasDamper) { s.dampTarget = dampMax_ * pedalDamping_; s.dampLand = releaseSpeed; }
     }
+    // The key landing back on its rest, and the hammer on its own: a softer knock than the
+    // one going down. Speed here is the hammer speed that an ordinary release corresponds to.
+    knock(n.thumpAt, 0.3 * n.thump * mechNoise_ * releaseSpeed, 0.004);
 }
 
 void Piano::setPedal(double position) {
@@ -454,6 +478,19 @@ void Piano::setPedal(double position) {
     // clear the previous harmony.
     double x = std::clamp((position - 0.34) / 0.13, 0.0, 1.0);
     double damping = 1.0 - x * x * (3 - 2 * x);
+    // Pedal work: its speed drives a faint friction noise, and it knocks at each end of its travel.
+    {
+        double seconds = std::max(1e-3, (stepCount_ - pedalStep_) * k_);
+        double speed = std::fabs(position - pedalPos_) / seconds;  // travels per second
+        if (speed > 0) {
+            pedalSpeed_ = std::min(speed, 30.0);
+            pedalHiss_ = std::max(pedalHiss_, std::min(1.5, pedalSpeed_ / 6.0));
+            bool bottom = position >= 0.97 && pedalPos_ < 0.97, top = position <= 0.03 && pedalPos_ > 0.03;
+            if (bottom || top) knock(pedalAt_, 0.0015 * mechNoise_ * pedalSpeed_ * (top ? 0.7 : 1.0), 0.006);
+        }
+        pedalPos_ = position;
+        pedalStep_ = stepCount_;
+    }
     if (damping == pedalDamping_) return;
     pedalDamping_ = damping;
     for (NoteRT& n : notes_)
@@ -461,7 +498,7 @@ void Piano::setPedal(double position) {
             StringRT& s = strings_[n.first + i];
             if (!s.hasDamper) continue;
             if (damping < 1.0) wake(s);
-            if (!n.keyDown) s.dampTarget = dampMax_ * damping;
+            if (!n.keyDown) { s.dampTarget = dampMax_ * damping; s.dampLand = 1; }
         }
 }
 
@@ -530,13 +567,16 @@ void Piano::stepString(StringRT& s) {
 
     // Damper felt: viscous, backward Euler so that it is stable at any strength.
     if (s.dampRate != s.dampTarget) {
-        double rate = s.dampTarget > s.dampRate ? 0.004 : 0.02;  // engage ~5 ms, lift ~1 ms at 48 kHz
+        // Felt takes a few milliseconds to seat or to let go.
+        double rate = s.dampTarget > s.dampRate ? 0.004 * s.dampLand : 0.006;
         s.dampRate += (s.dampTarget - s.dampRate) * rate * (48000.0 * k_);
         if (std::fabs(s.dampRate - s.dampTarget) < 1e-3) s.dampRate = s.dampTarget;
     }
     if (s.dampRate > 0) {
+        // The damper rests on the string (toward the board) and soaks up its motion.
         RealS scale = (RealS)((1 + s.s0k) / (1 + s.s0k + 2 * k_ * s.dampRate));
-        for (int l = s.dmp0; l < s.dmp1; l++) vn[l] *= scale;
+        RealS press = (RealS)(s.pressK * s.dampRate / dampMax_);
+        for (int l = s.dmp0; l < s.dmp1; l++) vn[l] = (vn[l] - press) * scale;
     }
 }
 
@@ -668,7 +708,7 @@ void Piano::housekeeping() {
         double uN = u[s.N], m = 0;
         s.endPeak = std::max(std::fabs(uN), 0.97 * s.endPeak);
         for (int l = 1; l < s.N; l++) m = std::max(m, std::fabs((double)u[l] - uN * l / s.N));
-        if (m < 1e-8 + 3 * s.endPeak) sleep(s);
+        if (m < 1e-8 + 3 * s.endPeak && !neverSleep_) sleep(s);
     }
     // Bring the helpers in only when there is enough string work to share.
     // Helpers are worth calling in whenever anything is sounding: the plate work is shared too.
@@ -721,6 +761,12 @@ void Piano::step(double& pL, double& pR) {
         double f = pu.peak * std::sin(M_PI * (pu.step + 0.5) / pu.length) * k_ * k_;
         for (int q = 0; q < 4; q++) r[pu.at.idx[q]] += (RealP)(pu.at.w[q] * f);
         if (++pu.step >= pu.length) pulses_[i] = pulses_[--pulseCount_]; else i++;
+    }
+    if (pedalHiss_ > 1e-4) {  // friction in the pedal work: a faint, quickly fading rustle on the case
+        rng_ = rng_ * 1664525u + 1013904223u;
+        double noise = ((rng_ >> 8) * (1.0 / 8388608.0) - 1.0) * 0.02 * mechNoise_ * pedalHiss_;
+        for (int q = 0; q < 4; q++) r[pedalAt_.idx[q]] += (RealP)(pedalAt_.w[q] * noise * k_ * k_);
+        pedalHiss_ *= 1.0 - 30.0 * k_;
     }
     if (extF_ != 0) {
         for (int q = 0; q < 4; q++) r[extAt_.idx[q]] += (RealP)(extAt_.w[q] * extF_ * k_ * k_);

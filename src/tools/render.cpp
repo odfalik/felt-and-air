@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
         while (next < ev.size() && ev[next].t * fs <= frame) {
             const Event& e = ev[next++];
             if (e.type == 1) piano.noteOn(e.midi, midiVelocityToHammerSpeed(e.vel));
-            else if (e.type == 0) piano.noteOff(e.midi);
+            else if (e.type == 0) piano.noteOff(e.midi, e.vel > 0 ? e.vel / 64.0 : 1.0);
             else piano.setPedal(e.vel > 1 ? e.vel / 127.0 : (double)e.vel);
         }
         piano.process(l.data(), r.data(), block);

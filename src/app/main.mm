@@ -123,7 +123,7 @@ struct Engine {
     }
     void handle(const Event& e) {
         if (e.type == 1) { piano->noteOn(e.a, midiVelocityToHammerSpeed(e.b)); focus = e.a; }
-        else if (e.type == 0) piano->noteOff(e.a);
+        else if (e.type == 0) piano->noteOff(e.a, e.b > 0 ? e.b / 64.0 : 1.0);
         else if (e.type == 2) { lastPedal = e.a / 127.0; piano->setPedal(lastPedal); }
         else if (e.type == 4 && e.a >= 0 && e.a < (int)demos.size()) { silence(); demoIndex = e.a; demoNext = 0; demoFrame = 0; demoPlaying = e.a; }
         else if (e.type == 5) { silence(); demoIndex = -1; demoPlaying = -1; }
@@ -908,7 +908,7 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
                 if ((word >> 28) != 2) continue;  // MIDI 1.0 channel voice
                 int status = (word >> 20) & 0xF, d1 = (word >> 8) & 0x7F, d2 = word & 0x7F;
                 if (status == 9 && d2 > 0) gEngine.midiEvents.push({1, d1, d2});
-                else if (status == 8 || status == 9) gEngine.midiEvents.push({0, d1, 0});
+                else if (status == 8 || status == 9) gEngine.midiEvents.push({0, d1, status == 8 ? d2 : 0});
                 else if (status == 0xB && d1 == 64) gEngine.midiEvents.push({2, d2, 0});
                 if (status == 8 || status == 9) {
                     BOOL on = status == 9 && d2 > 0;

@@ -9,7 +9,7 @@
 
 namespace pp {
 
-struct MidiEvent { double seconds; int type, a, b; };  // 1 note on (a note, b velocity), 0 note off, 2 pedal (a = position 0..127)
+struct MidiEvent { double seconds; int type, a, b; };  // 1 note on (a note, b velocity), 0 note off (b release velocity, 0 unknown), 2 pedal (a = position 0..127)
 
 inline std::vector<MidiEvent> readMidiFile(const std::string& path) {
     std::vector<MidiEvent> out;
@@ -57,7 +57,7 @@ inline std::vector<MidiEvent> readMidiFile(const std::string& path) {
                 int hi = status & 0xF0, a = p < end ? d[p++] : 0, b = 0;
                 if (hi != 0xC0 && hi != 0xD0) b = p < end ? d[p++] : 0;
                 if (hi == 0x90 && b > 0) raw.push_back({tick, 1, a, b});
-                else if (hi == 0x80 || hi == 0x90) raw.push_back({tick, 0, a, 0});
+                else if (hi == 0x80 || hi == 0x90) raw.push_back({tick, 0, a, hi == 0x80 ? b : 0});  // b: release velocity
                 else if (hi == 0xB0 && a == 64) raw.push_back({tick, 2, b, 0});
             }
         }

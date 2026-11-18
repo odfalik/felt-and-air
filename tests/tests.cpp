@@ -30,6 +30,8 @@ static PianoDesign oneNote(int key = 40) {
 static void makeLossless(PianoDesign& d) {
     d.longitudinal = false;  // driven one-way by the transverse motion, so not part of the energy balance
     d.airLoading = false;    // the air carries energy away
+    d.damperPress = 0;       // outside forces
+    d.mechanismNoise = 0;
     d.board.lossFactor = 0;
     d.board.sigma0 = 0;
     for (auto& n : d.notes) {
@@ -127,6 +129,9 @@ static void testPassivity() {
     pd.notes[0].keyThump = 0;  // the key knock is an outside force and would add energy
     pd.longitudinal = false;   // one-way drive, outside the energy balance
     pd.airLoading = false;     // acts through delays, outside the step-by-step energy argument
+    pd.damperPress = 0;        // the damper's weight and the key's return are outside forces
+    pd.mechanismNoise = 0;
+    pd.dampedStringsRing = false;  // so that the sleep check below applies
     Piano p(pd, {48000, 1, 0.5});
     p.noteOn(60, 4.0);
     double prev = p.energy(), worstRise = 0, a, b, e0 = prev;

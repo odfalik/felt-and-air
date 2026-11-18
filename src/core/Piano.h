@@ -8,6 +8,7 @@
 #include "Acoustics.h"
 #include "Design.h"
 #include "Plate.h"
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -37,7 +38,9 @@ public:
 
     // Control. Call from the same thread as process(); none of these allocate.
     void noteOn(int midi, double hammerSpeed);
-    void noteOff(int midi);
+    // releaseSpeed: how fast the key comes back up, 1 = ordinary. Sets how quickly the damper
+    // lands and how hard the key knocks on its rest.
+    void noteOff(int midi, double releaseSpeed = 1.0);
     void setSustain(bool down) { setPedal(down ? 1.0 : 0.0); }
     // Sustain pedal position, 0 (up) to 1 (down). Between about 0.34 and 0.47 the dampers only
     // graze the strings (half pedal).
@@ -108,6 +111,8 @@ private:
         int hamL = 0; double hamG[2] = {0, 0}; double hamA = 0;
         int dmp0 = 0, dmp1 = 0; double dampRate = 0, dampTarget = 0;
         int dampedSteps = 0;   // steps spent fully damped
+        double dampLand = 1;   // how fast the damper comes down, relative to ordinary
+        double pressK = 0;     // dt^2 * resting damper force per node / node mass, at full engagement
         double endPeak = 0;    // recent size of the bridge motion at this string
         int fitPartial = 1;    // partial used to fit the grid dispersion
         double f0 = 0, inharm = 0;
@@ -178,8 +183,15 @@ private:
     static const int kPulses = 32;
     Pulse pulses_[kPulses];
     int pulseCount_ = 0;
+    void knock(const Interp& at, double impulse, double seconds);
+    // Pedal work: where it is, how fast it is moving, and its friction noise.
+    Interp pedalAt_;
+    double pedalPos_ = 0, pedalSpeed_ = 0, pedalHiss_ = 0, mechNoise_ = 1;
+    long pedalStep_ = 0;
+    uint32_t rng_ = 0x2545F491u;
     long stepCount_ = 0;
     int quietChecks_ = 1 << 20;
+    bool neverSleep_ = false;
     int hammerItersMax_ = 0;
     double dampMax_ = 1500.0;
 };
