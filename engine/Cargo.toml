@@ -1,0 +1,19 @@
+[package]
+name = "piano_engine"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A piano simulated from its mechanics, in real time"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.test]
+opt-level = 3
