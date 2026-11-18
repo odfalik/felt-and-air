@@ -35,6 +35,20 @@ public:
     // One internal time step; returns the two ear pressures in pascal at the internal rate.
     void step(double& pLeft, double& pRight);
 
+    // A copy of what a display needs. prepare once, then fill from the audio thread
+    // (allocation free).
+    struct Snapshot {
+        std::vector<float> board;        // plate displacement, grid storage, metres
+        std::vector<float> stringLevel;  // per string: largest displacement, metres
+        std::vector<float> shape[3];     // displacement along the strings of the focus note
+        int shapeNodes[3] = {0, 0, 0};
+        float hammerForce[3] = {0, 0, 0};
+        int focusMidi = -1, awake = 0;
+    };
+    void prepareSnapshot(Snapshot& s) const;
+    void fillSnapshot(Snapshot& s, int focusMidi) const;
+    int stringMidi(int index) const { return notes_[strings_[index].note].midi; }
+
     // ---- diagnostics (not for the audio thread) ----
     double energy() const;
     double dt() const { return k_; }

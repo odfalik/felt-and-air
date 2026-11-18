@@ -572,6 +572,40 @@ double Piano::energy() const {
     return H;
 }
 
+void Piano::prepareSnapshot(Snapshot& s) const {
+    s.board.assign(w_.size(), 0.0f);
+    s.stringLevel.assign(strings_.size(), 0.0f);
+    int maxN = 0;
+    for (const StringRT& st : strings_) maxN = std::max(maxN, st.N + 1);
+    for (auto& sh : s.shape) sh.assign(maxN, 0.0f);
+}
+
+void Piano::fillSnapshot(Snapshot& s, int focusMidi) const {
+    for (size_t g = 0; g < w_.size(); g++) s.board[g] = (float)w_[g];
+    s.awake = 0;
+    for (size_t i = 0; i < strings_.size(); i++) {
+        const StringRT& st = strings_[i];
+        float m = 0;
+        if (st.awake) {
+            s.awake++;
+            const RealS* u = &u_[st.off];
+            for (int l = 1; l < st.N; l++) m = std::max(m, (float)std::fabs(u[l]));
+        }
+        s.stringLevel[i] = m;
+    }
+    s.focusMidi = focusMidi;
+    for (int i = 0; i < 3; i++) { s.shapeNodes[i] = 0; s.hammerForce[i] = 0; }
+    int ni = focusMidi >= 0 ? noteOfMidi_[focusMidi & 127] : -1;
+    if (ni < 0) return;
+    for (int i = 0; i < notes_[ni].count; i++) {
+        const StringRT& st = strings_[notes_[ni].first + i];
+        const RealS* u = &u_[st.off];
+        s.shapeNodes[i] = st.N + 1;
+        for (int l = 0; l <= st.N; l++) s.shape[i][l] = st.awake ? (float)u[l] : 0.0f;
+        s.hammerForce[i] = (float)st.force;
+    }
+}
+
 int Piano::awakeStrings() const {
     int c = 0;
     for (const StringRT& s : strings_) c += s.awake;

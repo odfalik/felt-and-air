@@ -7,8 +7,8 @@ CORE_OBJ := $(patsubst src/core/%.cpp,build/core/%.o,$(CORE_SRC))
 FAST     := -DPP_PLATE_REAL=float -DPP_STRING_REAL=float
 FAST_OBJ := $(patsubst src/core/%.cpp,build/fast/%.o,$(CORE_SRC))
 
-.PHONY: all test clean render bench
-all: build/tests build/render build/bench build/render-fast build/bench-fast
+.PHONY: all test clean app
+all: build/tests build/render build/bench build/render-fast build/bench-fast app
 
 build/core/%.o: src/core/%.cpp $(CORE_HDR)
 	@mkdir -p build/core
@@ -27,6 +27,15 @@ build/render: src/tools/render.cpp $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 build/bench: src/tools/bench.cpp $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
+
+APP := build/PhysicalPiano.app
+app: $(APP)/Contents/MacOS/PhysicalPiano
+$(APP)/Contents/MacOS/PhysicalPiano: src/app/main.mm src/app/Info.plist $(CORE_OBJ)
+	@mkdir -p $(APP)/Contents/MacOS
+	cp src/app/Info.plist $(APP)/Contents/Info.plist
+	$(CXX) $(CXXFLAGS) -fobjc-arc -ObjC++ src/app/main.mm $(CORE_OBJ) -o $@ \
+		-framework AppKit -framework AudioToolbox -framework CoreAudio -framework CoreMIDI
+	codesign --force --sign - $(APP) >/dev/null 2>&1 || true
 
 test: build/tests
 	./build/tests
