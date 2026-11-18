@@ -14,7 +14,8 @@ Needs only the Xcode Command Line Tools.
 
 ```bash
 make            # engine, tests, tools, app
-make test       # validation suite (about 40 s)
+make test       # validation suite (about a minute)
+make install-au # Audio Unit into ~/Library/Audio/Plug-Ins/Components
 open build/PhysicalPiano.app
 ```
 
@@ -33,10 +34,11 @@ python3 -I tools/fetch_demos.py
 | `C` / `V` | softer / harder |
 | `Space` | sustain pedal |
 
-Controls in the window: sound on/off, volume, a menu of demo recordings, board grid,
-listener position, and an **Instrument** panel of sliders (felt hardness, hammer mass, strike
-point, detune, losses, board thickness, rib height, key knock, room, lid). Sliders rebuild
-the instrument when released.
+Controls in the window: sound on/off, volume, a menu of demo recordings, board grid, and an
+**Instrument** window with four tabs (Space, Hammers, Strings, Soundboard): sliders in
+physical units, switches for each part of the physics, presets, your own saved setups, and a
+room plan where the piano and the listener can be dragged. Changes rebuild the instrument
+when you let go.
 
 MIDI keyboards are picked up automatically. The mouse plays the on-screen keys.
 

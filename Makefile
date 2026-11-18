@@ -7,7 +7,7 @@ CORE_OBJ := $(patsubst src/core/%.cpp,build/core/%.o,$(CORE_SRC))
 FAST     := -DPP_PLATE_REAL=float -DPP_STRING_REAL=float
 FAST_OBJ := $(patsubst src/core/%.cpp,build/fast/%.o,$(CORE_SRC))
 
-.PHONY: all test clean app
+.PHONY: all test clean app au install-au
 all: build/tests build/render build/bench build/report build/metalbench build/render-fast build/bench-fast app
 
 build/core/%.o: src/core/%.cpp $(CORE_HDR)
@@ -27,6 +27,8 @@ build/render: src/tools/render.cpp $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 build/metalbench: src/tools/metalbench.mm
 	$(CXX) $(CXXFLAGS) -fobjc-arc -ObjC++ $< -o $@ -framework Foundation -framework Metal
+build/autest: src/tools/autest.cpp
+	$(CXX) $(CXXFLAGS) $< -o $@ -framework AudioToolbox -framework CoreFoundation
 build/report: src/tools/report.cpp $(CORE_OBJ)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 build/bench: src/tools/bench.cpp $(CORE_OBJ)
@@ -40,6 +42,20 @@ $(APP)/Contents/MacOS/PhysicalPiano: src/app/main.mm src/app/Info.plist $(CORE_O
 	$(CXX) $(CXXFLAGS) -fobjc-arc -ObjC++ -DPP_DEMO_DIR='"$(CURDIR)/demos"' src/app/main.mm $(CORE_OBJ) -o $@ \
 		-framework AppKit -framework AudioToolbox -framework CoreAudio -framework CoreMIDI
 	codesign --force --sign - $(APP) >/dev/null 2>&1 || true
+
+AU := build/PhysicalPiano.component
+au: $(AU)/Contents/MacOS/PhysicalPiano
+$(AU)/Contents/MacOS/PhysicalPiano: src/au/PhysicalPianoAU.cpp src/au/Info.plist $(CORE_OBJ) $(CORE_HDR)
+	@mkdir -p $(AU)/Contents/MacOS
+	cp src/au/Info.plist $(AU)/Contents/Info.plist
+	$(CXX) $(CXXFLAGS) -bundle src/au/PhysicalPianoAU.cpp $(CORE_OBJ) -o $@ \
+		-framework AudioToolbox -framework AudioUnit -framework CoreFoundation
+	codesign --force --sign - $(AU) >/dev/null 2>&1 || true
+# Copies the plug-in to where hosts look for it, for this user only.
+install-au: au
+	mkdir -p "$(HOME)/Library/Audio/Plug-Ins/Components"
+	rm -rf "$(HOME)/Library/Audio/Plug-Ins/Components/PhysicalPiano.component"
+	cp -R $(AU) "$(HOME)/Library/Audio/Plug-Ins/Components/"
 
 test: build/tests
 	./build/tests

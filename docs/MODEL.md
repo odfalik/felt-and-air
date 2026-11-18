@@ -12,12 +12,16 @@ part consistently.
 | Part | Model |
 |---|---|
 | Strings | Stiff string (tension + bending), 228 strings for 88 keys, 5 to 200 grid nodes each. Optional second (sideways) polarisation |
+| Stretching | Longitudinal motion on its own coarse grid, driven by the transverse wave; its tension change presses on the bridge through the downbearing angle. One-way: it does not act back on the transverse motion |
+| Duplex | 99 free lengths of the treble wires behind the bridge, a third or half as long, never struck or damped |
 | Tuning | A4 = 440 Hz, octaves tuned outward by matching partials (4:2, 2:1 in the high treble, 6:3 in the bass). Gives -14 cents at A0 and +34 cents at C8 |
 | String loss | Constant plus frequency-squared decay rate. The constant is 0.12 /s, not the 0.5 /s of Chaigne and Askenfelt (1994), which was fitted with a rigid bridge and so contained the soundboard's share |
-| Hammer | Point mass, nonlinear felt `F = K z^p` with Hunt-Crossley damping, one hammer striking all strings of its note, in free flight as after let-off |
-| Key knock | A 3 ms force pulse on the board's front edge when the key lands |
-| Dampers | Viscous felt over a short length of string. The pedal is continuous: dampers graze the strings between 34 % and 47 % of its travel |
+| Hammer | Head on a flexible shank (two masses and a spring), nonlinear felt `F = K z^p` with Hunt-Crossley damping, one hammer striking all strings of its note, in free flight as after let-off |
+| Keys | A force pulse on the board's front edge when the key lands, a softer one when it returns; release speed sets how fast the damper comes down |
+| Pedal work | A knock at each end of the pedal's travel and a faint friction noise while it moves, as forces on the case |
+| Dampers | Felt that rests on the string with a small force and soaks up its motion. Lifting it releases the slightly deflected string, which is the stir of the strings when the pedal goes down (about 35 dB below a mezzo forte note). Damped strings stay in the simulation. The pedal is continuous: dampers graze the strings between 34 % and 47 % of its travel |
 | Soundboard | Orthotropic Kirchhoff plate on a grain-aligned grid, grand-shaped outline, clamped rim, crown as a shallow-shell stiffness |
+| Air on the board | Each quarter-metre patch feels its own motion as a piston (mass-like at low, resistive at high frequency) and the delayed acceleration of every other patch, on both faces. Lowers the lowest resonance by 8 % |
 | Ribs | Beams across the grain, with a composite-section stiffness and tapered ends |
 | Bridges | Beams along the bass and treble bridge lines, tied to the plate by interpolation |
 | String to bridge | The string's end node is the plate at that point. Force and motion pass both ways with no extra parameters |
@@ -56,6 +60,9 @@ part consistently.
 | Board drains the strings | 4 dB extra decay over 1.6 s |
 | Helper threads | output bit-identical to one thread |
 | Room | direct sound arrives on time; decay 0.81 s against Sabine 0.89 s |
+| Longitudinal motion | tension pulses at twice the fundamental; longitudinal mode at 2402 Hz against 2413 Hz expected |
+| Air loading | lowest resonance 44.2 Hz in vacuum, 40.7 Hz in air; fortissimo with pedal rings down |
+| Audio Unit, driven in-process as a host would | 9 checks pass (formats, MIDI notes and pedal, own buffers, slice limit, state) |
 | Fortissimo abuse over the full compass with pedal | finite, bounded |
 
 Measured, not tested against a target: bridge driving-point impedance 300 to 3000 kg/s across
@@ -67,18 +74,19 @@ about 2 dB per second after.
 The work of one time step is shared between the audio thread and three helper threads that
 join the audio device's realtime thread group and spin only while a block is being rendered.
 
-On the real audio thread, output silenced, board grid 1.5x (1,632 nodes), one polarisation,
-room on, machine otherwise lightly loaded:
+On the real audio thread, output silenced, board grid 1.5x (1,632 nodes), room on, every
+part of the model above on except the sideways polarisation, machine otherwise lightly loaded:
 
 | Material | Mean load | Worst block after the first |
 |---|---|---|
-| Bach prelude, little pedal, about 70 strings awake | 45 % | 59 % |
-| Chopin nocturne, pedalled, all 228 strings awake | 56 % | 60 % |
+| Bach prelude | 70 to 72 % | 81 % |
+| Chopin nocturne, pedalled | 66 to 73 % | 81 % |
 
-The first block after sound starts has run over budget. On one thread the same two cases
-cost about 65 % and 117 %. Finer board grids cost more: the plate stencil scales with node
-count, the stiffener solve does not. Sustained thermal behaviour on the fanless Air has not
-been measured.
+The two cost the same because damped strings are now always simulated: 327 strings are awake
+at all times. The first one or two blocks after sound starts run over budget. Before
+longitudinal motion, air loading, duplex lengths and always-awake strings were added, the
+same cases cost 45 % and 56 %. Finer board grids cost more. Sustained thermal behaviour on
+the fanless Air has not been measured.
 
 **Single precision** was tried and rejected for now. For the soundboard it saves about 27 %
 but adds noise at -55 dB relative to the signal in the 16 to 24 kHz band. For the strings
@@ -101,19 +109,24 @@ budget. A real-time air simulation on this GPU is limited to roughly a 7 m room 
 
 ## Not modelled, or guessed
 
-- **Longitudinal string motion.** No phantom partials.
-- **Polarisation coupling strength.** Bridge tilt (6 degrees) and hammer tilt (4 degrees)
-  are assumptions. With them the sideways motion changes the sound by under 0.2 dB, so it is
-  off by default; the two-stage decay comes from unison detuning.
-- **Air loading on the board**, diffraction around the case, and the lid's shadow. The late
-  reverberant field is statistical, not simulated.
-- **Downbearing and prestress.** The crown is included only as its membrane stiffness.
+- **Sideways polarisation.** Implemented and energy-exact, but its coupling to the board is a
+  tilted bridge axis with assumed angles, and with them it changes the level by at most
+  2.5 dB late in a note. It is off by default. A coupling derived from the bridge rocking on
+  the board, with no free angle, has not been built.
+- **Longitudinal motion** is one-way and its link to the board is a single downbearing
+  angle (1.5 degrees, assumed).
+- **Air.** Loading is resolved to quarter-metre patches, so it is a low-frequency model.
+  Diffraction around the case and the lid's shadow are missing. The late reverberant field
+  is statistical, not simulated.
+- **Downbearing and prestress** of the board. The crown is included only as its membrane stiffness.
 - **Shear and rotary inertia** in board and strings (thin-plate and Euler-Bernoulli limits).
-- **Duplex and back-string lengths, agraffe and pin compliance, the iron plate.**
-- **Action.** No key, escapement, shank flex or repetition mechanics; hammer speed is a
-  fixed curve of MIDI velocity.
-- **Leaky dampers.** A fully damped string is silent once settled, and is then replaced by a
-  dashpot at the bridge until it is played or the pedal lifts.
+- **Front duplex lengths, agraffe and pin compliance, the iron plate.** Rear duplex lengths
+  are ideal thirds and halves, not a maker's scaling.
+- **Action.** The key, wippen, jack and repetition lever are not simulated as bodies. With
+  MIDI input their result, the hammer's speed and timing at let-off, is what the note-on
+  already carries; hammer speed is a fixed curve of MIDI velocity. Shank flex, key and pedal
+  knocks and damper mechanics are modelled, with guessed strengths. Pedal friction is a
+  noise source, not a friction model. Una corda and sostenuto pedals are missing.
 - **Geometry.** A generic 2 m grand: outline, scale, rib and bridge sizes are plausible
   values, not measurements of an instrument.
 - **Material and felt data.** Spruce and maple constants are textbook values. Felt stiffness
@@ -121,3 +134,12 @@ budget. A real-time air simulation on this GPU is limited to roughly a 7 m room 
   board loss factor, crown radius, key knock strength, pedal thresholds, room size and
   absorption are assumptions. The pedal thresholds were inferred from recorded pedalling.
 - **Listening.** Checks are numerical. Judgements of tone so far are the owner's, by ear.
+
+## Plug-in
+
+`make au` builds an Audio Unit instrument (`aumu` / `PhPn` / `Strd`) with one parameter
+(volume), MIDI notes, release velocity and a continuous sustain pedal. `make install-au`
+copies it to `~/Library/Audio/Plug-Ins/Components`. It has no editor window, so the
+Instrument settings are those of the reference grand. Apple's `auval` has not been run on
+it: the system's component registry had not picked the new plug-in up, and refreshing it
+needs a log-out or administrator rights. There is no VST3 build; that needs Steinberg's SDK.
