@@ -38,7 +38,7 @@ public:
     void noteOn(int midi, double hammerSpeed);
     void noteOff(int midi);
     void setSustain(bool down) { setPedal(down ? 1.0 : 0.0); }
-    // Sustain pedal position, 0 (up) to 1 (down). Between about 0.3 and 0.6 the dampers only
+    // Sustain pedal position, 0 (up) to 1 (down). Between about 0.34 and 0.47 the dampers only
     // graze the strings (half pedal).
     void setPedal(double position);
 

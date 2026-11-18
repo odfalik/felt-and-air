@@ -404,9 +404,12 @@ void Piano::noteOff(int midi) {
 }
 
 void Piano::setPedal(double position) {
-    // Dampers start to leave the strings around 30 % of the pedal travel and are clear by
-    // 60 %. In between the felt only grazes the string, modelled as a weaker damper.
-    double x = std::clamp((position - 0.30) / 0.30, 0.0, 1.0);
+    // Dampers start to leave the strings around 34 % of the pedal travel and are clear by
+    // 47 %; in between the felt only grazes the string, modelled as a weaker damper. The
+    // range is inferred from recorded performances: players release a bass key with the pedal
+    // near 50 % on its way down and expect the note to be caught, and dip to about 40 % to
+    // clear the previous harmony.
+    double x = std::clamp((position - 0.34) / 0.13, 0.0, 1.0);
     double damping = 1.0 - x * x * (3 - 2 * x);
     if (damping == pedalDamping_) return;
     pedalDamping_ = damping;
