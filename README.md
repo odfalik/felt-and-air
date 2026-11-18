@@ -18,7 +18,13 @@ make test       # validation suite (about 40 s)
 open build/PhysicalPiano.app
 ```
 
-The app starts silent. Press **Return** to turn sound on.
+The app starts silent. Press **Return** or the Sound button to turn sound on.
+
+For the demo recordings (real performances, 58 MB download, CC BY-NC-SA):
+
+```bash
+python3 -I tools/fetch_demos.py
+```
 
 | Keys | Action |
 |---|---|
@@ -26,7 +32,6 @@ The app starts silent. Press **Return** to turn sound on.
 | `Z` / `X` | octave down / up |
 | `C` / `V` | softer / harder |
 | `Space` | sustain pedal |
-| `1` `2` `3` | soundboard grid: finest, 1.25x, 1.5x spacing |
 
 MIDI keyboards are picked up automatically. The mouse plays the on-screen keys.
 

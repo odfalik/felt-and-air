@@ -1,0 +1,2 @@
+MIDI recordings of live performances from the MAESTRO dataset v3.0.0 (Hawthorne et al., 2019),
+https://magenta.tensorflow.org/datasets/maestro, licensed CC BY-NC-SA 4.0. Not redistributed with this repository.

@@ -2,7 +2,14 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <stdexcept>
+#include <thread>
+#if defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 namespace pp {
 
@@ -18,6 +25,112 @@ struct FlushDenormals {
     ~FlushDenormals() { __asm__ volatile("msr fpcr, %0" : : "r"(saved)); }
 #endif
 };
+}
+
+// Work sharing for the strings. Within one time step every string depends only on the state
+// of the previous step, so strings can be advanced side by side. The audio thread publishes
+// a job, takes chunks itself, and helpers take the rest; if a helper is late the audio thread
+// simply ends up doing more of the chunks, so a slow helper costs time but never correctness.
+struct Piano::Pool {
+    std::vector<std::thread> threads;
+    // One word holds the whole job: generation, phase and the next unclaimed chunk. A chunk
+    // is claimed by compare-and-swap on that word, so a thread can never pair a chunk of a
+    // new job with the phase of an old one.
+    std::atomic<uint64_t> ticket{~0ull};
+    std::atomic<int> done{0};
+    std::atomic<bool> stop{false}, active{false};
+    std::mutex m;
+    std::condition_variable cv;
+    int chunks = 0;
+    uint64_t generation = 0;
+
+    // Claims a chunk of the current job. Returns false when none are left.
+    bool claim(int& phase, int& chunk) {
+        uint64_t t = ticket.load(std::memory_order_acquire);
+        for (;;) {
+            uint32_t idx = (uint32_t)t;
+            if (idx >= (uint32_t)chunks) return false;
+            if (ticket.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) {
+                phase = (int)((t >> 32) & 1);
+                chunk = (int)idx;
+                return true;
+            }
+        }
+    }
+    void post(int phase) {
+        done.store(0, std::memory_order_release);
+        ticket.store((++generation << 33) | ((uint64_t)phase << 32), std::memory_order_release);
+    }
+};
+
+Piano::~Piano() { setHelperThreads(0); }
+
+void Piano::setHelperThreads(int count, std::function<void()> onStart) {
+    if (pool_) {
+        pool_->stop = true;
+        { std::lock_guard<std::mutex> g(pool_->m); }
+        pool_->cv.notify_all();
+        for (auto& t : pool_->threads) t.join();
+        pool_.reset();
+    }
+    if (count <= 0) return;
+    pool_ = std::make_unique<Pool>();
+    Pool* p = pool_.get();
+    p->chunks = (int)chunks_.size();
+    for (int i = 0; i < count; i++)
+        p->threads.emplace_back([this, p, onStart] {
+#if defined(__APPLE__)
+            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+            if (onStart) onStart();
+            FlushDenormals flush;
+            while (!p->stop.load(std::memory_order_relaxed)) {
+                if (!p->active.load(std::memory_order_acquire)) {
+                    std::unique_lock<std::mutex> lk(p->m);
+                    p->cv.wait(lk, [p] { return p->stop.load() || p->active.load(); });
+                    continue;
+                }
+                int ph, c;
+                if (p->claim(ph, c)) {
+                    chunkWork(ph, c);
+                    p->done.fetch_add(1, std::memory_order_release);
+                } else {
+#if defined(__aarch64__)
+                    __asm__ volatile("yield");
+#endif
+                }
+            }
+        });
+}
+
+bool Piano::helpersBusy() const { return pool_ && pool_->active.load(); }
+
+void Piano::chunkWork(int phase, int chunk) {
+    const int a = chunks_[chunk].first, b = chunks_[chunk].second;
+    if (phase == 0) {
+        for (int i = a; i < b; i++) stepString(strings_[i]);
+    } else {
+        const int vb = vb_;
+        for (int i = a; i < b; i++) {
+            const StringRT& s = strings_[i];
+            if (!s.awake) continue;
+            RealS* __restrict u = &u_[s.off];
+            const RealS* __restrict v = &v_[vb][s.off];
+            for (int l = 1; l < s.N; l++) u[l] += v[l];
+        }
+    }
+}
+
+// Starts a pass over all chunks. With helpers active the caller may do other work before
+// calling finishChunks(); without them the pass runs here and now.
+void Piano::runChunks(int phase) {
+    Pool* p = pool_.get();
+    const int n = (int)chunks_.size();
+    if (!p || !p->active.load(std::memory_order_relaxed)) {
+        for (int c = 0; c < n; c++) chunkWork(phase, c);
+        return;
+    }
+    p->post(phase);
 }
 
 Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
@@ -142,6 +255,13 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
         }
         noteOfMidi_[nd.midi & 127] = (int)notes_.size();
         notes_.push_back(n);
+    }
+    {
+        int start = 0, nodes = 0;
+        for (int i = 0; i < (int)strings_.size(); i++) {
+            nodes += strings_[i].N;
+            if (nodes >= 1200 || i + 1 == (int)strings_.size()) { chunks_.push_back({start, i + 1}); start = i + 1; nodes = 0; }
+        }
     }
     u_.assign(offset, 0);
     v_[0].assign(offset, 0);
@@ -306,8 +426,7 @@ void Piano::stepString(StringRT& s) {
 
     if (!s.awake) {
         // A damped string absorbs what the bridge sends into it: characteristic impedance.
-        double f = -k_ * s.z0 * vN;
-        for (int q = 0; q < 4; q++) r_[s.at.idx[q]] += (RealP)(s.at.w[q] * f);
+        s.endForce = -k_ * s.z0 * vN;
         return;
     }
     // Both ends are simply supported: zero bending moment, expressed through ghost nodes.
@@ -317,8 +436,7 @@ void Piano::stepString(StringRT& s) {
 
     if (s.attached) {
         double uA = u[N - 1], uB = u[N - 2], vA = v[N - 1];
-        double f = s.mNode * (-(s.aT * (uN - uA) + s.aD * (vN - vA)) - s.aB * (uB - 2 * uA + uN));
-        for (int q = 0; q < 4; q++) r_[s.at.idx[q]] += (RealP)(s.at.w[q] * f);
+        s.endForce = s.mNode * (-(s.aT * (uN - uA) + s.aD * (vN - vA)) - s.aB * (uB - 2 * uA + uN));
     }
     const double inv = 1 / (1 + s.s0k);
     const RealS cu0 = (RealS)((-2 * s.aT - 6 * s.aB) * inv), cu1 = (RealS)((s.aT + 4 * s.aB) * inv), cu2 = (RealS)(-s.aB * inv);
@@ -466,6 +584,18 @@ void Piano::housekeeping() {
         for (int l = 1; l < s.N; l++) m = std::max(m, std::fabs(u[l] - uN * l / s.N));
         if (m < 1e-8) sleep(s);
     }
+    // Bring the helpers in only when there is enough string work to share.
+    if (pool_) {
+        int nodes = 0;
+        for (const StringRT& s : strings_) nodes += s.awake ? s.N : 0;
+        bool on = pool_->active.load(std::memory_order_relaxed);
+        if (!on && nodes > 6000) {
+            pool_->active.store(true, std::memory_order_release);
+            pool_->cv.notify_all();
+        } else if (on && nodes < 4000) {
+            pool_->active.store(false, std::memory_order_release);
+        }
+    }
 }
 
 void Piano::step(double& pL, double& pR) {
@@ -474,22 +604,40 @@ void Piano::step(double& pL, double& pR) {
     RealP* __restrict w = w_.data();
     RealP* __restrict vw = vw_.data();
 
+    Pool* pool = pool_.get();
+    const bool shared = pool && pool->active.load(std::memory_order_relaxed);
+    const int nChunks = (int)chunks_.size();
+    // Finish a shared pass: take whatever chunks are left, then wait for the helpers' ones.
+    auto finish = [&](int phase) {
+        if (!shared) return;
+        int ph, c;
+        while (pool->claim(ph, c)) {
+            chunkWork(ph, c);
+            pool->done.fetch_add(1, std::memory_order_release);
+        }
+        (void)phase;
+        while (pool->done.load(std::memory_order_acquire) < nChunks) {
+#if defined(__aarch64__)
+            __asm__ volatile("yield");
+#endif
+        }
+    };
+
+    if (shared) runChunks(0);  // helpers start on the strings while this thread does the plate
     P.apply(w, vw, r);  // plate internal forces, scaled by dt^2
     if (extF_ != 0) {
         for (int q = 0; q < 4; q++) r[extAt_.idx[q]] += (RealP)(extAt_.w[q] * extF_ * k_ * k_);
         extF_ = 0;
     }
 
-    for (StringRT& s : strings_) stepString(s);
+    if (shared) finish(0); else runChunks(0);
+    for (const StringRT& s : strings_)
+        if (s.attached && s.endForce != 0)
+            for (int q = 0; q < 4; q++) r[s.at.idx[q]] += (RealP)(s.at.w[q] * s.endForce);
     for (NoteRT& n : notes_)
         if (n.hammerActive) stepHammer(n);
     vb_ ^= 1;
-    for (StringRT& s : strings_) {
-        if (!s.awake) continue;
-        RealS* __restrict u = &u_[s.off];
-        const RealS* __restrict v = &v_[vb_][s.off];
-        for (int l = 1; l < s.N; l++) u[l] += v[l];
-    }
+    runChunks(1);  // advance the string displacements (alongside the plate solve when shared)
 
     // Implicit stiffener solve, then the plate update. Afterwards r holds the change of the
     // plate increment, i.e. dt^2 * acceleration, which is what radiates.
@@ -532,6 +680,7 @@ void Piano::step(double& pL, double& pR) {
     pR = ring_[1][ringPos_]; ring_[1][ringPos_] = 0;
     ringPos_ = (ringPos_ + 1) & ringMask_;
 
+    finish(1);
     if ((++stepCount_ & 63) == 0) housekeeping();
 }
 

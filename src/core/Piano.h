@@ -7,6 +7,7 @@
 #pragma once
 #include "Design.h"
 #include "Plate.h"
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -24,6 +25,13 @@ struct PianoOptions {
 class Piano {
 public:
     Piano(const PianoDesign& design, const PianoOptions& options);
+    ~Piano();
+
+    // Helper threads that share the string work when many strings are ringing. They idle
+    // (asleep) until then. Call before audio starts.
+    // onStart runs once on each helper thread (for example to join an audio workgroup).
+    void setHelperThreads(int count, std::function<void()> onStart = {});
+    bool helpersBusy() const;
 
     // Control. Call from the same thread as process(); none of these allocate.
     void noteOn(int midi, double hammerSpeed);
@@ -96,6 +104,7 @@ private:
         int fitPartial = 1;    // partial used to fit the grid dispersion
         double f0 = 0, inharm = 0;
         double zeta = 0, zetaPrev = 0, force = 0;
+        double endForce = 0;  // dt^2 * force on the bridge from the latest step
     };
     struct NoteRT {
         int midi = 0, first = 0, count = 0;  // count contacts; each may have a second polarisation
@@ -111,6 +120,11 @@ private:
     void stepString(StringRT& s);
     void stepHammer(NoteRT& n);
     void housekeeping();
+    struct Pool;
+    std::unique_ptr<Pool> pool_;
+    std::vector<std::pair<int, int>> chunks_;  // string index ranges of similar size
+    void runChunks(int phase);
+    void chunkWork(int phase, int chunk);
     template <class T> double uEnd(const StringRT& s, const T* field) const { return s.attached ? s.at.eval(field) : 0.0; }
 
     double k_ = 0, fs_ = 0, outGain_ = 0;

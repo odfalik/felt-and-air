@@ -31,12 +31,15 @@ int main(int argc, char** argv) {
     double seconds = argc > 2 ? std::atof(argv[2]) : 4.0;
     int block = argc > 3 ? std::atoi(argv[3]) : 128;
     double gridScale = argc > 4 ? std::atof(argv[4]) : 1.0;
+    int helpers = argc > 5 ? std::atoi(argv[5]) : 0;
     const double fs = 48000;
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // ask for a performance core
 
     PianoOptions opt;
     opt.sampleRate = fs; opt.oversample = os; opt.boardGridScale = gridScale;
     Piano piano(makeGrand(), opt);
+    piano.setHelperThreads(helpers);
+    std::printf("helper threads: %d (cycle counts below include them)\n", helpers);
     std::printf("engine: %d strings / %d string nodes, board %d nodes (%.1f x %.1f mm), internal rate %.0f Hz, block %d (%.2f ms)\n",
                 piano.stringCount(), piano.totalStringNodes(), piano.plate().n, piano.plate().hx * 1e3, piano.plate().hy * 1e3, fs * os, block,
                 1e3 * block / fs);

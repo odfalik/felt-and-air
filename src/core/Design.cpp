@@ -100,6 +100,7 @@ PianoDesign makeGrand(const GrandOptions& o) {
         n.hammerMu = 0.1;
         n.hasDamper = key <= 69;
         n.hammerTilt = o.hammerTiltDeg * M_PI / 180.0;
+        n.twoPolarisations = o.twoPolarisations;
         d.notes.push_back(n);
     }
 

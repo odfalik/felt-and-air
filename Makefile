@@ -32,10 +32,10 @@ build/bench: src/tools/bench.cpp $(CORE_OBJ)
 
 APP := build/PhysicalPiano.app
 app: $(APP)/Contents/MacOS/PhysicalPiano
-$(APP)/Contents/MacOS/PhysicalPiano: src/app/main.mm src/app/Info.plist $(CORE_OBJ)
+$(APP)/Contents/MacOS/PhysicalPiano: src/app/main.mm src/app/Info.plist $(CORE_OBJ) $(CORE_HDR)
 	@mkdir -p $(APP)/Contents/MacOS
 	cp src/app/Info.plist $(APP)/Contents/Info.plist
-	$(CXX) $(CXXFLAGS) -fobjc-arc -ObjC++ src/app/main.mm $(CORE_OBJ) -o $@ \
+	$(CXX) $(CXXFLAGS) -fobjc-arc -ObjC++ -DPP_DEMO_DIR='"$(CURDIR)/demos"' src/app/main.mm $(CORE_OBJ) -o $@ \
 		-framework AppKit -framework AudioToolbox -framework CoreAudio -framework CoreMIDI
 	codesign --force --sign - $(APP) >/dev/null 2>&1 || true
 

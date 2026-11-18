@@ -332,12 +332,35 @@ static void testRobustness() {
     CHECK(std::isfinite(e) && e < 10.0, "stored energy %.4f J stays bounded", e);
 }
 
+static void testThreads() {
+    std::printf("\n11. Helper threads give bit-identical output\n");
+    std::vector<float> ref, out;
+    for (int helpers : {0, 3}) {
+        Piano p(makeGrand(), {48000, 1});
+        p.setHelperThreads(helpers);
+        std::vector<float> l(64), r(64);
+        std::vector<float>& dst = helpers ? out : ref;
+        bool shared = false;
+        p.setSustain(true);
+        for (int block = 0; block < 300; block++) {
+            if (block % 25 == 0) p.noteOn(30 + (block / 25 * 7) % 60, 3.0);
+            p.process(l.data(), r.data(), 64);
+            shared = shared || p.helpersBusy();
+            dst.insert(dst.end(), l.begin(), l.end());
+        }
+        if (helpers) CHECK(shared, "helpers were sharing the string work");
+    }
+    size_t diff = 0;
+    for (size_t i = 0; i < ref.size(); i++) diff += ref[i] != out[i];
+    CHECK(diff == 0, "%zu of %zu samples differ between 0 and 3 helpers", diff, ref.size());
+}
+
 int main(int argc, char** argv) {
     std::vector<std::pair<std::string, std::function<void()>>> tests = {
         {"kernel", testKernelMatchesAssembly}, {"energy", testEnergyConservation}, {"free", testEnergyAfterRelease},
         {"passivity", testPassivity},          {"plate", testPlateAnalytic},       {"partials", testStringPartials},
         {"hammer", testHammer},                {"reciprocity", testReciprocity},   {"coupling", testCoupling},
-        {"robust", testRobustness}};
+        {"robust", testRobustness},           {"threads", testThreads}};
     for (auto& t : tests)
         if (argc < 2 || t.first == argv[1]) t.second();
     std::printf("\n%s (%d failed checks)\n", failures ? "FAILED" : "ALL PASSED", failures);

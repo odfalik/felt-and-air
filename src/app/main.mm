@@ -7,14 +7,20 @@
 #include <atomic>
 #include <cmath>
 #include <mach/mach_time.h>
+#include <os/workgroup.h>
 #include <memory>
+#include <pthread.h>
 #include <vector>
+#include "Midi.h"
 #include "Piano.h"
+#include <fstream>
+#include <sstream>
+#include <string>
 
 using namespace pp;
 
 // Single producer, single consumer queue of control events.
-struct Event { int type, a, b; };  // 1 note on (a midi, b velocity), 0 note off, 2 sustain (a)
+struct Event { int type, a, b; };  // 1 note on (a midi, b velocity), 0 note off, 2 sustain (a), 4 play demo a, 5 stop demo
 struct EventQueue {
     static const int N = 1024;
     Event buf[N];
@@ -44,16 +50,53 @@ struct Engine {
     std::vector<float> l, r;
     std::atomic<float> volume{0.8f}, load{0}, loadPeak{0}, level{0};
     std::atomic<int> focus{60}, overruns{0};
-    double sampleRate = 48000, gridScale = 1.25;
+    double sampleRate = 48000, gridScale = 1.5;
+    os_workgroup_t workgroup = nullptr;  // the audio device's realtime thread group
+    bool sideways = false;
     int framesSinceSnap = 0;
+
+    // Demo recordings, loaded once at start. The audio thread only reads them.
+    struct Demo { std::string title, note; std::vector<MidiEvent> events; };
+    std::vector<Demo> demos;
+    std::atomic<int> demoPlaying{-1};
+    std::atomic<float> demoSeconds{0};
+    int demoIndex = -1;
+    size_t demoNext = 0;
+    long demoFrame = 0;
+
+    void loadDemos(const std::string& dir) {
+        std::ifstream list(dir + "/demos.txt");
+        std::string line;
+        while (std::getline(list, line)) {
+            std::stringstream ss(line);
+            std::string file, title, note;
+            std::getline(ss, file, '|'); std::getline(ss, title, '|'); std::getline(ss, note, '|');
+            Demo d{title, note, readMidiFile(dir + "/" + file)};
+            if (!d.events.empty()) demos.push_back(std::move(d));
+        }
+    }
+    void silence() {
+        for (int m = 21; m <= 108; m++) piano->noteOff(m);
+        piano->setSustain(false);
+    }
     mach_timebase_info_data_t tb;
 
     void build() {
-        design = makeGrand();
+        GrandOptions g;
+        g.twoPolarisations = sideways;
+        design = makeGrand(g);
+        demoPlaying = -1; demoIndex = -1;
         PianoOptions o;
         o.sampleRate = sampleRate;
         o.boardGridScale = gridScale;
         piano = std::make_unique<Piano>(design, o);
+        // Helpers join the audio thread's workgroup so the system schedules them as one
+        // realtime unit instead of preempting them mid-step.
+        os_workgroup_t wg = workgroup;
+        piano->setHelperThreads(3, [wg] {
+            static thread_local os_workgroup_join_token_s token;
+            if (wg) os_workgroup_join(wg, &token);
+        });
         piano->prepareSnapshot(snap);
         piano->prepareSnapshot(snapUI);
         l.assign(8192, 0); r.assign(8192, 0);
@@ -62,7 +105,9 @@ struct Engine {
     void handle(const Event& e) {
         if (e.type == 1) { piano->noteOn(e.a, midiVelocityToHammerSpeed(e.b)); focus = e.a; }
         else if (e.type == 0) piano->noteOff(e.a);
-        else piano->setSustain(e.a != 0);
+        else if (e.type == 2) piano->setSustain(e.a != 0);
+        else if (e.type == 4 && e.a >= 0 && e.a < (int)demos.size()) { silence(); demoIndex = e.a; demoNext = 0; demoFrame = 0; demoPlaying = e.a; }
+        else if (e.type == 5) { silence(); demoIndex = -1; demoPlaying = -1; }
     }
     // Runs on the audio thread: no locks, no allocation.
     void render(float* outL, float* outR, int n) {
@@ -71,7 +116,23 @@ struct Engine {
         while (uiEvents.pop(e)) handle(e);
         while (midiEvents.pop(e)) handle(e);
         n = std::min(n, (int)l.size());
-        piano->process(l.data(), r.data(), n);
+        // Render in pieces so that recorded notes land on their exact sample.
+        for (int done = 0; done < n;) {
+            int until = n;
+            if (demoIndex >= 0) {
+                const auto& ev = demos[demoIndex].events;
+                while (demoNext < ev.size() && (long)(ev[demoNext].seconds * sampleRate) <= demoFrame) {
+                    const MidiEvent& m = ev[demoNext++];
+                    handle({m.type, m.a, m.b});
+                }
+                if (demoNext < ev.size()) until = (int)std::min<long>(n, done + (long)(ev[demoNext].seconds * sampleRate) - demoFrame);
+                else if (demoFrame > (long)((ev.back().seconds + 4.0) * sampleRate)) { demoIndex = -1; demoPlaying = -1; }
+                until = std::max(until, done + 1);
+            }
+            piano->process(l.data() + done, r.data() + done, until - done);
+            if (demoIndex >= 0) { demoFrame += until - done; demoSeconds = (float)(demoFrame / sampleRate); }
+            done = until;
+        }
         float vol = volume.load(), pk = 0;
         for (int i = 0; i < n; i++) {
             float a = std::tanh(l[i] * vol), b = std::tanh(r[i] * vol);  // soft ceiling
@@ -148,13 +209,15 @@ static OSStatus renderCallback(void*, AudioUnitRenderActionFlags*, const AudioTi
 
 - (NSRect)boardRect { return NSMakeRect(20, 50, 420, 450); }
 - (NSRect)keysRect { return NSMakeRect(20, self.bounds.size.height - 110, self.bounds.size.width - 40, 90); }
+- (void)clearKeys { memset(_down, 0, sizeof(_down)); }
 
 static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k == 6 || k == 8 || k == 10; }
 
 - (void)drawRect:(NSRect)dirty {
     Engine& E = gEngine;
+    // Copy, not swap: the display may redraw several times between two audio snapshots.
     while (E.snapLock.test_and_set(std::memory_order_acquire)) {}
-    std::swap(E.snap, E.snapUI);
+    E.snapUI = E.snap;
     E.snapLock.clear(std::memory_order_release);
     const Piano::Snapshot& S = E.snapUI;
 
@@ -247,19 +310,20 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 
     // Status.
     float ld = E.load.load(), pk = E.loadPeak.load();
-    CGFloat y = 320;
+    CGFloat y = 396;
     auto line = [&](NSString* s, NSDictionary* at) { [s drawAtPoint:NSMakePoint(470, y) withAttributes:at]; y += 18; };
-    line(self.audioOn ? @"Audio ON" : @"Audio OFF  (press Return to start sound)", title);
-    line([NSString stringWithFormat:@"engine load %3.0f %%   peak %3.0f %%   overruns %d", ld * 100, pk * 100, E.overruns.load()], small);
-    line([NSString stringWithFormat:@"strings awake %d / %d    output peak %.2f", S.awake, E.piano->stringCount(), E.level.load()], small);
-    line([NSString stringWithFormat:@"sample rate %.0f Hz   board grid scale %.2f   double precision", E.sampleRate, E.gridScale], small);
-    y += 8;
+    int dp = E.demoPlaying.load();
+    if (dp >= 0 && dp < (int)E.demos.size())
+        line([NSString stringWithFormat:@"Playing: %s  (%d:%02d)", E.demos[dp].title.c_str(), (int)E.demoSeconds.load() / 60, (int)E.demoSeconds.load() % 60], title);
+    else
+        line(self.audioOn ? @"Audio on" : @"Audio off", title);
+    line([NSString stringWithFormat:@"engine load %3.0f %%   peak %3.0f %%   overruns %d   helpers %s", ld * 100, pk * 100, E.overruns.load(),
+                                    E.piano->helpersBusy() ? "sharing" : "idle"], small);
+    line([NSString stringWithFormat:@"strings awake %d / %d    output peak %.2f    %.0f Hz", S.awake, E.piano->stringCount(), E.level.load(), E.sampleRate], small);
+    y += 6;
     line(@"Play:  A W S E D F T G Y H U J K O L P ;    mouse on the keys    MIDI", small);
-    line([NSString stringWithFormat:@"Z / X octave (now %d)    C / V velocity (now %d)    Space sustain", self.octave, self.velocity], small);
-    line(@"1 / 2 / 3 board grid: finest / 1.25 / 1.5     Return audio on/off", small);
-    y += 8;
-    line(@"Pedal down wakes all 228 strings. That exceeds one core today:", small);
-    line(@"expect overruns with heavy pedal. See docs/MODEL.md.", small);
+    line([NSString stringWithFormat:@"Z / X octave (now %d)    C / V velocity (now %d)    Space sustain    Return audio", self.octave, self.velocity], small);
+    if (dp >= 0 && dp < (int)E.demos.size()) line([NSString stringWithFormat:@"%s, MAESTRO dataset (CC BY-NC-SA)", E.demos[dp].note.c_str()], small);
 
     // Keyboard.
     NSRect kr = [self keysRect];
@@ -330,7 +394,6 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
         case 'v': self.velocity = std::min(127, self.velocity + 15); break;
         case ' ': gEngine.uiEvents.push({2, 1, 0}); break;
         case '\r': [NSApp sendAction:@selector(toggleAudio:) to:nil from:self]; break;
-        case '1': case '2': case '3': [NSApp sendAction:@selector(setGrid:) to:nil from:@(c - '0')]; break;
         default: break;
     }
 }
@@ -349,6 +412,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 // ------------------------------------------------------------------------------ app
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
+- (PianoView*)setUp;
 @end
 
 @implementation AppDelegate {
@@ -358,6 +422,12 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     MIDIClientRef _midi;
     MIDIPortRef _port;
     NSTimer* _timer;
+    NSButton* _audioButton;
+    NSButton* _playButton;
+    NSButton* _sidewaysBox;
+    NSPopUpButton* _demoMenu;
+    NSPopUpButton* _gridMenu;
+    NSSlider* _volume;
 }
 
 - (BOOL)openAudio {
@@ -372,23 +442,82 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     AudioUnitSetProperty(_unit, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &f, sizeof(f));
     AURenderCallbackStruct cb = {renderCallback, NULL};
     AudioUnitSetProperty(_unit, kAudioUnitProperty_SetRenderCallback, kAudioUnitScope_Input, 0, &cb, sizeof(cb));
-    return AudioUnitInitialize(_unit) == noErr;
+    if (AudioUnitInitialize(_unit) != noErr) return NO;
+    os_workgroup_t wg = nullptr;
+    UInt32 size = sizeof(wg);
+    if (AudioUnitGetProperty(_unit, kAudioOutputUnitProperty_OSWorkgroup, kAudioUnitScope_Global, 0, &wg, &size) == noErr) gEngine.workgroup = wg;
+    return YES;
 }
 
 - (void)toggleAudio:(id)sender {
     if (!_unit && ![self openAudio]) return;
     if (_view.audioOn) AudioOutputUnitStop(_unit); else { gEngine.loadPeak = 0; gEngine.overruns = 0; AudioOutputUnitStart(_unit); }
     _view.audioOn = !_view.audioOn;
+    _audioButton.title = _view.audioOn ? @"Sound: on" : @"Sound: off";
+    [_window makeFirstResponder:_view];
 }
 
-- (void)setGrid:(NSNumber*)which {
-    double scales[] = {1.0, 1.25, 1.5};
+- (void)toggleDemo:(id)sender {
+    if (gEngine.demoPlaying.load() >= 0) {
+        gEngine.uiEvents.push({5, 0, 0});
+    } else if (!gEngine.demos.empty()) {
+        if (!_view.audioOn) [self toggleAudio:nil];
+        gEngine.uiEvents.push({4, (int)_demoMenu.indexOfSelectedItem, 0});
+    }
+    [_view clearKeys];
+    [_window makeFirstResponder:_view];
+}
+
+// Board grid or string model changed: build a new engine.
+- (void)rebuild:(id)sender {
     BOOL was = _view.audioOn;
     if (was) [self toggleAudio:nil];
-    gEngine.gridScale = scales[std::clamp(which.intValue - 1, 0, 2)];
+    const double scales[] = {1.0, 1.25, 1.5};
+    gEngine.gridScale = scales[std::clamp((int)_gridMenu.indexOfSelectedItem, 0, 2)];
+    gEngine.sideways = _sidewaysBox.state == NSControlStateValueOn;
     gEngine.build();
     [_view rebuildMap];
+    [_view clearKeys];
     if (was) [self toggleAudio:nil];
+    [_window makeFirstResponder:_view];
+}
+
+- (void)volumeChanged:(id)sender { gEngine.volume = (float)_volume.doubleValue; [_window makeFirstResponder:_view]; }
+
+- (void)buildControls {
+    auto label = [&](NSString* text, CGFloat x, CGFloat y) {
+        NSTextField* t = [NSTextField labelWithString:text];
+        t.textColor = [NSColor colorWithWhite:0.75 alpha:1];
+        t.font = [NSFont systemFontOfSize:11];
+        t.frame = NSMakeRect(x, y + 4, 90, 16);
+        [_view addSubview:t];
+    };
+    _audioButton = [NSButton buttonWithTitle:@"Sound: off" target:self action:@selector(toggleAudio:)];
+    _audioButton.frame = NSMakeRect(466, 312, 110, 28);
+    [_view addSubview:_audioButton];
+    label(@"Volume", 590, 314);
+    _volume = [NSSlider sliderWithValue:0.8 minValue:0.05 maxValue:3.0 target:self action:@selector(volumeChanged:)];
+    _volume.frame = NSMakeRect(640, 314, 160, 24);
+    [_view addSubview:_volume];
+
+    _demoMenu = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(466, 346, 420, 26) pullsDown:NO];
+    for (const auto& d : gEngine.demos) [_demoMenu addItemWithTitle:@(d.title.c_str())];
+    if (gEngine.demos.empty()) [_demoMenu addItemWithTitle:@"No demo recordings found (run tools/fetch_demos.sh)"];
+    [_view addSubview:_demoMenu];
+    _playButton = [NSButton buttonWithTitle:@"Play / stop" target:self action:@selector(toggleDemo:)];
+    _playButton.frame = NSMakeRect(892, 345, 110, 28);
+    [_view addSubview:_playButton];
+
+    label(@"Board grid", 820, 314);
+    _gridMenu = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(886, 312, 116, 26) pullsDown:NO];
+    [_gridMenu addItemsWithTitles:@[@"finest", @"1.25x", @"1.5x"]];
+    [_gridMenu selectItemAtIndex:2];
+    _gridMenu.target = self; _gridMenu.action = @selector(rebuild:);
+    [_view addSubview:_gridMenu];
+    _sidewaysBox = [NSButton checkboxWithTitle:@"Sideways string motion (2x string cost, barely audible)" target:self action:@selector(rebuild:)];
+    _sidewaysBox.frame = NSMakeRect(468, 372, 420, 20);
+    _sidewaysBox.contentTintColor = [NSColor whiteColor];
+    [_view addSubview:_sidewaysBox];
 }
 
 - (void)openMIDI {
@@ -413,7 +542,8 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     for (ItemCount i = 0; i < MIDIGetNumberOfSources(); i++) MIDIPortConnectSource(_port, MIDIGetSource(i), NULL);
 }
 
-- (void)applicationDidFinishLaunching:(NSNotification*)n {
+- (PianoView*)setUp {
+    gEngine.loadDemos(PP_DEMO_DIR);
     gEngine.build();
     _window = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 1100, 640)
                                           styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
@@ -421,6 +551,14 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     _window.title = @"Physical Piano";
     _view = [[PianoView alloc] initWithFrame:NSMakeRect(0, 0, 1100, 640)];
     _window.contentView = _view;
+    _window.appearance = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+    [self buildControls];
+    return _view;
+}
+
+- (void)applicationDidFinishLaunching:(NSNotification*)n {
+    [self openAudio];  // opened, not started: no sound until asked
+    [self setUp];
     [_window center];
     [_window makeKeyAndOrderFront:nil];
     [_window makeFirstResponder:_view];
@@ -435,12 +573,15 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 // Headless check: drives the same render path the audio callback uses, with no device and
 // no window, then writes a picture of the view.
 static int selfTest(const char* png) {
-    gEngine.build();
-    PianoView* view = [[PianoView alloc] initWithFrame:NSMakeRect(0, 0, 1100, 640)];
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);  // stand in for the audio thread's priority
+    [NSApplication sharedApplication];
+    AppDelegate* d = [AppDelegate new];
+    PianoView* view = [d setUp];  // window is built but never shown
+    printf("selftest: %zu demo recordings loaded\n", gEngine.demos.size());
     std::vector<float> L(256), R(256);
     float peak = 0;
-    for (int b = 0; b < 190; b++) {
-        if (b == 2) for (int m : {48, 60, 64, 67}) gEngine.uiEvents.push({1, m, 90});
+    for (int b = 0; b < 1500; b++) {
+        if (b == 2) gEngine.uiEvents.push({4, 0, 0});
         gEngine.framesSinceSnap = 1 << 20;
         gEngine.render(L.data(), R.data(), 256);
         for (float x : L) peak = std::max(peak, std::fabs(x));
@@ -448,7 +589,8 @@ static int selfTest(const char* png) {
     NSBitmapImageRep* rep = [view bitmapImageRepForCachingDisplayInRect:view.bounds];
     [view cacheDisplayInRect:view.bounds toBitmapImageRep:rep];
     [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:@(png) atomically:YES];
-    printf("selftest: 1.0 s rendered through the callback path, peak %.3f, awake %d, wrote %s\n", peak, gEngine.piano->awakeStrings(), png);
+    printf("selftest: engine load mean %.0f %%, worst block %.0f %%\n", gEngine.load.load() * 100, gEngine.loadPeak.load() * 100);
+    printf("selftest: 8 s of the first demo rendered through the callback path, peak %.3f, awake %d, wrote %s\n", peak, gEngine.piano->awakeStrings(), png);
     return peak > 0.001f && std::isfinite(peak) ? 0 : 1;
 }
 

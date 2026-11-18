@@ -1,6 +1,8 @@
 // Offline renderer: plays a small score through the model and writes a WAV file.
 //   render <out.wav> [score] [oversample] [seconds]
-// Scores: "c4" (one mezzo forte note), "phrase" (a short two-hand phrase with pedal).
+// Scores: "c4" (one mezzo forte note), "phrase" (a short two-hand phrase with pedal),
+// or the path of a MIDI file.
+#include "Midi.h"
 #include "Piano.h"
 #include "Util.h"
 #include <algorithm>
@@ -52,6 +54,10 @@ int main(int argc, char** argv) {
         g.firstKey = g.lastKey = 40;
         ev = {{0.05, 1, 60, 80}, {4.0, 0, 60, 0}};
         seconds = 5.0;
+    } else if (score.size() > 4 && score.substr(score.size() - 4) == ".mid") {
+        for (const MidiEvent& m : readMidiFile(score)) ev.push_back({m.seconds, m.type, m.type == 2 ? 0 : m.a, m.type == 2 ? m.a : m.b});
+        if (ev.empty()) { std::fprintf(stderr, "no notes in %s\n", score.c_str()); return 1; }
+        seconds = ev.back().t + 4.0;
     } else {
         ev = phrase();
         seconds = 13.5;
@@ -60,6 +66,7 @@ int main(int argc, char** argv) {
 
     const int fs = 48000, block = 64;
     Piano piano(makeGrand(g), {(double)fs, os});
+    piano.setHelperThreads(3);
     std::printf("%d strings (%d nodes), board %d nodes at %.1f x %.1f mm, internal rate %d Hz\n", piano.stringCount(),
                 piano.totalStringNodes(), piano.plate().n, piano.plate().hx * 1e3, piano.plate().hy * 1e3, fs * os);
 
@@ -90,7 +97,7 @@ int main(int argc, char** argv) {
     for (float& x : wav) x = (float)(x * norm);
     system(("mkdir -p \"$(dirname '" + out + "')\"").c_str());
     if (!writeWavFloat(out, wav, 2, fs)) { std::fprintf(stderr, "cannot write %s\n", out.c_str()); return 1; }
-    std::printf("wrote %s: %.1f s, peak %.3f (scaled by %.3f), up to %d strings awake, %.2fx realtime on one thread\n", out.c_str(),
+    std::printf("wrote %s: %.1f s, peak %.3f (scaled by %.3f), up to %d strings awake, %.2fx realtime\n", out.c_str(),
                 seconds, peak, norm, maxAwake, seconds / wall);
     return 0;
 }

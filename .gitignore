@@ -3,3 +3,5 @@ out/
 *.wav
 .pi-loop.json.lock
 .DS_Store
+demos/*.mid
+demos/demos.txt

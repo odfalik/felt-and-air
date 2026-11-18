@@ -64,8 +64,15 @@ Counted in processor cycles, which do not depend on how busy the machine is. One
 | 1.25x (38 x 19 mm) | 2,354 | 54 % | 60 % | 107 % |
 | 1.5x (45 x 23 mm) | 1,635 | 41 % | 48 % | 96 % |
 
+String work is shared with up to three helper threads once more than about 6,000 string
+nodes are ringing (output is bit-identical to the single-thread result). In a headless run
+of a pedalled recording at 1.5x with all 228 strings awake the audio thread used 61 to 68 %
+of its budget on a busy machine, with occasional blocks over budget. This has not yet been
+measured on the real audio thread.
+
 These figures predate the second polarisation, which doubles the string work: at 1.25x a
-six-note chord is now about 72 % and pedal down about 167 %. The app defaults to 1.25x. **Pedal down with every string ringing does not fit in one core
+six-note chord is now about 72 % and pedal down about 167 %. The app defaults to 1.5x with the
+second polarisation off. **Pedal down with every string ringing does not fit in one core
 at any setting.** Sustained thermal behaviour on the fanless Air has not been measured.
 
 Single precision was tried and rejected for now: it saves about 27 % but adds noise at

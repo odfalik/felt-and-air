@@ -71,6 +71,7 @@ struct GrandOptions {
     double unisonDetuneCents = 0.6;  // spread of the strings inside one note
     double bridgeTiltDeg = 6.0;      // assumed; see docs/MODEL.md
     double hammerTiltDeg = 4.0;      // assumed
+    bool twoPolarisations = true;
 };
 
 // A generic 2 m class grand. Not a model of any specific instrument.
