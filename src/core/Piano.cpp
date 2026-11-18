@@ -1,12 +1,23 @@
 #include "Piano.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 
 namespace pp {
 
 namespace {
 inline double pos(double x) { return x > 0 ? x : 0; }
+
+// Decaying vibration ends in subnormal numbers, which are very slow to compute with.
+// Flush them to zero while rendering, and restore the caller's floating point mode after.
+struct FlushDenormals {
+#if defined(__aarch64__)
+    uint64_t saved;
+    FlushDenormals() { __asm__ volatile("mrs %0, fpcr" : "=r"(saved)); uint64_t v = saved | (1ull << 24); __asm__ volatile("msr fpcr, %0" : : "r"(v)); }
+    ~FlushDenormals() { __asm__ volatile("msr fpcr, %0" : : "r"(saved)); }
+#endif
+};
 }
 
 Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
@@ -101,8 +112,8 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
             if (s.dmp0 >= s.dmp1) s.hasDamper = false;
             s.dampRate = s.dampTarget = s.hasDamper ? dampMax_ : 0.0;
 
-            s.off = offset;
-            offset += N + 1;
+            s.off = offset + 1;
+            offset += N + 3;
             maxN = std::max(maxN, N);
             if (s.attached) att.push_back({sd.bridge, 0.5 * s.mNode, s.z0});
             strings_.push_back(s);
@@ -110,12 +121,12 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
         noteOfMidi_[nd.midi & 127] = (int)notes_.size();
         notes_.push_back(n);
     }
-    u_.assign(offset, 0.0);
-    v_.assign(offset, 0.0);
-    cScr_.assign(maxN + 2, 0.0);
-    zScr_.assign(maxN + 2, 0.0);
+    u_.assign(offset, 0);
+    v_[0].assign(offset, 0);
+    v_[1].assign(offset, 0);
+    (void)maxN;
 
-    plate_ = std::make_unique<Plate>(d.board, att, k);
+    plate_ = std::make_unique<Plate>(d.board, att, k, std::max(1.0, o.boardGridScale));
     const Plate& P = *plate_;
     {
         size_t ai = 0;
@@ -126,7 +137,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
             s.awake = !s.hasDamper || !s.attached;
         }
     }
-    w_.assign(P.gridSize, 0.0); vw_.assign(P.gridSize, 0.0); r_.assign(P.gridSize, 0.0);
+    w_.assign(P.gridSize, 0); vw_.assign(P.gridSize, 0); r_.assign(P.gridSize, 0);
 
     // Rayleigh integral over a baffled board: p = rho/(2 pi) * sum dS * accel(t - r/c) / r.
     // Delays are rounded to the nearest step (a path error under 4 mm at 48 kHz, well below
@@ -153,7 +164,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
         for (int a = 0; a < P.n; a++) {
             int q = fill[delay[a] - lo]++;
             tapIdx_[e][q] = P.gid[a];
-            tapGain_[e][q] = gain[a];
+            tapGain_[e][q] = (RealP)gain[a];
         }
         while (ringLen < hi + 4) ringLen <<= 1;
     }
@@ -187,18 +198,17 @@ void Piano::wake(StringRT& s) {
     if (s.awake) return;
     // Start from the static shape for the current bridge position, so waking is silent.
     double uN = uEnd(s, w_.data()), vN = uEnd(s, vw_.data());
-    double* u = &u_[s.off];
-    double* v = &v_[s.off];
+    RealS* u = &u_[s.off];
+    RealS* v = &v_[vb_][s.off];
     for (int l = 0; l <= s.N; l++) {
-        u[l] = uN * l / s.N;
-        v[l] = vN * l / s.N;
+        u[l] = (RealS)(uN * l / s.N);
+        v[l] = (RealS)(vN * l / s.N);
     }
     s.awake = true;
 }
 
 void Piano::sleep(StringRT& s) {
-    std::fill(&u_[s.off], &u_[s.off] + s.N + 1, 0.0);
-    std::fill(&v_[s.off], &v_[s.off] + s.N + 1, 0.0);
+    for (auto* a : {&u_, &v_[0], &v_[1]}) std::fill(a->begin() + s.off - 1, a->begin() + s.off + s.N + 2, (RealS)0);
     s.awake = false;
 }
 
@@ -212,7 +222,7 @@ void Piano::noteOn(int midi, double speed) {
         StringRT& s = strings_[n.first + i];
         wake(s);
         s.dampTarget = s.dampRate = 0;  // the key lifts the damper well before the hammer arrives
-        const double* u = &u_[s.off];
+        const RealS* u = &u_[s.off];
         top = std::max(top, s.hamG[0] * u[s.hamL] + s.hamG[1] * u[s.hamL + 1]);
     }
     if (!(speed > 0)) return;
@@ -221,8 +231,8 @@ void Piano::noteOn(int midi, double speed) {
     n.hammerActive = true;
     for (int i = 0; i < n.count; i++) {
         StringRT& s = strings_[n.first + i];
-        const double* u = &u_[s.off];
-        const double* v = &v_[s.off];
+        const RealS* u = &u_[s.off];
+        const RealS* v = &v_[vb_][s.off];
         double gu = s.hamG[0] * u[s.hamL] + s.hamG[1] * u[s.hamL + 1];
         double gv = s.hamG[0] * v[s.hamL] + s.hamG[1] * v[s.hamL + 1];
         s.zeta = n.eta - gu;
@@ -254,34 +264,38 @@ void Piano::setSustain(bool down) {
         }
 }
 
-// Explicit update of one string. Writes the new increments v and adds the bridge force to
-// the plate right hand side. Displacements are advanced later, after the hammer.
+// Explicit update of one string: reads displacement u and the current increments, writes
+// the next increments into the other buffer, and adds the bridge force to the plate right
+// hand side. Displacements are advanced later, after the hammer has had its say.
 void Piano::stepString(StringRT& s) {
     const int N = s.N;
-    double* __restrict u = &u_[s.off];
-    double* __restrict v = &v_[s.off];
-    double* __restrict c = cScr_.data();
-    double* __restrict z = zScr_.data();
+    RealS* __restrict u = &u_[s.off];
+    RealS* __restrict v = &v_[vb_][s.off];
+    RealS* __restrict vn = &v_[vb_ ^ 1][s.off];
     const double uN = uEnd(s, w_.data()), vN = uEnd(s, vw_.data());
 
     if (!s.awake) {
         // A damped string absorbs what the bridge sends into it: characteristic impedance.
         double f = -k_ * s.z0 * vN;
-        for (int q = 0; q < 4; q++) r_[s.at.idx[q]] += s.at.w[q] * f;
+        for (int q = 0; q < 4; q++) r_[s.at.idx[q]] += (RealP)(s.at.w[q] * f);
         return;
     }
-    u[N] = uN; v[N] = vN;
-    c[0] = 0; c[N] = 0;
-    for (int l = 1; l < N; l++) c[l] = u[l - 1] - 2 * u[l] + u[l + 1];
-    for (int l = 0; l <= N; l++) z[l] = s.aT * u[l] + s.aD * v[l];
+    // Both ends are simply supported: zero bending moment, expressed through ghost nodes.
+    u[N] = (RealS)uN; v[N] = (RealS)vN;
+    u[-1] = -u[1];
+    u[N + 1] = (RealS)(2 * uN - (double)u[N - 1]);
 
     if (s.attached) {
-        double f = s.mNode * (-(z[N] - z[N - 1]) - s.aB * c[N - 1]);
-        for (int q = 0; q < 4; q++) r_[s.at.idx[q]] += s.at.w[q] * f;
+        double uA = u[N - 1], uB = u[N - 2], vA = v[N - 1];
+        double f = s.mNode * (-(s.aT * (uN - uA) + s.aD * (vN - vA)) - s.aB * (uB - 2 * uA + uN));
+        for (int q = 0; q < 4; q++) r_[s.at.idx[q]] += (RealP)(s.at.w[q] * f);
     }
-    const double a = 1 - s.s0k, inv = 1 / (1 + s.s0k), aB = s.aB;
+    const double inv = 1 / (1 + s.s0k);
+    const RealS cu0 = (RealS)((-2 * s.aT - 6 * s.aB) * inv), cu1 = (RealS)((s.aT + 4 * s.aB) * inv), cu2 = (RealS)(-s.aB * inv);
+    const RealS cv0 = (RealS)((1 - s.s0k - 2 * s.aD) * inv), cv1 = (RealS)(s.aD * inv);
     for (int l = 1; l < N; l++)
-        v[l] = (a * v[l] + (z[l - 1] - 2 * z[l] + z[l + 1]) - aB * (c[l - 1] - 2 * c[l] + c[l + 1])) * inv;
+        vn[l] = cv0 * v[l] + cv1 * (v[l - 1] + v[l + 1]) + cu0 * u[l] + cu1 * (u[l - 1] + u[l + 1]) + cu2 * (u[l - 2] + u[l + 2]);
+    vn[0] = 0;
 
     // Damper felt: viscous, backward Euler so that it is stable at any strength.
     if (s.dampRate != s.dampTarget) {
@@ -290,8 +304,8 @@ void Piano::stepString(StringRT& s) {
         if (std::fabs(s.dampRate - s.dampTarget) < 1e-3) s.dampRate = s.dampTarget;
     }
     if (s.dampRate > 0) {
-        double scale = (1 + s.s0k) / (1 + s.s0k + 2 * k_ * s.dampRate);
-        for (int l = s.dmp0; l < s.dmp1; l++) v[l] *= scale;
+        RealS scale = (RealS)((1 + s.s0k) / (1 + s.s0k + 2 * k_ * s.dampRate));
+        for (int l = s.dmp0; l < s.dmp1; l++) vn[l] *= scale;
     }
 }
 
@@ -305,8 +319,8 @@ void Piano::stepHammer(NoteRT& n) {
     bool contact = false;
     for (int i = 0; i < ns; i++) {
         StringRT& s = strings_[n.first + i];
-        const double* u = &u_[s.off];
-        const double* v = &v_[s.off];
+        const RealS* u = &u_[s.off];
+        const RealS* v = &v_[vb_ ^ 1][s.off];  // increments the string would make without the hammer
         double gu = s.hamG[0] * u[s.hamL] + s.hamG[1] * u[s.hamL + 1];
         double gv = s.hamG[0] * v[s.hamL] + s.hamG[1] * v[s.hamL + 1];
         zn[i] = n.eta - gu;
@@ -384,10 +398,10 @@ void Piano::stepHammer(NoteRT& n) {
     bool away = true;
     for (int i = 0; i < ns; i++) {
         StringRT& s = strings_[n.first + i];
-        double* v = &v_[s.off];
+        RealS* v = &v_[vb_ ^ 1][s.off];
         double q = k_ * k_ * F[i] / (s.mNode * (1 + s.s0k));
-        v[s.hamL] += s.hamG[0] * q;
-        v[s.hamL + 1] += s.hamG[1] * q;
+        v[s.hamL] += (RealS)(s.hamG[0] * q);
+        v[s.hamL + 1] += (RealS)(s.hamG[1] * q);
         s.force = F[i];
         s.zetaPrev = zn[i];
         s.zeta = zm[i] + r[i];
@@ -409,7 +423,7 @@ void Piano::housekeeping() {
         if (!s.awake || !s.hasDamper || !s.attached) continue;
         if (s.dampRate < dampMax_ || notes_[s.note].hammerActive) { s.dampedSteps = 0; continue; }
         if (++s.dampedSteps < settle) continue;
-        const double* u = &u_[s.off];
+        const RealS* u = &u_[s.off];
         double uN = u[s.N], m = 0;
         for (int l = 1; l < s.N; l++) m = std::max(m, std::fabs(u[l] - uN * l / s.N));
         if (m < 1e-8) sleep(s);
@@ -418,59 +432,69 @@ void Piano::housekeeping() {
 
 void Piano::step(double& pL, double& pR) {
     const Plate& P = *plate_;
-    double* __restrict r = r_.data();
-    double* __restrict w = w_.data();
-    double* __restrict vw = vw_.data();
+    RealP* __restrict r = r_.data();
+    RealP* __restrict w = w_.data();
+    RealP* __restrict vw = vw_.data();
 
     P.apply(w, vw, r);  // plate internal forces, scaled by dt^2
 
     for (StringRT& s : strings_) stepString(s);
     for (NoteRT& n : notes_)
         if (n.hammerActive) stepHammer(n);
+    vb_ ^= 1;
     for (StringRT& s : strings_) {
         if (!s.awake) continue;
-        double* __restrict u = &u_[s.off];
-        const double* __restrict v = &v_[s.off];
+        RealS* __restrict u = &u_[s.off];
+        const RealS* __restrict v = &v_[vb_][s.off];
         for (int l = 1; l < s.N; l++) u[l] += v[l];
     }
 
-    P.solve(r);  // r is now the change of the plate increment, i.e. dt^2 * acceleration
+    // Implicit stiffener solve, then the plate update. Afterwards r holds the change of the
+    // plate increment, i.e. dt^2 * acceleration, which is what radiates.
+    P.solveStiff(r);
+    const RealP* __restrict scale = P.diagScale();
+    for (const Plate::Span& sp : P.spans) {
+        RealP* __restrict ws = w + sp.start;
+        RealP* __restrict vs = vw + sp.start;
+        RealP* __restrict rs = r + sp.start;
+        const RealP* __restrict ds = scale + sp.start;
+        for (int t = 0; t < sp.len; t++) {
+            rs[t] *= ds[t];
+            vs[t] += rs[t];
+            ws[t] += vs[t];
+        }
+    }
 
     for (int e = 0; e < 2; e++) {
         double* __restrict ring = ring_[e].data();
         const int* __restrict idx = tapIdx_[e].data();
-        const double* __restrict g = tapGain_[e].data();
+        const RealP* __restrict g = tapGain_[e].data();
         const int* __restrict bp = binPtr_[e].data();
         const int bins = (int)binPtr_[e].size() - 1, base = ringPos_ + binFirst_[e];
         for (int b = 0; b < bins; b++) {
-            double s0 = 0, s1 = 0;
+            // Four independent partial sums, so the additions do not wait on each other.
+            RealP s0 = 0, s1 = 0, s2 = 0, s3 = 0;
             int q = bp[b];
             const int end = bp[b + 1];
-            for (; q + 1 < end; q += 2) {
+            for (; q + 3 < end; q += 4) {
                 s0 += g[q] * r[idx[q]];
                 s1 += g[q + 1] * r[idx[q + 1]];
+                s2 += g[q + 2] * r[idx[q + 2]];
+                s3 += g[q + 3] * r[idx[q + 3]];
             }
-            if (q < end) s0 += g[q] * r[idx[q]];
-            ring[(base + b) & ringMask_] += s0 + s1;
+            for (; q < end; q++) s0 += g[q] * r[idx[q]];
+            ring[(base + b) & ringMask_] += (double)((s0 + s1) + (s2 + s3));
         }
     }
     pL = ring_[0][ringPos_]; ring_[0][ringPos_] = 0;
     pR = ring_[1][ringPos_]; ring_[1][ringPos_] = 0;
     ringPos_ = (ringPos_ + 1) & ringMask_;
 
-    for (const Plate::Span& sp : P.spans) {
-        double* __restrict ws = w + sp.start;
-        double* __restrict vs = vw + sp.start;
-        const double* __restrict rs = r + sp.start;
-        for (int t = 0; t < sp.len; t++) {
-            vs[t] += rs[t];
-            ws[t] += vs[t];
-        }
-    }
     if ((++stepCount_ & 63) == 0) housekeeping();
 }
 
 void Piano::process(float* left, float* right, int n) {
+    FlushDenormals flush;
     for (int f = 0; f < n; f++) {
         double l = 0, r = 0;
         if (os_ == 1) {
@@ -502,10 +526,10 @@ double Piano::energy() const {
     const double k = k_;
     // Evaluated directly from energy densities, independently of the stepping stencils.
     // With x = 2 q - v (q, v at the newest step): H = KE + (V2(x) - V2(v)) / 8.
-    std::vector<double> xg(P.gridSize), xp(P.n), vp(P.n), tmp;
-    for (int g = 0; g < P.gridSize; g++) xg[g] = 2 * w_[g] - vw_[g];
+    std::vector<double> xg(P.gridSize), vg(P.gridSize), xp(P.n), vp(P.n);
+    for (int g = 0; g < P.gridSize; g++) { vg[g] = vw_[g]; xg[g] = 2 * (double)w_[g] - vg[g]; }
     P.gather(xg.data(), xp.data());
-    P.gather(vw_.data(), vp.data());
+    P.gather(vg.data(), vp.data());
     double kin = 0, v2x = P.K.quad(xp.data()), v2v = P.K.quad(vp.data());
     for (int a = 0; a < P.n; a++) kin += P.mass[a] * vp[a] * vp[a];
     kin += 0.25 * k * k * P.Kimp.quad(vp.data()) - 0.5 * k * P.D.quad(vp.data());
@@ -513,23 +537,22 @@ double Piano::energy() const {
     for (const StringRT& s : strings_) {
         if (!s.awake) continue;
         const int N = s.N;
-        const double* u = &u_[s.off];
-        const double* v = &v_[s.off];
-        tmp.assign(N + 1, 0.0);
-        std::vector<double> vv(v, v + N + 1);
-        vv[N] = uEnd(s, vw_.data()); vv[0] = 0;
-        for (int l = 1; l < N; l++) tmp[l] = 2 * u[l] - v[l];
-        tmp[N] = uEnd(s, xg.data());
-        auto v2 = [&](const std::vector<double>& x) {
+        const RealS* u = &u_[s.off];
+        const RealS* v = &v_[vb_][s.off];
+        std::vector<double> x(N + 1, 0.0), vv(N + 1, 0.0);
+        for (int l = 1; l < N; l++) { vv[l] = v[l]; x[l] = 2 * (double)u[l] - vv[l]; }
+        vv[N] = uEnd(s, vg.data());
+        x[N] = uEnd(s, xg.data());
+        auto v2 = [&](const std::vector<double>& y) {
             double e = 0;
-            for (int l = 0; l < N; l++) e += s.T_h * (x[l + 1] - x[l]) * (x[l + 1] - x[l]);
+            for (int l = 0; l < N; l++) e += s.T_h * (y[l + 1] - y[l]) * (y[l + 1] - y[l]);
             for (int l = 1; l < N; l++) {
-                double c = x[l - 1] - 2 * x[l] + x[l + 1];
+                double c = y[l - 1] - 2 * y[l] + y[l + 1];
                 e += s.EI_h3 * c * c;
             }
             return e;
         };
-        v2x += v2(tmp);
+        v2x += v2(x);
         v2v += v2(vv);
         for (int l = 1; l < N; l++) kin += s.mNode * vv[l] * vv[l];
         double dis = 0;

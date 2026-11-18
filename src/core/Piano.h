@@ -16,6 +16,9 @@ struct PianoOptions {
     double sampleRate = 48000;
     int oversample = 1;      // internal steps per output sample
     double outputGain = 0.06; // full scale per pascal
+    // Soundboard grid spacing relative to the finest stable one. 1 is the finest; larger
+    // values trade spatial resolution for processor time (node count falls as 1/scale^2).
+    double boardGridScale = 1.0;
 };
 
 class Piano {
@@ -36,7 +39,7 @@ public:
     double energy() const;
     double dt() const { return k_; }
     const Plate& plate() const { return *plate_; }
-    const std::vector<double>& plateDisplacement() const { return w_; }  // grid storage
+    const std::vector<RealP>& plateDisplacement() const { return w_; }  // grid storage
     int stringCount() const { return (int)strings_.size(); }
     int awakeStrings() const;
     int totalStringNodes() const;
@@ -44,7 +47,7 @@ public:
     bool hammerActive(int midi) const { int n = noteOfMidi_[midi & 127]; return n >= 0 && notes_[n].hammerActive; }
 
     struct StringView {
-        int midi; int nodes; double h; const double* u; double hammerForce; bool awake; double tension;
+        int midi; int nodes; double h; const RealS* u; double hammerForce; bool awake; double tension;
     };
     StringView stringView(int index) const;
     std::vector<int> stringsOfNote(int midi) const;
@@ -54,11 +57,11 @@ public:
     double continuumPartial(int index, int p) const;
     int fitPartial(int index) const { return strings_[index].fitPartial; }
     // Test hooks: raw access to one string's displacement and per-step increment arrays.
-    double* stringU(int index) { return &u_[strings_[index].off]; }
-    double* stringV(int index) { return &v_[strings_[index].off]; }
+    RealS* stringU(int index) { return &u_[strings_[index].off]; }
+    RealS* stringV(int index) { return &v_[vb_][strings_[index].off]; }
     double stringNodeMass(int index) const { return strings_[index].mNode; }
-    std::vector<double>& plateU() { return w_; }
-    std::vector<double>& plateV() { return vw_; }
+    std::vector<RealP>& plateU() { return w_; }
+    std::vector<RealP>& plateV() { return vw_; }
 
 private:
     struct StringRT {
@@ -86,7 +89,7 @@ private:
     void stepString(StringRT& s);
     void stepHammer(NoteRT& n);
     void housekeeping();
-    double uEnd(const StringRT& s, const double* field) const { return s.attached ? s.at.eval(field) : 0.0; }
+    template <class T> double uEnd(const StringRT& s, const T* field) const { return s.attached ? s.at.eval(field) : 0.0; }
 
     double k_ = 0, fs_ = 0, outGain_ = 0;
     int os_ = 1;
@@ -96,14 +99,16 @@ private:
     int noteOfMidi_[128];
     bool sustain_ = false;
 
-    std::vector<double> u_, v_;          // all string nodes
-    std::vector<double> cScr_, zScr_;    // scratch for one string
-    std::vector<double> w_, vw_, r_;     // plate displacement, increment, right hand side (grid storage)
+    // All string nodes. Each string owns N+3 entries: a ghost node, nodes 0..N, a ghost node.
+    // The per-step increments are double buffered (vb_ selects the current one).
+    std::vector<RealS> u_, v_[2];
+    int vb_ = 0;
+    std::vector<RealP> w_, vw_, r_;      // plate displacement, increment, right hand side (grid storage)
 
     // Radiation (Rayleigh integral): nodes are grouped by their delay to each ear, so one
     // step is a short dot product per delay bin.
     std::vector<int> tapIdx_[2], binPtr_[2];
-    std::vector<double> tapGain_[2];
+    std::vector<RealP> tapGain_[2];
     int binFirst_[2] = {0, 0};
     std::vector<double> ring_[2];
     int ringPos_ = 0, ringMask_ = 0;

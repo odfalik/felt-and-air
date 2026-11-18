@@ -8,7 +8,20 @@
 #include "Design.h"
 #include <vector>
 
+// Precision of the run time state. Setup, assembly and the factorisation are always double.
+// The validation suite runs in double; single precision is an option for the realtime build
+// and its added noise is measured against the double reference (see docs/MODEL.md).
+#ifndef PP_PLATE_REAL
+#define PP_PLATE_REAL double
+#endif
+#ifndef PP_STRING_REAL
+#define PP_STRING_REAL double
+#endif
+
 namespace pp {
+
+using RealP = PP_PLATE_REAL;   // soundboard state
+using RealS = PP_STRING_REAL;  // string state
 
 struct Csr {
     int n = 0;
@@ -21,8 +34,8 @@ struct Csr {
 struct Interp {  // bilinear interpolation onto plate nodes (grid storage index); dropped weights are zero
     int idx[4] = {0, 0, 0, 0};
     double w[4] = {0, 0, 0, 0};
-    double eval(const double* f) const {
-        return w[0] * f[idx[0]] + w[1] * f[idx[1]] + w[2] * f[idx[2]] + w[3] * f[idx[3]];
+    template <class T> double eval(const T* f) const {
+        return w[0] * (double)f[idx[0]] + w[1] * (double)f[idx[1]] + w[2] * (double)f[idx[2]] + w[3] * (double)f[idx[3]];
     }
 };
 
@@ -33,7 +46,8 @@ struct Attachment { Vec2 pos; double mass = 0; double dashpot = 0; };
 class Plate {
 public:
     // dt: time step. The grid spacing is chosen as fine as the stability bound allows.
-    Plate(const BoardDesign& board, const std::vector<Attachment>& attachments, double dt);
+    // gridScale >= 1 coarsens the grid beyond that limit.
+    Plate(const BoardDesign& board, const std::vector<Attachment>& attachments, double dt, double gridScale = 1.0);
 
     int n = 0;                     // active nodes
     int Nx = 0, Ny = 0;
@@ -47,10 +61,10 @@ public:
     std::vector<int> gid;          // active index -> grid storage index
     struct Span { int start, len; };
     std::vector<Span> spans;       // contiguous runs of active nodes
-    void gather(const double* grid, double* active) const { for (int a = 0; a < n; a++) active[a] = grid[gid[a]]; }
+    template <class T> void gather(const T* grid, double* active) const { for (int a = 0; a < n; a++) active[a] = grid[gid[a]]; }
 
     // r = -(dt^2 K w + dt D v + dt C0 v), the plate's internal force times dt^2. Allocation free.
-    void apply(const double* w, const double* v, double* r) const;
+    void apply(const RealP* w, const RealP* v, RealP* r) const;
     std::vector<double> mass;      // lumped mass per node, kg
     std::vector<double> c0;        // mass proportional damping per node, kg/s
     Csr K;                         // full stiffness, N/m
@@ -65,8 +79,12 @@ public:
     Vec2 nodePosition(int node) const;  // piano coordinates
     std::vector<int> ribColumns;
 
-    // x <- A^-1 x with A = M + dt^2/4 Kimp + dt/2 C0, on grid storage. Allocation free.
-    void solve(double* x) const;
+    // A^-1 x with A = M + dt^2/4 Kimp + dt/2 C0, on grid storage, in two parts so that the
+    // caller can fold the diagonal part into its own loop: solveStiff() overwrites the
+    // entries of the stiffened block with the solution, and every entry must then be
+    // multiplied by diagScale() (which is 1 on the stiffened block). Allocation free.
+    void solveStiff(RealP* x) const;
+    const RealP* diagScale() const { return invDiag_.data(); }
     int correctionNnz() const { return (int)corrCol_.size(); }
 
 private:
@@ -83,24 +101,32 @@ private:
 
     // Kernel data, all premultiplied by dt^2 (stiffness) or dt (damping).
     double a0_ = 0, a1x_ = 0, a1y_ = 0, a2x_ = 0, a2y_ = 0, a11_ = 0, b0_ = 0, bx_ = 0, by_ = 0;
-    std::vector<double> c0dt_;                 // grid storage
+    std::vector<RealP> c0dt_;                  // grid storage
     std::vector<int> corrRow_, corrPtr_, corrCol_;  // boundary correction to the uniform stencil
-    std::vector<double> corrVal_;
+    std::vector<RealP> corrVal_;
     struct RibRun { int start, len, coef; };   // coef: offset into ribCoef_
     std::vector<RibRun> ribRuns_;
-    std::vector<double> ribCoef_;
-    struct BeamForm { int idx[12]; double c[12]; double coef; };
+    std::vector<RealP> ribCoef_;
+    struct BeamForm { int idx[12]; RealP c[12]; RealP coef; };
     std::vector<BeamForm> beams_;
-    mutable std::vector<double> ribScr_;
+    mutable std::vector<RealP> ribScr_;
 
-    // Sparse Cholesky of the stiffened block of A, plus the plain diagonal elsewhere.
-    std::vector<double> invDiag_;  // grid storage: 1/A_ii, zero outside the board
-    std::vector<int> perm_;        // stiffened block: position -> grid storage index
-    std::vector<int> lPtr_, lRow_;      // L by columns (backward substitution)
-    std::vector<double> lVal_, lInvDiag_;
-    std::vector<int> rPtr_, rCol_;      // L by rows (forward substitution)
-    std::vector<double> rVal_;
-    mutable std::vector<double> work_;
+    // Cholesky factor of the stiffened block of A. Rib segments that hang off a bridge are
+    // eliminated first; each is a pentadiagonal chain, and all chains are swept together,
+    // one position per step, so the sweep vectorises across ribs. What is left (the bridges
+    // and their junctions with the ribs) is a small general sparse factor.
+    std::vector<RealP> invDiag_;        // grid storage: 1/A_ii off the stiffened block, 1 on it, 0 outside the board
+    int lanes_ = 0, levels_ = 0, slots_ = 0, coreN_ = 0;
+    std::vector<RealP> f1_, f2_, fd_;   // forward sweep coefficients per slot
+    std::vector<RealP> g1_, g2_, gd_;   // backward sweep coefficients per slot
+    std::vector<int> chainSlot_, chainGid_;      // real chain nodes
+    std::vector<int> virtSlot_, virtCore_;       // slots that mirror a core unknown
+    std::vector<int> coreGid_;
+    std::vector<int> cfPtr_, cfCol_;    // core rows of L (columns index the work vector)
+    std::vector<RealP> cfVal_, cInvDiag_;
+    std::vector<int> cbPtr_, cbRow_;    // core columns of L restricted to the core
+    std::vector<RealP> cbVal_;
+    mutable std::vector<RealP> work_;
 };
 
 }  // namespace pp

@@ -137,7 +137,7 @@ Interp Plate::interpActive(Vec2 piano) const {
     return it;
 }
 
-Plate::Plate(const BoardDesign& board, const std::vector<Attachment>& att, double dt) {
+Plate::Plate(const BoardDesign& board, const std::vector<Attachment>& att, double dt, double gridScale) {
     dt_ = dt;
     ex_[0] = std::cos(board.grainAngle); ex_[1] = std::sin(board.grainAngle);
     ey_[0] = -ex_[1]; ey_[1] = ex_[0];
@@ -159,6 +159,10 @@ Plate::Plate(const BoardDesign& board, const std::vector<Attachment>& att, doubl
         if (stabilityBound <= target && stabilityBound > target - 0.08) break;
         double s = std::pow(stabilityBound / (target - 0.03), 0.25);
         hx *= s; hy *= s;
+    }
+    if (gridScale > 1.0) {  // coarser than the limit is always stable
+        hx *= gridScale; hy *= gridScale;
+        build(board, att, dt);
     }
     if (stabilityBound >= 4.0) throw std::runtime_error("plate grid failed the stability bound");
     factor(dt);
@@ -304,9 +308,9 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
                 tk.quad(f, bEI * ds);
                 ti.quad(f, bEI * ds);
                 BeamForm bf{};
-                for (int q = 0; q < f.n; q++) { bf.idx[q] = gid[f.idx[q]]; bf.c[q] = f.c[q]; }
+                for (int q = 0; q < f.n; q++) { bf.idx[q] = gid[f.idx[q]]; bf.c[q] = (RealP)f.c[q]; }
                 for (int q = f.n; q < 12; q++) { bf.idx[q] = gid[f.idx[0]]; bf.c[q] = 0; }
-                bf.coef = dt * dt * bEI * ds;
+                bf.coef = (RealP)(dt * dt * bEI * ds);
                 beams_.push_back(bf);
             }
         }
@@ -338,8 +342,8 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
             while (j < Ny && id(i, j) >= 0) j++;
             spans.push_back({(i + 2) * stride + j0 + 2, j - j0});
         }
-    c0dt_.assign(gridSize, 0.0);
-    for (int a = 0; a < n; a++) c0dt_[gid[a]] = dt * c0[a];
+    c0dt_.assign(gridSize, 0);
+    for (int a = 0; a < n; a++) c0dt_[gid[a]] = (RealP)(dt * c0[a]);
 
     // Uniform interior stencil of the bare plate, and its damping twin.
     const double Dm = 2 * D1 + 4 * Dk, q = dt * dt * area;
@@ -374,7 +378,7 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
             for (auto& kv : acc)
                 if (std::fabs(kv.second) > 1e-9 * a0_) {
                     corrCol_.push_back(gid[kv.first]);
-                    corrVal_.push_back(kv.second);
+                    corrVal_.push_back((RealP)kv.second);
                     any = true;
                 }
             if (any) { corrRow_.push_back(gid[a]); corrPtr_.push_back((int)corrCol_.size()); }
@@ -388,16 +392,16 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
         for (int j = 0; j < Ny; j++) {
             if (id(i, j) < 0) continue;
             RibRun run{(i + 2) * stride + j + 2, 0, (int)ribCoef_.size()};
-            ribCoef_.push_back(0.0);  // one zero pad on each side of the run
+            ribCoef_.push_back(0);  // one zero pad on each side of the run
             while (j < Ny && id(i, j) >= 0) {
-                ribCoef_.push_back(dt * dt * ribEI[id(i, j)] / (hy * hy * hy));
+                ribCoef_.push_back((RealP)(dt * dt * ribEI[id(i, j)] / (hy * hy * hy)));
                 run.len++; j++;
             }
-            ribCoef_.push_back(0.0);
+            ribCoef_.push_back(0);
             ribRuns_.push_back(run);
             longest = std::max(longest, run.len);
         }
-    ribScr_.assign(longest + 2, 0.0);
+    ribScr_.assign(longest + 2, 0);
 
     // Gershgorin bound on M^-1 (dt^2 (K - Kimp) + 2 dt (D + dashpots)).
     std::vector<double> row(n, 0.0);
@@ -441,42 +445,42 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
     stabilityEstimate = lam;
 }
 
-void Plate::apply(const double* __restrict w, const double* __restrict v, double* __restrict r) const {
+void Plate::apply(const RealP* __restrict w, const RealP* __restrict v, RealP* __restrict r) const {
     const int S = stride;
-    const double a0 = a0_, a1x = a1x_, a1y = a1y_, a2x = a2x_, a2y = a2y_, a11 = a11_;
-    const double b0 = b0_, bx = bx_, by = by_;
+    const RealP a0 = (RealP)a0_, a1x = (RealP)a1x_, a1y = (RealP)a1y_, a2x = (RealP)a2x_, a2y = (RealP)a2y_, a11 = (RealP)a11_;
+    const RealP b0 = (RealP)b0_, bx = (RealP)bx_, by = (RealP)by_;
     for (const Span& sp : spans) {
-        const double* __restrict ws = w + sp.start;
-        const double* __restrict vs = v + sp.start;
-        const double* __restrict cs = c0dt_.data() + sp.start;
-        double* __restrict rs = r + sp.start;
+        const RealP* __restrict ws = w + sp.start;
+        const RealP* __restrict vs = v + sp.start;
+        const RealP* __restrict cs = c0dt_.data() + sp.start;
+        RealP* __restrict rs = r + sp.start;
         for (int t = 0; t < sp.len; t++) {
-            double kw = a0 * ws[t] + a1x * (ws[t - S] + ws[t + S]) + a1y * (ws[t - 1] + ws[t + 1]) +
+            RealP kw = a0 * ws[t] + a1x * (ws[t - S] + ws[t + S]) + a1y * (ws[t - 1] + ws[t + 1]) +
                         a2x * (ws[t - 2 * S] + ws[t + 2 * S]) + a2y * (ws[t - 2] + ws[t + 2]) +
                         a11 * (ws[t - S - 1] + ws[t - S + 1] + ws[t + S - 1] + ws[t + S + 1]);
-            double dv = (b0 + cs[t]) * vs[t] + bx * (vs[t - S] + vs[t + S]) + by * (vs[t - 1] + vs[t + 1]);
+            RealP dv = (b0 + cs[t]) * vs[t] + bx * (vs[t - S] + vs[t + S]) + by * (vs[t - 1] + vs[t + 1]);
             rs[t] = -(kw + dv);
         }
     }
     const int rows = (int)corrRow_.size();
     for (int i = 0; i < rows; i++) {
-        double s = 0;
+        RealP s = 0;
         for (int p = corrPtr_[i]; p < corrPtr_[i + 1]; p++) s += corrVal_[p] * w[corrCol_[p]];
         r[corrRow_[i]] -= s;
     }
     // Ribs: bending moment along the run, then its second difference.
-    double* __restrict m = ribScr_.data();
+    RealP* __restrict m = ribScr_.data();
     for (const RibRun& run : ribRuns_) {
-        const double* __restrict ws = w + run.start;
-        const double* __restrict cf = ribCoef_.data() + run.coef + 1;
-        double* __restrict rs = r + run.start;
+        const RealP* __restrict ws = w + run.start;
+        const RealP* __restrict cf = ribCoef_.data() + run.coef + 1;
+        RealP* __restrict rs = r + run.start;
         m[0] = 0;
         for (int t = 0; t < run.len; t++) m[t + 1] = cf[t] * (ws[t - 1] - 2 * ws[t] + ws[t + 1]);
         m[run.len + 1] = 0;
         for (int t = 0; t < run.len; t++) rs[t] -= m[t] - 2 * m[t + 1] + m[t + 2];
     }
     for (const BeamForm& b : beams_) {
-        double s = 0;
+        RealP s = 0;
         for (int q = 0; q < 12; q++) s += b.c[q] * w[b.idx[q]];
         s *= b.coef;
         for (int q = 0; q < 12; q++) r[b.idx[q]] -= b.c[q] * s;
@@ -484,43 +488,94 @@ void Plate::apply(const double* __restrict w, const double* __restrict v, double
 }
 
 void Plate::factor(double dt) {
-    // Nodes touched by an implicit stiffener form a sparse SPD block; everything else is diagonal.
-    std::vector<int> pos(n, -1);
-    std::vector<int> stiff;
-    for (int a = 0; a < n; a++)
-        if (Kimp.rowPtr[a + 1] > Kimp.rowPtr[a]) stiff.push_back(a);
-    stiffNodes = (int)stiff.size();
+    auto id = [&](int i, int j) { return (i < 0 || i >= Nx || j < 0 || j >= Ny) ? -1 : nodeIndex[i + Nx * j]; };
+    std::vector<char> stiff(n, 0), core(n, 0);
+    for (int a = 0; a < n; a++) stiff[a] = Kimp.rowPtr[a + 1] > Kimp.rowPtr[a];
+    stiffNodes = 0;
+    for (int a = 0; a < n; a++) stiffNodes += stiff[a];
 
-    // Elimination order: farthest from the bridges first. Rib chains are then eliminated from
-    // their free ends inward with no fill, leaving the narrow band along the bridges for last.
-    std::vector<int> dist(n, -1);
-    std::queue<int> q;
+    // Outside the stiffened block A is diagonal; inside it the factor does the work.
+    invDiag_.assign(gridSize, 0);
+    for (int a = 0; a < n; a++) invDiag_[gid[a]] = (RealP)(stiff[a] ? 1.0 : 1.0 / (mass[a] + 0.5 * dt * c0[a]));
+
+    // Core: every node a bridge touches, widened by one node along the ribs so that a rib
+    // chain always ends on two consecutive core nodes.
     for (int b : bridgeNodes_)
-        if (Kimp.rowPtr[b + 1] > Kimp.rowPtr[b]) { dist[b] = 0; q.push(b); }
-    while (!q.empty()) {
-        int a = q.front(); q.pop();
-        for (int p = Kimp.rowPtr[a]; p < Kimp.rowPtr[a + 1]; p++) {
-            int c = Kimp.col[p];
-            if (dist[c] < 0) { dist[c] = dist[a] + 1; q.push(c); }
+        if (stiff[b]) {
+            core[b] = 1;
+            for (int dj : {-1, 1}) {
+                int c = id(gi[b], gj[b] + dj);
+                if (c >= 0 && stiff[c]) core[c] = 1;
+            }
         }
-    }
-    std::sort(stiff.begin(), stiff.end(), [&](int a, int b) {
-        int da = dist[a] < 0 ? 1 << 28 : dist[a], db = dist[b] < 0 ? 1 << 28 : dist[b];
-        if (da != db) return da > db;
-        if (gi[a] != gi[b]) return gi[a] < gi[b];
-        return gj[a] < gj[b];
-    });
-    perm_.resize(stiffNodes);
-    for (int i = 0; i < stiffNodes; i++) { pos[stiff[i]] = i; perm_[i] = gid[stiff[i]]; }
+    std::vector<char> isRib(Nx, 0);
+    for (int i : ribColumns) isRib[i] = 1;
+    for (int a = 0; a < n; a++)
+        if (stiff[a] && !isRib[gi[a]]) core[a] = 1;
 
-    invDiag_.assign(gridSize, 0.0);
-    for (int a = 0; a < n; a++) invDiag_[gid[a]] = 1.0 / (mass[a] + 0.5 * dt * c0[a]);
+    struct Chain { std::vector<int> nodes; int cA = -1, cB = -1; };
+    std::vector<Chain> chains;
+    for (int i : ribColumns)
+        for (int j = 0; j < Ny; j++) {
+            int a = id(i, j);
+            if (a < 0 || core[a]) continue;
+            int j0 = j;
+            while (j < Ny && id(i, j) >= 0 && !core[id(i, j)]) j++;
+            int j1 = j - 1;  // segment [j0, j1] of plain rib nodes
+            int lo = id(i, j0 - 1), hi = id(i, j1 + 1);
+            bool coreLo = lo >= 0 && core[lo], coreHi = hi >= 0 && core[hi];
+            if (coreLo && coreHi) {  // held at both ends: leave it to the general factor
+                for (int q = j0; q <= j1; q++) core[id(i, q)] = 1;
+                continue;
+            }
+            Chain c;
+            if (coreLo) {
+                for (int q = j1; q >= j0; q--) c.nodes.push_back(id(i, q));
+                c.cA = lo; c.cB = id(i, j0 - 2);
+            } else {
+                for (int q = j0; q <= j1; q++) c.nodes.push_back(id(i, q));
+                if (coreHi) { c.cA = hi; c.cB = id(i, j1 + 2); }
+            }
+            if (c.cB >= 0 && !core[c.cB]) throw std::runtime_error("rib chain ends on a single core node");
+            chains.push_back(c);
+        }
+
+    // Elimination order: chains first, then the core, farthest from the bridges first.
+    std::vector<int> order, pos(n, -1);
+    for (const Chain& c : chains)
+        for (int a : c.nodes) order.push_back(a);
+    const int nChain = (int)order.size();
+    {
+        std::vector<int> dist(n, -1), cn;
+        std::queue<int> q;
+        for (int b : bridgeNodes_)
+            if (core[b]) { dist[b] = 0; q.push(b); }
+        while (!q.empty()) {
+            int a = q.front(); q.pop();
+            for (int p = Kimp.rowPtr[a]; p < Kimp.rowPtr[a + 1]; p++) {
+                int c = Kimp.col[p];
+                if (core[c] && dist[c] < 0) { dist[c] = dist[a] + 1; q.push(c); }
+            }
+        }
+        for (int a = 0; a < n; a++)
+            if (core[a]) cn.push_back(a);
+        std::sort(cn.begin(), cn.end(), [&](int a, int b) {
+            int da = dist[a] < 0 ? 1 << 28 : dist[a], db = dist[b] < 0 ? 1 << 28 : dist[b];
+            if (da != db) return da > db;
+            if (gi[a] != gi[b]) return gi[a] < gi[b];
+            return gj[a] < gj[b];
+        });
+        for (int a : cn) order.push_back(a);
+    }
+    const int m = (int)order.size();
+    coreN_ = m - nChain;
+    for (int i = 0; i < m; i++) pos[order[i]] = i;
 
     // Right-looking Cholesky on column maps. Fine for a one-off setup of a few thousand rows.
-    std::vector<std::map<int, double>> colm(stiffNodes);
-    std::vector<double> diag(stiffNodes);
-    for (int i = 0; i < stiffNodes; i++) {
-        int a = stiff[i];
+    std::vector<std::map<int, double>> colm(m);
+    std::vector<double> diag(m);
+    for (int i = 0; i < m; i++) {
+        int a = order[i];
         diag[i] = mass[a] + 0.5 * dt * c0[a];
         for (int p = Kimp.rowPtr[a]; p < Kimp.rowPtr[a + 1]; p++) {
             int j = pos[Kimp.col[p]];
@@ -529,66 +584,135 @@ void Plate::factor(double dt) {
             else if (j > i) colm[i][j] += v;
         }
     }
-    lPtr_.assign(stiffNodes + 1, 0);
-    lRow_.clear(); lVal_.clear();
-    lInvDiag_.assign(stiffNodes, 0.0);
-    for (int j = 0; j < stiffNodes; j++) {
+    std::vector<double> linv(m);
+    factorNnz = 0;
+    for (int j = 0; j < m; j++) {
         if (!(diag[j] > 0)) throw std::runtime_error("stiffener block is not positive definite");
         double l = std::sqrt(diag[j]);
-        lInvDiag_[j] = 1.0 / l;
+        linv[j] = 1.0 / l;
         for (auto& kv : colm[j]) kv.second /= l;
         for (auto a = colm[j].begin(); a != colm[j].end(); ++a) {
             diag[a->first] -= a->second * a->second;
             auto b = a;
             for (++b; b != colm[j].end(); ++b) colm[a->first][b->first] -= a->second * b->second;
         }
-        for (auto& kv : colm[j]) { lRow_.push_back(kv.first); lVal_.push_back(kv.second); }
-        lPtr_[j + 1] = (int)lRow_.size();
-        colm[j].clear();
+        factorNnz += (int)colm[j].size();
     }
-    factorNnz = (int)lRow_.size();
-    work_.assign(stiffNodes, 0.0);
-    // Row copy of L. Both substitutions then only read earlier results, which lets the
-    // processor run the independent rib chains side by side.
-    rPtr_.assign(stiffNodes + 1, 0);
-    for (int r : lRow_) rPtr_[r + 1]++;
-    for (int i = 0; i < stiffNodes; i++) rPtr_[i + 1] += rPtr_[i];
-    rCol_.resize(factorNnz); rVal_.resize(factorNnz);
-    std::vector<int> fill(rPtr_.begin(), rPtr_.end() - 1);
-    for (int j = 0; j < stiffNodes; j++)
-        for (int p = lPtr_[j]; p < lPtr_[j + 1]; p++) {
-            int q = fill[lRow_[p]]++;
-            rCol_[q] = j; rVal_[q] = lVal_[p];
+
+    // Lay the chains out as lanes x levels, two zero levels in front and two behind.
+    lanes_ = ((int)chains.size() + 7) / 8 * 8;  // whole SIMD groups; spare lanes stay empty
+    int longest = 0;
+    for (const Chain& c : chains) longest = std::max(longest, (int)c.nodes.size());
+    levels_ = longest + 4;
+    slots_ = lanes_ * levels_;
+    f1_.assign(slots_, 0); f2_.assign(slots_, 0); fd_.assign(slots_, 0);
+    g1_.assign(slots_, 0); g2_.assign(slots_, 0); gd_.assign(slots_, 1);
+    chainSlot_.clear(); chainGid_.clear(); virtSlot_.clear(); virtCore_.clear();
+    std::vector<int> slotOf(m, -1);  // elimination index -> index in the work vector
+    {
+        int e = 0;
+        for (int c = 0; c < (int)chains.size(); c++)
+            for (size_t t = 0; t < chains[c].nodes.size(); t++, e++) slotOf[e] = (int)(t + 2) * lanes_ + c;
+        for (int i = nChain; i < m; i++) slotOf[i] = slots_ + (i - nChain);
+    }
+    {
+        int e = 0;
+        for (int c = 0; c < (int)chains.size(); c++) {
+            const Chain& ch = chains[c];
+            const int T = (int)ch.nodes.size();
+            const int vA = (T + 2) * lanes_ + c, vB = (T + 3) * lanes_ + c;
+            if (ch.cA >= 0) { virtSlot_.push_back(vA); virtCore_.push_back(slots_ + pos[ch.cA] - nChain); }
+            if (ch.cB >= 0) { virtSlot_.push_back(vB); virtCore_.push_back(slots_ + pos[ch.cB] - nChain); }
+            for (int t = 0; t < T; t++, e++) {
+                int s = slotOf[e];
+                chainSlot_.push_back(s);
+                chainGid_.push_back(gid[ch.nodes[t]]);
+                fd_[s] = gd_[s] = (RealP)linv[e];
+                for (auto& kv : colm[e]) {
+                    int row = kv.first, target;
+                    if (row < nChain) target = slotOf[row];
+                    else if (ch.cA >= 0 && row == pos[ch.cA]) target = vA;
+                    else if (ch.cB >= 0 && row == pos[ch.cB]) target = vB;
+                    else throw std::runtime_error("unexpected fill in a rib chain");
+                    if (target == s + lanes_) g1_[s] = (RealP)kv.second;
+                    else if (target == s + 2 * lanes_) g2_[s] = (RealP)kv.second;
+                    else throw std::runtime_error("rib chain is not pentadiagonal");
+                    if (row < nChain) {  // the same entry seen from its row, for the forward sweep
+                        if (target == s + lanes_) f1_[target] = (RealP)kv.second;
+                        else f2_[target] = (RealP)kv.second;
+                    }
+                }
+            }
         }
+    }
+    // Core rows (forward) and core columns (backward).
+    coreGid_.resize(coreN_);
+    cInvDiag_.resize(coreN_);
+    for (int i = 0; i < coreN_; i++) { coreGid_[i] = gid[order[nChain + i]]; cInvDiag_[i] = (RealP)linv[nChain + i]; }
+    std::vector<std::vector<std::pair<int, double>>> rows(coreN_);
+    cbPtr_.assign(coreN_ + 1, 0); cbRow_.clear(); cbVal_.clear();
+    for (int j = 0; j < m; j++) {
+        for (auto& kv : colm[j]) {
+            if (kv.first >= nChain) rows[kv.first - nChain].push_back({slotOf[j], kv.second});
+        }
+        if (j >= nChain) {
+            // Farthest row first: the unknown computed just before this one then enters the
+            // sum last, which keeps the dependency chain of the substitution short.
+            for (auto it = colm[j].rbegin(); it != colm[j].rend(); ++it) {
+                cbRow_.push_back(slots_ + it->first - nChain);
+                cbVal_.push_back((RealP)it->second);
+            }
+            cbPtr_[j - nChain + 1] = (int)cbRow_.size();
+        }
+    }
+    cfPtr_.assign(coreN_ + 1, 0); cfCol_.clear(); cfVal_.clear();
+    for (int i = 0; i < coreN_; i++) {
+        for (auto& e : rows[i]) { cfCol_.push_back(e.first); cfVal_.push_back((RealP)e.second); }
+        cfPtr_[i + 1] = (int)cfCol_.size();
+    }
+    work_.assign(slots_ + coreN_, 0);
 }
 
-void Plate::solve(double* __restrict x) const {
-    double* __restrict y = work_.data();
-    const int m = stiffNodes;
-    for (int i = 0; i < m; i++) y[i] = x[perm_[i]];
-    const double* __restrict id = invDiag_.data();
-    for (const Span& sp : spans) {
-        double* __restrict xs = x + sp.start;
-        const double* __restrict ds = id + sp.start;
-        for (int t = 0; t < sp.len; t++) xs[t] *= ds[t];
+void Plate::solveStiff(RealP* __restrict x) const {
+    RealP* __restrict y = work_.data();
+    const int W = lanes_, nc = (int)chainSlot_.size(), cn = coreN_;
+    RealP* __restrict yc = y + slots_;
+    for (int i = 0; i < nc; i++) y[chainSlot_[i]] = x[chainGid_[i]];
+    for (int i = 0; i < cn; i++) yc[i] = x[coreGid_[i]];
+    // Forward: all rib chains in step, then the core.
+    for (int lv = 2; lv < levels_; lv++) {
+        RealP* __restrict cur = y + lv * W;
+        const RealP* __restrict p1 = y + (lv - 1) * W;
+        const RealP* __restrict p2 = y + (lv - 2) * W;
+        const RealP* __restrict a1 = f1_.data() + lv * W;
+        const RealP* __restrict a2 = f2_.data() + lv * W;
+        const RealP* __restrict dd = fd_.data() + lv * W;
+        for (int c = 0; c < W; c++) cur[c] = (cur[c] - a1[c] * p1[c] - a2[c] * p2[c]) * dd[c];
     }
-    const int* __restrict lp = lPtr_.data();
-    const int* __restrict lr = lRow_.data();
-    const double* __restrict lv = lVal_.data();
-    const int* __restrict rp = rPtr_.data();
-    const int* __restrict rc = rCol_.data();
-    const double* __restrict rv = rVal_.data();
-    for (int i = 0; i < m; i++) {
-        double s = y[i];
-        for (int p = rp[i]; p < rp[i + 1]; p++) s -= rv[p] * y[rc[p]];
-        y[i] = s * lInvDiag_[i];
+    for (int i = 0; i < cn; i++) {
+        RealP s = yc[i];
+        for (int p = cfPtr_[i]; p < cfPtr_[i + 1]; p++) s -= cfVal_[p] * y[cfCol_[p]];
+        yc[i] = s * cInvDiag_[i];
     }
-    for (int j = m - 1; j >= 0; j--) {
-        double s = y[j];
-        for (int p = lp[j]; p < lp[j + 1]; p++) s -= lv[p] * y[lr[p]];
-        y[j] = s * lInvDiag_[j];
+    // Backward: core, then the chains outward from the bridges.
+    for (int j = cn - 1; j >= 0; j--) {
+        RealP s = yc[j];
+        for (int p = cbPtr_[j]; p < cbPtr_[j + 1]; p++) s -= cbVal_[p] * y[cbRow_[p]];
+        yc[j] = s * cInvDiag_[j];
     }
-    for (int i = 0; i < m; i++) x[perm_[i]] = y[i];
+    const int nv = (int)virtSlot_.size();
+    for (int i = 0; i < nv; i++) y[virtSlot_[i]] = y[virtCore_[i]];
+    for (int lv = levels_ - 3; lv >= 2; lv--) {
+        RealP* __restrict cur = y + lv * W;
+        const RealP* __restrict n1 = y + (lv + 1) * W;
+        const RealP* __restrict n2 = y + (lv + 2) * W;
+        const RealP* __restrict a1 = g1_.data() + lv * W;
+        const RealP* __restrict a2 = g2_.data() + lv * W;
+        const RealP* __restrict dd = gd_.data() + lv * W;
+        for (int c = 0; c < W; c++) cur[c] = (cur[c] - a1[c] * n1[c] - a2[c] * n2[c]) * dd[c];
+    }
+    for (int i = 0; i < nc; i++) x[chainGid_[i]] = y[chainSlot_[i]];
+    for (int i = 0; i < cn; i++) x[coreGid_[i]] = yc[i];
 }
 
 }  // namespace pp

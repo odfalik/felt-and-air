@@ -52,10 +52,11 @@ static void testKernelMatchesAssembly() {
     std::printf("\n1. Fast plate kernel reproduces the assembled energy operator\n");
     Piano p(oneNote(), {48000, 1, 0.5});
     const Plate& P = p.plate();
-    std::vector<double> w(P.gridSize, 0.0), v(P.gridSize, 0.0), r(P.gridSize, 0.0), wa(P.n), va(P.n), kw(P.n), dv(P.n);
+    std::vector<RealP> w(P.gridSize, 0), v(P.gridSize, 0), r(P.gridSize, 0);
+    std::vector<double> wa(P.n), va(P.n), kw(P.n), dv(P.n);
     unsigned seed = 12345;
     auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return (seed >> 8) / 16777216.0 - 0.5; };
-    for (int a = 0; a < P.n; a++) { w[P.gid[a]] = rnd(); v[P.gid[a]] = rnd(); }
+    for (int a = 0; a < P.n; a++) { w[P.gid[a]] = (RealP)rnd(); v[P.gid[a]] = (RealP)rnd(); }
     P.gather(w.data(), wa.data());
     P.gather(v.data(), va.data());
     P.apply(w.data(), v.data(), r.data());
@@ -158,12 +159,12 @@ static void testPlateAnalytic() {
         for (auto [m, n] : std::vector<std::pair<int, int>>{{1, 1}, {2, 1}, {1, 2}, {3, 2}, {2, 5}}) {
             double exact = 0.5 * M_PI * std::sqrt((Dx * std::pow(m / A, 4) + 2 * (D1 + 2 * Dk) * std::pow(m * n / (A * B), 2) +
                                                    Dy * std::pow(n / B, 4)) / (bd.rho * H));
-            std::fill(p.plateU().begin(), p.plateU().end(), 0.0);
-            std::fill(p.plateV().begin(), p.plateV().end(), 0.0);
+            std::fill(p.plateU().begin(), p.plateU().end(), (RealP)0);
+            std::fill(p.plateV().begin(), p.plateV().end(), (RealP)0);
             int probe = 0;
             for (int a = 0; a < P.n; a++) {
                 double sx = std::sin(m * M_PI * (P.gi[a] - i0 + 1) * P.hx / A), sy = std::sin(n * M_PI * (P.gj[a] - j0 + 1) * P.hy / B);
-                p.plateU()[P.gid[a]] = 1e-6 * sx * sy;
+                p.plateU()[P.gid[a]] = (RealP)(1e-6 * sx * sy);
                 if (std::fabs(sx * sy) > 0.9) probe = P.gid[a];
             }
             // Count zero crossings of the probe node.
@@ -268,7 +269,7 @@ static void testReciprocity() {
         for (int n = 0; n < 2000; n++) p.step(a, b);  // let the dampers finish lifting
         int from = dir == 0 ? 0 : 2, to = dir == 0 ? 2 : 0;
         int nf = dir == 0 ? 20 : 41, nt = dir == 0 ? 41 : 20;
-        p.stringV(from)[nf] = 1e-9 / p.stringNodeMass(from);  // unit momentum
+        p.stringV(from)[nf] = (RealS)(1e-9 / p.stringNodeMass(from));  // unit momentum
         for (int n = 0; n < 6000; n++) {
             p.step(a, b);
             if (n % 500 == 499) acc += p.stringU(to)[nt] * (1 + n);
