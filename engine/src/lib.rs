@@ -1,6 +1,7 @@
 //! A piano simulated from its mechanics. See docs/MODEL.md.
 pub mod acoustics;
 pub mod design;
+pub mod ffi;
 pub mod midi;
 pub mod piano;
 pub mod plate;

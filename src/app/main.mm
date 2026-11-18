@@ -13,8 +13,7 @@
 #include <memory>
 #include <pthread.h>
 #include <vector>
-#include "Midi.h"
-#include "Piano.h"
+#include "Engine.h"
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -44,9 +43,18 @@ struct EventQueue {
 };
 
 struct Engine {
-    PianoDesign design;
     std::unique_ptr<Piano> piano;
-    Piano::Snapshot snap, snapUI;
+    PPSnapshot* snap = nullptr;    // written by the audio thread
+    PPSnapshot* snapUI = nullptr;  // the display's copy
+    std::vector<Vec2> outline, bridges[2];
+    Vec2 ears[2];
+    void refreshGeometry() {
+        outline = outlineOf(voicing);
+        for (int b = 0; b < 2; b++) bridges[b] = bridgeOf(voicing, b);
+        double e[6];
+        pp_ears(&voicing, e);
+        ears[0] = {e[0], e[1]}; ears[1] = {e[3], e[4]};
+    }
     std::atomic_flag snapLock = ATOMIC_FLAG_INIT;
     EventQueue uiEvents, midiEvents;
     std::vector<float> l, r;
@@ -75,8 +83,7 @@ struct Engine {
             std::stringstream ss(line);
             std::string file, title, note;
             std::getline(ss, file, '|'); std::getline(ss, title, '|'); std::getline(ss, note, '|');
-            Demo d{title, note, readMidiFile(dir + "/" + file)};
-            leadNotesByFlight(d.events, voicing.letOffMm * 1e-3, midiVelocityToHammerSpeed);
+            Demo d{title, note, readMidiFile(dir + "/" + file, voicing.let_off_mm * 1e-3)};
             if (!d.events.empty()) demos.push_back(std::move(d));
         }
     }
@@ -88,12 +95,8 @@ struct Engine {
     mach_timebase_info_data_t tb;
 
     void build() {
-        GrandOptions g = voicing;
-        design = makeGrand(g);
-        PianoOptions o;
-        o.sampleRate = sampleRate;
-        o.boardGridScale = gridScale;
-        piano = std::make_unique<Piano>(design, o);
+        refreshGeometry();
+        piano = std::make_unique<Piano>(voicing, sampleRate, gridScale);
         // Helpers join the audio thread's workgroup so the system schedules them as one
         // realtime unit instead of preempting them mid-step.
         os_workgroup_t wg = workgroup;
@@ -114,8 +117,9 @@ struct Engine {
                 joined = wg && os_workgroup_join(wg, &token) == 0;
             },
             [wg] { if (joined) os_workgroup_leave(wg, &token); joined = false; });
-        piano->prepareSnapshot(snap);
-        piano->prepareSnapshot(snapUI);
+        pp_snapshot_free(snap); pp_snapshot_free(snapUI);
+        snap = pp_snapshot_new(piano->raw());
+        snapUI = pp_snapshot_new(piano->raw());
         piano->setPedal(lastPedal);  // a demo keeps playing across a rebuild; carry the pedal over
         l.assign(8192, 0); r.assign(8192, 0);
         mach_timebase_info(&tb);
@@ -163,7 +167,7 @@ struct Engine {
         level = std::max(pk, level.load() * 0.9f);
         framesSinceSnap += n;
         if (framesSinceSnap >= sampleRate / 40 && !snapLock.test_and_set(std::memory_order_acquire)) {
-            piano->fillSnapshot(snap, focus.load());
+            pp_snapshot_fill(piano->raw(), snap, focus.load());
             snapLock.clear(std::memory_order_release);
             framesSinceSnap = 0;
         }
@@ -219,15 +223,9 @@ static OSStatus renderCallback(void*, AudioUnitRenderActionFlags*, const AudioTi
     _iw = 280; _ih = 300;
     _pixMap.assign(_iw * _ih, -1);
     _pixels.assign(_iw * _ih * 4, 0);
-    const Plate& P = gEngine.piano->plate();
     for (int y = 0; y < _ih; y++)
-        for (int x = 0; x < _iw; x++) {
-            Vec2 p{1.40 * (x + 0.5) / _iw, 1.50 * (1.0 - (y + 0.5) / _ih)};
-            Interp it = P.interp(p);
-            int best = -1; double bw = 0.2;
-            for (int k = 0; k < 4; k++) if (it.w[k] > bw) { bw = it.w[k]; best = it.idx[k]; }
-            _pixMap[y * _iw + x] = best;
-        }
+        for (int x = 0; x < _iw; x++)
+            _pixMap[y * _iw + x] = gEngine.piano->boardNodeAt({1.40 * (x + 0.5) / _iw, 1.50 * (1.0 - (y + 0.5) / _ih)});
 }
 
 - (NSRect)boardRect { return NSMakeRect(20, 50, 420, 450); }
@@ -240,9 +238,10 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
     Engine& E = gEngine;
     // Copy, not swap: the display may redraw several times between two audio snapshots.
     while (E.snapLock.test_and_set(std::memory_order_acquire)) {}
-    E.snapUI = E.snap;
+    pp_snapshot_copy(E.snapUI, E.snap);
     E.snapLock.clear(std::memory_order_release);
-    const Piano::Snapshot& S = E.snapUI;
+    PPSnapshotView S;
+    pp_snapshot_view(E.snapUI, &S);
 
     [[NSColor colorWithWhite:0.09 alpha:1] setFill];
     NSRectFill(self.bounds);
@@ -253,7 +252,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 
     // Soundboard displacement, blue down / orange up, auto-ranged.
     float mx = 1e-9f;
-    for (float v : S.board) mx = std::max(mx, std::fabs(v));
+    for (int g = 0; g < S.board_len; g++) mx = std::max(mx, std::fabs(S.board[g]));
     _boardScale = std::max(mx, _boardScale * 0.97f);
     float inv = 1.0f / std::max(_boardScale, 2e-8f);
     for (int i = 0; i < _iw * _ih; i++) {
@@ -282,7 +281,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 
     auto toView = [&](Vec2 p) { return NSMakePoint(br.origin.x + p.x / 1.40 * br.size.width, br.origin.y + (1 - p.y / 1.50) * br.size.height); };
     [[NSColor colorWithWhite:1 alpha:0.55] setStroke];
-    for (const auto& line : E.design.board.bridges) {
+    for (const auto& line : E.bridges) {
         NSBezierPath* path = [NSBezierPath bezierPath];
         for (size_t i = 0; i < line.size(); i++) {
             if (i == 0) [path moveToPoint:toView(line[i])]; else [path lineToPoint:toView(line[i])];
@@ -291,32 +290,33 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
         [path stroke];
     }
     // Where each ringing string meets the bridge.
-    for (int si = 0; si < E.piano->stringCount() && si < (int)S.stringLevel.size(); si++) {
-        float lv = S.stringLevel[si];
+    for (int si = 0; si < E.piano->stringCount() && si < S.string_count; si++) {
+        float lv = S.string_level[si];
         if (lv < 2e-7f) continue;
         float a = std::min(1.0f, 0.25f + 0.12f * std::log10(lv / 2e-7f));
         [[NSColor colorWithRed:1 green:0.95 blue:0.6 alpha:a] setFill];
         NSPoint c = toView(E.piano->stringBridge(si));
         [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(c.x - 3, c.y - 3, 6, 6)] fill];
     }
-    const Plate& P = E.piano->plate();
+    const int boardNodes = E.piano->boardNodes();
+    const Vec2 spacing = E.piano->boardSpacing();
     [@"Soundboard displacement" drawAtPoint:NSMakePoint(20, 14) withAttributes:title];
-    [[NSString stringWithFormat:@"%d nodes  %.0f x %.0f mm  full scale %.2f um", P.n, P.hx * 1e3, P.hy * 1e3, _boardScale * 1e6]
+    [[NSString stringWithFormat:@"%d nodes  %.0f x %.0f mm  full scale %.2f um", boardNodes, spacing.x * 1e3, spacing.y * 1e3, _boardScale * 1e6]
         drawAtPoint:NSMakePoint(20, 32) withAttributes:small];
 
     // Strings of the last played note.
     NSRect sr = NSMakeRect(470, 50, self.bounds.size.width - 490, 250);
     [[NSColor colorWithWhite:0.13 alpha:1] setFill];
     NSRectFill(sr);
-    [[NSString stringWithFormat:@"Strings of MIDI note %d (agraffe left, bridge right)", S.focusMidi] drawAtPoint:NSMakePoint(470, 14) withAttributes:title];
+    [[NSString stringWithFormat:@"Strings of MIDI note %d (agraffe left, bridge right)", S.focus_midi] drawAtPoint:NSMakePoint(470, 14) withAttributes:title];
     float smax = 1e-7f;
-    for (int i = 0; i < 3; i++) for (int l = 0; l < S.shapeNodes[i]; l++) smax = std::max(smax, std::fabs(S.shape[i][l]));
+    for (int i = 0; i < 3; i++) for (int l = 0; l < S.shape_nodes[i]; l++) smax = std::max(smax, std::fabs(S.shape[i][l]));
     static float sScale = 1e-4f;
     sScale = std::max(smax, sScale * 0.98f);
     NSColor* cols[3] = {[NSColor colorWithRed:0.45 green:0.8 blue:1 alpha:1], [NSColor colorWithRed:1 green:0.75 blue:0.35 alpha:1],
                         [NSColor colorWithRed:0.6 green:1 blue:0.6 alpha:1]};
     for (int i = 0; i < 3; i++) {
-        int N = S.shapeNodes[i];
+        int N = S.shape_nodes[i];
         if (N < 2) continue;
         NSBezierPath* path = [NSBezierPath bezierPath];
         for (int l = 0; l < N; l++) {
@@ -328,7 +328,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
         path.lineWidth = 1.4;
         [path stroke];
     }
-    [[NSString stringWithFormat:@"full scale %.3f mm   felt force %.1f / %.1f / %.1f N", sScale * 1e3, S.hammerForce[0], S.hammerForce[1], S.hammerForce[2]]
+    [[NSString stringWithFormat:@"full scale %.3f mm   felt force %.1f / %.1f / %.1f N", sScale * 1e3, S.hammer_force[0], S.hammer_force[1], S.hammer_force[2]]
         drawAtPoint:NSMakePoint(470, 32) withAttributes:small];
 
     // Status.
@@ -450,54 +450,54 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 - (BOOL)isFlipped { return NO; }
 - (CGFloat)scale {
     const GrandOptions& o = gEngine.voicing;
-    return std::min((self.bounds.size.width - 20) / o.roomLx, (self.bounds.size.height - 44) / o.roomLy);
+    return std::min((self.bounds.size.width - 20) / o.room_lx, (self.bounds.size.height - 44) / o.room_ly);
 }
 - (NSPoint)toView:(double)x :(double)y {
     const GrandOptions& o = gEngine.voicing;
     CGFloat s = [self scale];
-    return NSMakePoint(self.bounds.size.width / 2 + (x - o.roomLx / 2) * s, self.bounds.size.height / 2 + 10 + (y - o.roomLy / 2) * s);
+    return NSMakePoint(self.bounds.size.width / 2 + (x - o.room_lx / 2) * s, self.bounds.size.height / 2 + 10 + (y - o.room_ly / 2) * s);
 }
 - (void)drawRect:(NSRect)dirty {
     const GrandOptions& o = gEngine.voicing;
     [[NSColor colorWithWhite:0.12 alpha:1] setFill];
     NSRectFill(self.bounds);
-    NSPoint a = [self toView:0 :0], b = [self toView:o.roomLx :o.roomLy];
+    NSPoint a = [self toView:0 :0], b = [self toView:o.room_lx :o.room_ly];
     NSRect room = NSMakeRect(a.x, a.y, b.x - a.x, b.y - a.y);
-    [(o.roomEnabled ? [NSColor colorWithWhite:0.2 alpha:1] : [NSColor colorWithWhite:0.14 alpha:1]) setFill];
+    [(o.room_enabled ? [NSColor colorWithWhite:0.2 alpha:1] : [NSColor colorWithWhite:0.14 alpha:1]) setFill];
     NSRectFill(room);
-    [[NSColor colorWithWhite:o.roomEnabled ? 0.75 : 0.35 alpha:1] setStroke];
+    [[NSColor colorWithWhite:o.room_enabled ? 0.75 : 0.35 alpha:1] setStroke];
     NSBezierPath* walls = [NSBezierPath bezierPathWithRect:room];
-    walls.lineWidth = o.roomEnabled ? 2 : 1;
-    if (!o.roomEnabled) { CGFloat dash[] = {4, 4}; [walls setLineDash:dash count:2 phase:0]; }
+    walls.lineWidth = o.room_enabled ? 2 : 1;
+    if (!o.room_enabled) { CGFloat dash[] = {4, 4}; [walls setLineDash:dash count:2 phase:0]; }
     [walls stroke];
     // Piano: the soundboard outline, with the keyboard along its near edge.
     NSBezierPath* piano = [NSBezierPath bezierPath];
-    const auto& outline = gEngine.design.board.outline;
+    const auto& outline = gEngine.outline;
     for (size_t i = 0; i < outline.size(); i++) {
-        NSPoint q = [self toView:o.pianoX + outline[i].x :o.pianoY + outline[i].y];
+        NSPoint q = [self toView:o.piano_x + outline[i].x :o.piano_y + outline[i].y];
         if (i == 0) [piano moveToPoint:q]; else [piano lineToPoint:q];
     }
     [piano closePath];
     [[NSColor colorWithRed:0.75 green:0.55 blue:0.3 alpha:1] setFill];
     [piano fill];
-    NSPoint k0 = [self toView:o.pianoX :o.pianoY - 0.16], k1 = [self toView:o.pianoX + 1.40 :o.pianoY];
+    NSPoint k0 = [self toView:o.piano_x :o.piano_y - 0.16], k1 = [self toView:o.piano_x + 1.40 :o.piano_y];
     [[NSColor colorWithWhite:0.92 alpha:1] setFill];
     NSRectFill(NSMakeRect(k0.x, k0.y, k1.x - k0.x, k1.y - k0.y));
-    if (o.lidAngleDeg > 1) {  // the lid is hinged on the bass side and opens toward the treble
+    if (o.lid_angle_deg > 1) {  // the lid is hinged on the bass side and opens toward the treble
         [[NSColor colorWithWhite:1 alpha:0.8] setStroke];
         NSBezierPath* hinge = [NSBezierPath bezierPath];
-        [hinge moveToPoint:[self toView:o.pianoX :o.pianoY]];
-        [hinge lineToPoint:[self toView:o.pianoX :o.pianoY + 1.5]];
+        [hinge moveToPoint:[self toView:o.piano_x :o.piano_y]];
+        [hinge lineToPoint:[self toView:o.piano_x :o.piano_y + 1.5]];
         hinge.lineWidth = 3;
         [hinge stroke];
     }
     // Listener: two ears and the direction faced.
     [[NSColor colorWithRed:0.45 green:0.8 blue:1 alpha:1] setFill];
     for (int e = 0; e < 2; e++) {
-        NSPoint q = [self toView:o.pianoX + gEngine.design.ears[e].x :o.pianoY + gEngine.design.ears[e].y];
+        NSPoint q = [self toView:o.piano_x + gEngine.ears[e].x :o.piano_y + gEngine.ears[e].y];
         [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(q.x - 4, q.y - 4, 8, 8)] fill];
     }
-    NSPoint h = [self toView:o.listenerX :o.listenerY], c = [self toView:o.pianoX + 0.7 :o.pianoY + 0.6];
+    NSPoint h = [self toView:o.listener_x :o.listener_y], c = [self toView:o.piano_x + 0.7 :o.piano_y + 0.6];
     CGFloat len = hypot(c.x - h.x, c.y - h.y);
     if (len > 1) {
         [[NSColor colorWithRed:0.45 green:0.8 blue:1 alpha:0.7] setStroke];
@@ -508,28 +508,28 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
         [look stroke];
     }
     NSDictionary* small = @{NSFontAttributeName: [NSFont systemFontOfSize:10.5], NSForegroundColorAttributeName: [NSColor colorWithWhite:0.7 alpha:1]};
-    double dist = hypot(o.listenerX - (o.pianoX + 0.7), o.listenerY - (o.pianoY + 0.6));
-    [[NSString stringWithFormat:@"Drag the piano or the listener.   %.1f x %.1f m   listener %.1f m from the board", o.roomLx, o.roomLy, dist]
+    double dist = hypot(o.listener_x - (o.piano_x + 0.7), o.listener_y - (o.piano_y + 0.6));
+    [[NSString stringWithFormat:@"Drag the piano or the listener.   %.1f x %.1f m   listener %.1f m from the board", o.room_lx, o.room_ly, dist]
         drawAtPoint:NSMakePoint(6, 4) withAttributes:small];
 }
 - (void)mouseDown:(NSEvent*)e {
     const GrandOptions& o = gEngine.voicing;
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
-    NSPoint h = [self toView:o.listenerX :o.listenerY];
-    NSPoint pa = [self toView:o.pianoX :o.pianoY - 0.2], pb = [self toView:o.pianoX + 1.4 :o.pianoY + 1.5];
+    NSPoint h = [self toView:o.listener_x :o.listener_y];
+    NSPoint pa = [self toView:o.piano_x :o.piano_y - 0.2], pb = [self toView:o.piano_x + 1.4 :o.piano_y + 1.5];
     _drag = 0;
     if (hypot(p.x - h.x, p.y - h.y) < 16) { _drag = 1; _grab = NSMakePoint(p.x - h.x, p.y - h.y); }
-    else if (p.x >= pa.x && p.x <= pb.x && p.y >= pa.y && p.y <= pb.y) { _drag = 2; NSPoint q = [self toView:o.pianoX :o.pianoY]; _grab = NSMakePoint(p.x - q.x, p.y - q.y); }
+    else if (p.x >= pa.x && p.x <= pb.x && p.y >= pa.y && p.y <= pb.y) { _drag = 2; NSPoint q = [self toView:o.piano_x :o.piano_y]; _grab = NSMakePoint(p.x - q.x, p.y - q.y); }
 }
 - (void)mouseDragged:(NSEvent*)e {
     if (!_drag) return;
     GrandOptions& o = gEngine.voicing;
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
     CGFloat s = [self scale];
-    double x = o.roomLx / 2 + (p.x - _grab.x - self.bounds.size.width / 2) / s, y = o.roomLy / 2 + (p.y - _grab.y - self.bounds.size.height / 2 - 10) / s;
-    if (_drag == 1) { o.listenerX = std::clamp(x, 0.3, o.roomLx - 0.3); o.listenerY = std::clamp(y, 0.3, o.roomLy - 0.3); }
-    else { o.pianoX = std::clamp(x, 0.2, std::max(0.2, o.roomLx - 1.6)); o.pianoY = std::clamp(y, 0.8, std::max(0.8, o.roomLy - 1.7)); }
-    gEngine.design = makeGrand(o);  // only to redraw the ears while dragging; the engine is rebuilt on release
+    double x = o.room_lx / 2 + (p.x - _grab.x - self.bounds.size.width / 2) / s, y = o.room_ly / 2 + (p.y - _grab.y - self.bounds.size.height / 2 - 10) / s;
+    if (_drag == 1) { o.listener_x = std::clamp(x, 0.3, o.room_lx - 0.3); o.listener_y = std::clamp(y, 0.3, o.room_ly - 0.3); }
+    else { o.piano_x = std::clamp(x, 0.2, std::max(0.2, o.room_lx - 1.6)); o.piano_y = std::clamp(y, 0.8, std::max(0.8, o.room_ly - 1.7)); }
+    gEngine.refreshGeometry();  // to redraw the ears while dragging; the engine is rebuilt on release
     self.needsDisplay = YES;
 }
 - (void)mouseUp:(NSEvent*)e {
@@ -626,71 +626,71 @@ struct Knob { int tab; const char* name; double GrandOptions::* field; double lo
 enum { kSpace, kHammers, kStrings, kBoard, kTabCount };
 static const char* kTabNames[] = {"Space", "Hammers", "Strings", "Soundboard"};
 static const Knob kKnobs[] = {
-    {kSpace, "Room length", &GrandOptions::roomLx, 3.0, 30.0, true, "%.1f m", "Along the keyboard direction."},
-    {kSpace, "Room width", &GrandOptions::roomLy, 3.0, 30.0, true, "%.1f m", "Along the strings."},
-    {kSpace, "Room height", &GrandOptions::roomLz, 2.2, 15.0, true, "%.1f m", ""},
-    {kSpace, "Wall absorption", &GrandOptions::roomAbsorption, 0.03, 0.7, true, "%.2f", "Share of sound each surface soaks up. Low is a tiled hall, high is a carpeted studio."},
-    {kSpace, "Ear height", &GrandOptions::earHeightM, 0.6, 2.5, false, "%.2f m", "Above the floor. The soundboard sits at 0.75 m."},
-    {kSpace, "Ear spacing", &GrandOptions::earSpacingM, 0.1, 1.5, false, "%.2f m", "A spaced pair; wider gives a wider image."},
-    {kSpace, "Lid angle", &GrandOptions::lidAngleDeg, 0.0, 60.0, false, "%.0f deg", "0 takes the lid's reflection away."},
-    {kHammers, "Felt hardness", &GrandOptions::hammerHardness, 0.2, 5.0, true, "x %.2f", "Felt stiffness. Harder is brighter."},
-    {kHammers, "Hammer mass", &GrandOptions::hammerMass, 0.5, 2.0, true, "x %.2f", "Heavier stays on the string longer: louder and duller."},
-    {kHammers, "Felt damping", &GrandOptions::feltDamping, 0.0, 5.0, false, "x %.2f", "Energy the felt loses as it is squeezed."},
-    {kHammers, "Strike point", &GrandOptions::strikePosition, 0.5, 1.8, false, "x %.2f", "Distance from the agraffe; the reference is about 1/8 of the string."},
-    {kHammers, "Key knock", &GrandOptions::keyThump, 0.0, 30.0, false, "x %.1f", "Knock of the key landing on the keybed."},
-    {kHammers, "Let-off distance", &GrandOptions::letOffMm, 0.5, 5.0, false, "%.1f mm", "Gap to the string when the hammer is let go. It flies the rest, slowed by gravity."},
-    {kHammers, "Shank springiness", &GrandOptions::shankHz, 80.0, 2000.0, true, "%.0f Hz", "The wooden shank flexes at impact. High is a rigid hammer."},
-    {kHammers, "Damper strength", &GrandOptions::damperStrength, 0.2, 4.0, true, "x %.2f", "How fast a released note is stopped."},
-    {kHammers, "Damper weight", &GrandOptions::damperPressN, 0.0, 0.6, false, "%.2f N", "Force each damper rests on its string with. Lifting it lets the string stir."},
-    {kHammers, "Pedal and key noise", &GrandOptions::mechanismNoise, 0.0, 10.0, false, "x %.1f", "Knocks and friction of the pedal work and returning keys."},
-    {kStrings, "Pitch of A4", &GrandOptions::a4Hz, 415.0, 466.0, false, "%.1f Hz", ""},
-    {kStrings, "Unison detune", &GrandOptions::unisonDetuneCents, 0.0, 6.0, false, "%.2f cents", "Spread between the strings of one note. More gives beating, then honky-tonk."},
-    {kStrings, "Internal loss", &GrandOptions::stringLoss, 0.25, 5.0, true, "x %.2f", "The string's own damping, apart from what the board takes."},
-    {kStrings, "Wire stiffness", &GrandOptions::stringStiffness, 0.25, 4.0, true, "x %.2f", "Bending stiffness. More makes the overtones sharper."},
-    {kStrings, "Downbearing angle", &GrandOptions::downbearingDeg, 0.0, 5.0, false, "%.1f deg", "Bend of the strings over the bridge; sets how hard stretching presses on the board."},
-    {kStrings, "Strike angle", &GrandOptions::hammerTiltDeg, 0.0, 15.0, false, "%.1f deg", "How far off the upright the hammer hits; this is what sets strings moving sideways."},
-    {kBoard, "Thickness", &GrandOptions::boardThicknessMm, 5.0, 13.0, false, "%.1f mm", ""},
-    {kBoard, "Loss factor", &GrandOptions::boardLossPercent, 0.5, 8.0, true, "%.1f %%", "Internal damping of the wood."},
-    {kBoard, "Rib height", &GrandOptions::ribHeightMm, 10.0, 36.0, false, "%.0f mm", ""},
-    {kBoard, "Rib spacing", &GrandOptions::ribSpacingMm, 80.0, 220.0, false, "%.0f mm", ""},
-    {kBoard, "Crown radius", &GrandOptions::crownRadiusM, 6.0, 80.0, true, "%.0f m", "Smaller is a more domed, stiffer board."},
-    {kBoard, "Rim grip", &GrandOptions::rimClamp, 0.0, 1.0, false, "%.2f", "0: edge free to tilt. 1: edge clamped."},
-    {kBoard, "Bridge height", &GrandOptions::bridgeHeightMm, 20.0, 50.0, false, "%.0f mm", ""},
+    {kSpace, "Room length", &GrandOptions::room_lx, 3.0, 30.0, true, "%.1f m", "Along the keyboard direction."},
+    {kSpace, "Room width", &GrandOptions::room_ly, 3.0, 30.0, true, "%.1f m", "Along the strings."},
+    {kSpace, "Room height", &GrandOptions::room_lz, 2.2, 15.0, true, "%.1f m", ""},
+    {kSpace, "Wall absorption", &GrandOptions::room_absorption, 0.03, 0.7, true, "%.2f", "Share of sound each surface soaks up. Low is a tiled hall, high is a carpeted studio."},
+    {kSpace, "Ear height", &GrandOptions::ear_height_m, 0.6, 2.5, false, "%.2f m", "Above the floor. The soundboard sits at 0.75 m."},
+    {kSpace, "Ear spacing", &GrandOptions::ear_spacing_m, 0.1, 1.5, false, "%.2f m", "A spaced pair; wider gives a wider image."},
+    {kSpace, "Lid angle", &GrandOptions::lid_angle_deg, 0.0, 60.0, false, "%.0f deg", "0 takes the lid's reflection away."},
+    {kHammers, "Felt hardness", &GrandOptions::hammer_hardness, 0.2, 5.0, true, "x %.2f", "Felt stiffness. Harder is brighter."},
+    {kHammers, "Hammer mass", &GrandOptions::hammer_mass, 0.5, 2.0, true, "x %.2f", "Heavier stays on the string longer: louder and duller."},
+    {kHammers, "Felt damping", &GrandOptions::felt_damping, 0.0, 5.0, false, "x %.2f", "Energy the felt loses as it is squeezed."},
+    {kHammers, "Strike point", &GrandOptions::strike_position, 0.5, 1.8, false, "x %.2f", "Distance from the agraffe; the reference is about 1/8 of the string."},
+    {kHammers, "Key knock", &GrandOptions::key_thump, 0.0, 30.0, false, "x %.1f", "Knock of the key landing on the keybed."},
+    {kHammers, "Let-off distance", &GrandOptions::let_off_mm, 0.5, 5.0, false, "%.1f mm", "Gap to the string when the hammer is let go. It flies the rest, slowed by gravity."},
+    {kHammers, "Shank springiness", &GrandOptions::shank_hz, 80.0, 2000.0, true, "%.0f Hz", "The wooden shank flexes at impact. High is a rigid hammer."},
+    {kHammers, "Damper strength", &GrandOptions::damper_strength, 0.2, 4.0, true, "x %.2f", "How fast a released note is stopped."},
+    {kHammers, "Damper weight", &GrandOptions::damper_press_n, 0.0, 0.6, false, "%.2f N", "Force each damper rests on its string with. Lifting it lets the string stir."},
+    {kHammers, "Pedal and key noise", &GrandOptions::mechanism_noise, 0.0, 10.0, false, "x %.1f", "Knocks and friction of the pedal work and returning keys."},
+    {kStrings, "Pitch of A4", &GrandOptions::a4_hz, 415.0, 466.0, false, "%.1f Hz", ""},
+    {kStrings, "Unison detune", &GrandOptions::unison_detune_cents, 0.0, 6.0, false, "%.2f cents", "Spread between the strings of one note. More gives beating, then honky-tonk."},
+    {kStrings, "Internal loss", &GrandOptions::string_loss, 0.25, 5.0, true, "x %.2f", "The string's own damping, apart from what the board takes."},
+    {kStrings, "Wire stiffness", &GrandOptions::string_stiffness, 0.25, 4.0, true, "x %.2f", "Bending stiffness. More makes the overtones sharper."},
+    {kStrings, "Downbearing angle", &GrandOptions::downbearing_deg, 0.0, 5.0, false, "%.1f deg", "Bend of the strings over the bridge; sets how hard stretching presses on the board."},
+    {kStrings, "Strike angle", &GrandOptions::hammer_tilt_deg, 0.0, 15.0, false, "%.1f deg", "How far off the upright the hammer hits; this is what sets strings moving sideways."},
+    {kBoard, "Thickness", &GrandOptions::board_thickness_mm, 5.0, 13.0, false, "%.1f mm", ""},
+    {kBoard, "Loss factor", &GrandOptions::board_loss_percent, 0.5, 8.0, true, "%.1f %%", "Internal damping of the wood."},
+    {kBoard, "Rib height", &GrandOptions::rib_height_mm, 10.0, 36.0, false, "%.0f mm", ""},
+    {kBoard, "Rib spacing", &GrandOptions::rib_spacing_mm, 80.0, 220.0, false, "%.0f mm", ""},
+    {kBoard, "Crown radius", &GrandOptions::crown_radius_m, 6.0, 80.0, true, "%.0f m", "Smaller is a more domed, stiffer board."},
+    {kBoard, "Rim grip", &GrandOptions::rim_clamp, 0.0, 1.0, false, "%.2f", "0: edge free to tilt. 1: edge clamped."},
+    {kBoard, "Bridge height", &GrandOptions::bridge_height_mm, 20.0, 50.0, false, "%.0f mm", ""},
 };
 static const int kKnobCount = sizeof(kKnobs) / sizeof(kKnobs[0]);
 // Fields that have no slider but belong to a saved setup.
-static double GrandOptions::* const kPlanFields[] = {&GrandOptions::pianoX, &GrandOptions::pianoY, &GrandOptions::listenerX, &GrandOptions::listenerY};
+static double GrandOptions::* const kPlanFields[] = {&GrandOptions::piano_x, &GrandOptions::piano_y, &GrandOptions::listener_x, &GrandOptions::listener_y};
 static double knobToSlider(const Knob& k, double v) { return k.logScale ? std::log(v / k.lo) / std::log(k.hi / k.lo) : (v - k.lo) / (k.hi - k.lo); }
 static double sliderToKnob(const Knob& k, double t) { return k.logScale ? k.lo * std::pow(k.hi / k.lo, t) : k.lo + t * (k.hi - k.lo); }
 
 struct Toggle { int tab; const char* name; bool GrandOptions::* field; };
 static const Toggle kToggles[] = {
-    {kSpace, "Room (walls, floor, ceiling, reverberation)", &GrandOptions::roomEnabled},
-    {kStrings, "Stretch tuning (octaves tuned by matching overtones)", &GrandOptions::stretchTuning},
+    {kSpace, "Room (walls, floor, ceiling, reverberation)", &GrandOptions::room_enabled},
+    {kStrings, "Stretch tuning (octaves tuned by matching overtones)", &GrandOptions::stretch_tuning},
     {kStrings, "Longitudinal motion (stretching: phantom partials, bass ring)", &GrandOptions::longitudinal},
     {kStrings, "Duplex lengths behind the bridge (treble shimmer)", &GrandOptions::duplex},
-    {kStrings, "Damped strings keep ringing faintly (needed for the pedal stir)", &GrandOptions::dampedStringsRing},
-    {kStrings, "Sideways string motion (of struck strings)", &GrandOptions::twoPolarisations},
-    {kBoard, "Air loading (the air's mass and drag on the board)", &GrandOptions::airLoading},
+    {kStrings, "Damped strings keep ringing faintly (needed for the pedal stir)", &GrandOptions::damped_strings_ring},
+    {kStrings, "Sideways string motion (of struck strings)", &GrandOptions::two_polarisations},
+    {kBoard, "Air loading (the air's mass and drag on the board)", &GrandOptions::air_loading},
 };
 static const int kToggleCount = sizeof(kToggles) / sizeof(kToggles[0]);
 
 struct Preset { const char* name; void (*apply)(GrandOptions&); };
 static const Preset kPresets[] = {
     {"Recital room, listener by the lid", [](GrandOptions& o) { o = GrandOptions(); }},
-    {"At the keyboard", [](GrandOptions& o) { GrandOptions d; o.roomEnabled = true; o.roomLx = d.roomLx; o.roomLy = d.roomLy; o.roomLz = d.roomLz; o.roomAbsorption = d.roomAbsorption;
-                                              o.pianoX = d.pianoX; o.pianoY = d.pianoY; o.listenerX = d.pianoX + 0.70; o.listenerY = d.pianoY - 0.45; o.earHeightM = 1.2; o.earSpacingM = 0.18; }},
-    {"Small studio, close", [](GrandOptions& o) { o.roomEnabled = true; o.roomLx = 5.0; o.roomLy = 4.2; o.roomLz = 2.7; o.roomAbsorption = 0.40; o.pianoX = 1.2; o.pianoY = 1.3;
-                                                   o.listenerX = 3.6; o.listenerY = 1.9; o.earHeightM = 1.3; o.earSpacingM = 0.5; }},
-    {"Concert hall, tenth row", [](GrandOptions& o) { o.roomEnabled = true; o.roomLx = 28; o.roomLy = 18; o.roomLz = 12; o.roomAbsorption = 0.16; o.pianoX = 5.0; o.pianoY = 7.0;
-                                                       o.listenerX = 15.0; o.listenerY = 7.8; o.earHeightM = 1.2; o.earSpacingM = 0.3; }},
-    {"Stone chapel", [](GrandOptions& o) { o.roomEnabled = true; o.roomLx = 16; o.roomLy = 8; o.roomLz = 9; o.roomAbsorption = 0.06; o.pianoX = 4.0; o.pianoY = 2.5;
-                                            o.listenerX = 9.0; o.listenerY = 3.2; o.earHeightM = 1.2; o.earSpacingM = 0.4; }},
-    {"No room (open air), mics over the strings", [](GrandOptions& o) { o.roomEnabled = false; o.lidAngleDeg = 0; o.listenerX = o.pianoX + 0.70; o.listenerY = o.pianoY + 0.50; o.earHeightM = 1.65; o.earSpacingM = 0.7; }},
-    {"Voicing: bright", [](GrandOptions& o) { o.hammerHardness = 2.2; o.feltDamping = 0.6; o.hammerMass = 0.9; }},
-    {"Voicing: mellow", [](GrandOptions& o) { o.hammerHardness = 0.45; o.feltDamping = 1.6; o.hammerMass = 1.1; }},
-    {"Voicing: reference", [](GrandOptions& o) { GrandOptions d; o.hammerHardness = d.hammerHardness; o.feltDamping = d.feltDamping; o.hammerMass = d.hammerMass; o.strikePosition = d.strikePosition; }},
-    {"Honky-tonk tuning", [](GrandOptions& o) { o.unisonDetuneCents = 5.0; }},
+    {"At the keyboard", [](GrandOptions& o) { GrandOptions d; o.room_enabled = true; o.room_lx = d.room_lx; o.room_ly = d.room_ly; o.room_lz = d.room_lz; o.room_absorption = d.room_absorption;
+                                              o.piano_x = d.piano_x; o.piano_y = d.piano_y; o.listener_x = d.piano_x + 0.70; o.listener_y = d.piano_y - 0.45; o.ear_height_m = 1.2; o.ear_spacing_m = 0.18; }},
+    {"Small studio, close", [](GrandOptions& o) { o.room_enabled = true; o.room_lx = 5.0; o.room_ly = 4.2; o.room_lz = 2.7; o.room_absorption = 0.40; o.piano_x = 1.2; o.piano_y = 1.3;
+                                                   o.listener_x = 3.6; o.listener_y = 1.9; o.ear_height_m = 1.3; o.ear_spacing_m = 0.5; }},
+    {"Concert hall, tenth row", [](GrandOptions& o) { o.room_enabled = true; o.room_lx = 28; o.room_ly = 18; o.room_lz = 12; o.room_absorption = 0.16; o.piano_x = 5.0; o.piano_y = 7.0;
+                                                       o.listener_x = 15.0; o.listener_y = 7.8; o.ear_height_m = 1.2; o.ear_spacing_m = 0.3; }},
+    {"Stone chapel", [](GrandOptions& o) { o.room_enabled = true; o.room_lx = 16; o.room_ly = 8; o.room_lz = 9; o.room_absorption = 0.06; o.piano_x = 4.0; o.piano_y = 2.5;
+                                            o.listener_x = 9.0; o.listener_y = 3.2; o.ear_height_m = 1.2; o.ear_spacing_m = 0.4; }},
+    {"No room (open air), mics over the strings", [](GrandOptions& o) { o.room_enabled = false; o.lid_angle_deg = 0; o.listener_x = o.piano_x + 0.70; o.listener_y = o.piano_y + 0.50; o.ear_height_m = 1.65; o.ear_spacing_m = 0.7; }},
+    {"Voicing: bright", [](GrandOptions& o) { o.hammer_hardness = 2.2; o.felt_damping = 0.6; o.hammer_mass = 0.9; }},
+    {"Voicing: mellow", [](GrandOptions& o) { o.hammer_hardness = 0.45; o.felt_damping = 1.6; o.hammer_mass = 1.1; }},
+    {"Voicing: reference", [](GrandOptions& o) { GrandOptions d; o.hammer_hardness = d.hammer_hardness; o.felt_damping = d.felt_damping; o.hammer_mass = d.hammer_mass; o.strike_position = d.strike_position; }},
+    {"Honky-tonk tuning", [](GrandOptions& o) { o.unison_detune_cents = 5.0; }},
 };
 static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
 
@@ -707,11 +707,11 @@ static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
 // Keep the piano and the listener inside the room after any change.
 - (void)fitToRoom {
     GrandOptions& o = gEngine.voicing;
-    o.pianoX = std::clamp(o.pianoX, 0.2, std::max(0.2, o.roomLx - 1.6));
-    o.pianoY = std::clamp(o.pianoY, 0.8, std::max(0.8, o.roomLy - 1.7));
-    o.listenerX = std::clamp(o.listenerX, 0.3, o.roomLx - 0.3);
-    o.listenerY = std::clamp(o.listenerY, 0.3, o.roomLy - 0.3);
-    o.earHeightM = std::min(o.earHeightM, o.roomLz - 0.2);
+    o.piano_x = std::clamp(o.piano_x, 0.2, std::max(0.2, o.room_lx - 1.6));
+    o.piano_y = std::clamp(o.piano_y, 0.8, std::max(0.8, o.room_ly - 1.7));
+    o.listener_x = std::clamp(o.listener_x, 0.3, o.room_lx - 0.3);
+    o.listener_y = std::clamp(o.listener_y, 0.3, o.room_ly - 0.3);
+    o.ear_height_m = std::min(o.ear_height_m, o.room_lz - 0.2);
 }
 
 - (void)applyVoicing {
@@ -973,8 +973,8 @@ static int selfTest(const char* png) {
     BOOL audio = [d openAudio];  // opened but never started, so helpers get the real thread group and nothing sounds
     PianoView* view = [d setUp];  // window is built but never shown
     // Rebuild the engine the way the grid and string controls do.
-    for (double g : {1.0, 1.25, 1.5}) { gEngine.gridScale = g; gEngine.voicing.twoPolarisations = g == 1.25; gEngine.build(); [view rebuildMap]; }
-    gEngine.voicing.twoPolarisations = false;
+    for (double g : {1.0, 1.25, 1.5}) { gEngine.gridScale = g; gEngine.voicing.two_polarisations = g == 1.25; gEngine.build(); [view rebuildMap]; }
+    gEngine.voicing.two_polarisations = false;
     gEngine.build(); [view rebuildMap];
     printf("selftest: engine rebuilt 4 times, audio device %s, thread group %s\n", audio ? "opened" : "unavailable", gEngine.workgroup ? "joined" : "none");
     printf("selftest: %zu demo recordings loaded\n", gEngine.demos.size());
@@ -1016,7 +1016,7 @@ static int selfTest(const char* png) {
 
 // Measures the engine on the real audio thread, with the output forced to silence.
 static int loadTest(int demo, double seconds, double grid, bool sideways) {
-    gEngine.voicing.twoPolarisations = sideways;
+    gEngine.voicing.two_polarisations = sideways;
     [NSApplication sharedApplication];
     AppDelegate* d = [AppDelegate new];
     gEngine.mute = true;

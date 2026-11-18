@@ -9,7 +9,7 @@
 #include <memory>
 #include <pthread.h>
 #include <vector>
-#include "Piano.h"
+#include "Engine.h"
 
 using namespace pp;
 
@@ -67,17 +67,13 @@ OSStatus Close(void* self) { delete (Unit*)self; return noErr; }
 OSStatus Initialize(void* self) {
     Unit* u = (Unit*)self;
     if (u->initialized) return noErr;
-    try {
-        GrandOptions g;
-        PianoOptions o;
-        o.sampleRate = u->sampleRate;
-        o.boardGridScale = 1.5;
-        u->piano = std::make_unique<Piano>(makeGrand(g), o);
-        u->piano->setHelperThreads(3);
-    } catch (...) {
+    GrandOptions g;
+    u->piano = std::make_unique<Piano>(g, u->sampleRate, 1.5);
+    if (!u->piano->ok()) {
         u->piano.reset();
         return kAudioUnitErr_FailedInitialization;
     }
+    u->piano->setHelperThreads(3);
     u->l.assign(u->maxFrames, 0);
     u->r.assign(u->maxFrames, 0);
     u->midi.clear();
