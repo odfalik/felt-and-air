@@ -37,7 +37,10 @@ public:
     // Control. Call from the same thread as process(); none of these allocate.
     void noteOn(int midi, double hammerSpeed);
     void noteOff(int midi);
-    void setSustain(bool down);
+    void setSustain(bool down) { setPedal(down ? 1.0 : 0.0); }
+    // Sustain pedal position, 0 (up) to 1 (down). Between about 0.3 and 0.6 the dampers only
+    // graze the strings (half pedal).
+    void setPedal(double position);
 
     // Renders n stereo frames. Allocation and lock free.
     void process(float* left, float* right, int n);
@@ -134,7 +137,7 @@ private:
     std::vector<StringRT> strings_;
     std::vector<NoteRT> notes_;
     int noteOfMidi_[128];
-    bool sustain_ = false;
+    double pedalDamping_ = 1.0;  // share of full damper strength the pedal position leaves on
 
     // All string nodes. Each string owns N+3 entries: a ghost node, nodes 0..N, a ghost node.
     // The per-step increments are double buffered (vb_ selects the current one).

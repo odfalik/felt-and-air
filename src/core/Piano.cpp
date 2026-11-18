@@ -397,21 +397,25 @@ void Piano::noteOff(int midi) {
     if (ni < 0) return;
     NoteRT& n = notes_[ni];
     n.keyDown = false;
-    if (!sustain_)
-        for (int i = 0; i < n.total; i++) {
-            StringRT& s = strings_[n.first + i];
-            if (s.hasDamper) s.dampTarget = dampMax_;
-        }
+    for (int i = 0; i < n.total; i++) {
+        StringRT& s = strings_[n.first + i];
+        if (s.hasDamper) s.dampTarget = dampMax_ * pedalDamping_;
+    }
 }
 
-void Piano::setSustain(bool down) {
-    sustain_ = down;
+void Piano::setPedal(double position) {
+    // Dampers start to leave the strings around 30 % of the pedal travel and are clear by
+    // 60 %. In between the felt only grazes the string, modelled as a weaker damper.
+    double x = std::clamp((position - 0.30) / 0.30, 0.0, 1.0);
+    double damping = 1.0 - x * x * (3 - 2 * x);
+    if (damping == pedalDamping_) return;
+    pedalDamping_ = damping;
     for (NoteRT& n : notes_)
         for (int i = 0; i < n.total; i++) {
             StringRT& s = strings_[n.first + i];
             if (!s.hasDamper) continue;
-            if (down) { wake(s); s.dampTarget = 0; }
-            else if (!n.keyDown) s.dampTarget = dampMax_;
+            if (damping < 1.0) wake(s);
+            if (!n.keyDown) s.dampTarget = dampMax_ * damping;
         }
 }
 

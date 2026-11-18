@@ -107,7 +107,7 @@ struct Engine {
     void handle(const Event& e) {
         if (e.type == 1) { piano->noteOn(e.a, midiVelocityToHammerSpeed(e.b)); focus = e.a; }
         else if (e.type == 0) piano->noteOff(e.a);
-        else if (e.type == 2) piano->setSustain(e.a != 0);
+        else if (e.type == 2) piano->setPedal(e.a / 127.0);
         else if (e.type == 4 && e.a >= 0 && e.a < (int)demos.size()) { silence(); demoIndex = e.a; demoNext = 0; demoFrame = 0; demoPlaying = e.a; }
         else if (e.type == 5) { silence(); demoIndex = -1; demoPlaying = -1; }
     }
@@ -395,7 +395,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
         case 'x': self.octave = std::min(7, self.octave + 1); break;
         case 'c': self.velocity = std::max(10, self.velocity - 15); break;
         case 'v': self.velocity = std::min(127, self.velocity + 15); break;
-        case ' ': gEngine.uiEvents.push({2, 1, 0}); break;
+        case ' ': gEngine.uiEvents.push({2, 127, 0}); break;
         case '\r': [NSApp sendAction:@selector(toggleAudio:) to:nil from:self]; break;
         default: break;
     }
@@ -536,7 +536,7 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
                 int status = (word >> 20) & 0xF, d1 = (word >> 8) & 0x7F, d2 = word & 0x7F;
                 if (status == 9 && d2 > 0) gEngine.midiEvents.push({1, d1, d2});
                 else if (status == 8 || status == 9) gEngine.midiEvents.push({0, d1, 0});
-                else if (status == 0xB && d1 == 64) gEngine.midiEvents.push({2, d2 >= 64, 0});
+                else if (status == 0xB && d1 == 64) gEngine.midiEvents.push({2, d2, 0});
                 if (status == 8 || status == 9) {
                     BOOL on = status == 9 && d2 > 0;
                     dispatch_async(dispatch_get_main_queue(), ^{ [view midiNote:d1 on:on]; });

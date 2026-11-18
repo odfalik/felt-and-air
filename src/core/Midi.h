@@ -9,7 +9,7 @@
 
 namespace pp {
 
-struct MidiEvent { double seconds; int type, a, b; };  // 1 note on (a note, b velocity), 0 note off, 2 pedal (a = down)
+struct MidiEvent { double seconds; int type, a, b; };  // 1 note on (a note, b velocity), 0 note off, 2 pedal (a = position 0..127)
 
 inline std::vector<MidiEvent> readMidiFile(const std::string& path) {
     std::vector<MidiEvent> out;
@@ -58,7 +58,7 @@ inline std::vector<MidiEvent> readMidiFile(const std::string& path) {
                 if (hi != 0xC0 && hi != 0xD0) b = p < end ? d[p++] : 0;
                 if (hi == 0x90 && b > 0) raw.push_back({tick, 1, a, b});
                 else if (hi == 0x80 || hi == 0x90) raw.push_back({tick, 0, a, 0});
-                else if (hi == 0xB0 && a == 64) raw.push_back({tick, 2, b >= 64, 0});
+                else if (hi == 0xB0 && a == 64) raw.push_back({tick, 2, b, 0});
             }
         }
         p = end;
@@ -71,7 +71,7 @@ inline std::vector<MidiEvent> readMidiFile(const std::string& path) {
         seconds += (double)(r.tick - last) * usPerQuarter * 1e-6 / division;
         last = r.tick;
         if (r.type == 3) { usPerQuarter = r.a; continue; }
-        if (r.type == 2) { if (r.a == pedal) continue; pedal = r.a; }  // keep only the crossings
+        if (r.type == 2) { if (r.a == pedal) continue; pedal = r.a; }
         out.push_back({seconds, r.type, r.a, r.b});
     }
     return out;
