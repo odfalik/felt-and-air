@@ -65,6 +65,10 @@ public:
 
     // r = -(dt^2 K w + dt D v + dt C0 v), the plate's internal force times dt^2. Allocation free.
     void apply(const RealP* w, const RealP* v, RealP* r) const;
+    // The same in two parts, so the bulk can be shared between threads: the uniform stencil
+    // on a range of spans (independent of every other range), then everything else, once.
+    void applyStencil(const RealP* w, const RealP* v, RealP* r, int spanFrom, int spanTo) const;
+    void applyExtras(const RealP* w, RealP* r) const;
     std::vector<double> mass;      // lumped mass per node, kg
     std::vector<double> c0;        // mass proportional damping per node, kg/s
     Csr K;                         // full stiffness, N/m

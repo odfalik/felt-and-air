@@ -462,11 +462,17 @@ void Plate::build(const BoardDesign& board, const std::vector<Attachment>& att, 
     stabilityEstimate = lam;
 }
 
-void Plate::apply(const RealP* __restrict w, const RealP* __restrict v, RealP* __restrict r) const {
+void Plate::apply(const RealP* w, const RealP* v, RealP* r) const {
+    applyStencil(w, v, r, 0, (int)spans.size());
+    applyExtras(w, r);
+}
+
+void Plate::applyStencil(const RealP* __restrict w, const RealP* __restrict v, RealP* __restrict r, int spanFrom, int spanTo) const {
     const int S = stride;
     const RealP a0 = (RealP)a0_, a1x = (RealP)a1x_, a1y = (RealP)a1y_, a2x = (RealP)a2x_, a2y = (RealP)a2y_, a11 = (RealP)a11_;
     const RealP b0 = (RealP)b0_, bx = (RealP)bx_, by = (RealP)by_;
-    for (const Span& sp : spans) {
+    for (int si = spanFrom; si < spanTo; si++) {
+        const Span& sp = spans[si];
         const RealP* __restrict ws = w + sp.start;
         const RealP* __restrict vs = v + sp.start;
         const RealP* __restrict cs = c0dt_.data() + sp.start;
@@ -479,6 +485,9 @@ void Plate::apply(const RealP* __restrict w, const RealP* __restrict v, RealP* _
             rs[t] = -(kw + dv);
         }
     }
+}
+
+void Plate::applyExtras(const RealP* __restrict w, RealP* __restrict r) const {
     const int rows = (int)corrRow_.size();
     for (int i = 0; i < rows; i++) {
         RealP s = 0;

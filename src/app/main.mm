@@ -6,7 +6,9 @@
 #import <CoreMIDI/CoreMIDI.h>
 #include <atomic>
 #include <cmath>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/thread_policy.h>
 #include <os/workgroup.h>
 #include <memory>
 #include <pthread.h>
@@ -102,7 +104,18 @@ struct Engine {
         static thread_local os_workgroup_join_token_s token;
         static thread_local bool joined = false;
         piano->setHelperThreads(
-            3, [wg] { joined = wg && os_workgroup_join(wg, &token) == 0; },
+            3,
+            [wg] {
+                // Same scheduling class as the audio thread: a realtime thread with a stated
+                // period and work share, so it is given a performance core when it is needed.
+                mach_timebase_info_data_t t;
+                mach_timebase_info(&t);
+                auto ticks = [&](double seconds) { return (uint32_t)(seconds * 1e9 * t.denom / t.numer); };
+                thread_time_constraint_policy_data_t pol;
+                pol.period = ticks(0.0029); pol.computation = ticks(0.0012); pol.constraint = ticks(0.0029); pol.preemptible = 1;
+                thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&pol, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+                joined = wg && os_workgroup_join(wg, &token) == 0;
+            },
             [wg] { if (joined) os_workgroup_leave(wg, &token); joined = false; });
         piano->prepareSnapshot(snap);
         piano->prepareSnapshot(snapUI);

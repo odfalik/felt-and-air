@@ -130,7 +130,11 @@ private:
     void housekeeping();
     struct Pool;
     std::unique_ptr<Pool> pool_;
-    std::vector<std::pair<int, int>> chunks_;  // string index ranges of similar size
+    // Units of work that threads can take independently: the radiation task, ranges of
+    // soundboard spans, then ranges of strings. Heavy ones come first.
+    struct Chunk { int kind, from, to; };  // kind 0 radiation, 1 plate spans, 2 strings
+    std::vector<Chunk> chunks_;
+    std::vector<int> phaseChunks_[3];
     void runChunks(int phase);
     void chunkWork(int phase, int chunk);
     template <class T> double uEnd(const StringRT& s, const T* field) const { return s.attached ? s.at.eval(field) : 0.0; }
@@ -150,6 +154,10 @@ private:
     std::vector<RealP> w_, vw_, r_;      // plate displacement, increment, right hand side (grid storage)
 
     Radiation radiation_;
+    // Radiation does not act back on the instrument, so it runs one step behind, alongside
+    // the next step's string work: the sound of step n is computed during step n+1.
+    std::vector<RealP> radIn_;
+    double radL_ = 0, radR_ = 0;
 
     // Decimation when oversampling.
     std::vector<double> fir_, hist_[2];
@@ -162,6 +170,7 @@ private:
     Pulse pulses_[kPulses];
     int pulseCount_ = 0;
     long stepCount_ = 0;
+    int quietChecks_ = 1 << 20;
     int hammerItersMax_ = 0;
     double dampMax_ = 1500.0;
 };
