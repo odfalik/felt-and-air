@@ -27,8 +27,7 @@ public:
     // Reaction of the air on the board, per patch, as dt^2 * force on each node of the patch,
     // from the motion up to the step last passed to step(). Empty when air loading is off.
     const std::vector<RealP>& airForce() const { return airForce_; }
-    const std::vector<int>& patchPtr() const { return patchPtr_; }
-    const std::vector<int>& patchNode() const { return patchNode_; }
+    const std::vector<int>& patchOfGrid() const { return patchOfGrid_; }  // grid storage index -> patch
     int imageCount = 0, patchCount = 0;
 
 private:
@@ -51,9 +50,12 @@ private:
     // acceleration of every other patch. Both faces of the board count.
     bool air_ = false;
     std::vector<RealP> airForce_;
-    std::vector<double> patchVel_, velHist_, accHist_, invCount_;
+    std::vector<int> patchOfGrid_;
+    std::vector<double> patchVel_, invCount_;
+    std::vector<float> velHist_, accHist_;  // [time][patch], small enough to stay in the first-level cache
+    int velMask_ = 0;
     std::vector<int> selfDelay_, mutDelay_, mutSrc_, mutPtr_;
-    std::vector<double> mutGain_;
+    std::vector<float> mutGain_;
     double selfGain_ = 0;
     int histPos_ = 0, histMask_ = 0;
 

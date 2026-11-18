@@ -50,6 +50,8 @@ void Radiation::build(const Plate& P, const PianoDesign& d, double fs) {
         patchNode_.resize(P.n);
         for (int a = 0; a < P.n; a++) patchNode_[fill[patchOf[a]]++] = P.gid[a];
         patchAcc_.assign(patchCount, 0);
+        patchOfGrid_.assign(P.gridSize, 0);
+        for (int a = 0; a < P.n; a++) patchOfGrid_[P.gid[a]] = patchOf[a];
     }
 
     air_ = d.airLoading;
@@ -58,21 +60,21 @@ void Radiation::build(const Plate& P, const PianoDesign& d, double fs) {
         const int np = patchCount;
         airForce_.assign(np, 0);
         patchVel_.assign(np, 0.0); invCount_.resize(np); selfDelay_.resize(np);
-        int far = 1;
+        int far = 1, nearMax = 1;
         mutPtr_.assign(1, 0); mutDelay_.clear(); mutSrc_.clear(); mutGain_.clear();
         for (int p = 0; p < np; p++) {
             int count = patchPtr_[p + 1] - patchPtr_[p];
             invCount_[p] = 1.0 / count;
             double radius = std::sqrt(count * dS / M_PI);
             selfDelay_[p] = std::max(1, (int)std::lround(radius / c * fs));
-            far = std::max(far, selfDelay_[p]);
+            nearMax = std::max(nearMax, selfDelay_[p]);
             for (int q = 0; q < np; q++) {
                 if (q == p) continue;
                 double r = std::hypot(centre[p].x - centre[q].x, centre[p].y - centre[q].y);
                 int dl = std::max(1, (int)std::lround(r / c * fs));
                 mutDelay_.push_back(dl);
                 mutSrc_.push_back(q);
-                mutGain_.push_back(-rho * dS * dS / (M_PI * r));  // both faces; acts on the patch's summed dt^2 * accel
+                mutGain_.push_back((float)(-rho * dS * dS / (M_PI * r)));  // both faces; acts on the patch's summed dt^2 * accel
                 far = std::max(far, dl);
             }
             mutPtr_.push_back((int)mutDelay_.size());
@@ -81,8 +83,11 @@ void Radiation::build(const Plate& P, const PianoDesign& d, double fs) {
         int len = 1;
         while (len < far + 2) len <<= 1;
         histMask_ = len - 1; histPos_ = 0;
-        velHist_.assign((size_t)np * len, 0.0);
-        accHist_.assign((size_t)np * len, 0.0);
+        int vlen = 1;
+        while (vlen < nearMax + 2) vlen <<= 1;
+        velMask_ = vlen - 1;
+        velHist_.assign((size_t)np * vlen, 0.0f);
+        accHist_.assign((size_t)np * len, 0.0f);
     }
 
     int maxDelay = 0;
@@ -245,17 +250,28 @@ void Radiation::step(const RealP* __restrict r, double& left, double& right) {
         total += s0 + s1;
     }
     if (air_) {
-        const int len = histMask_ + 1, now = histPos_;
+        const int now = histPos_;
+        float* __restrict vh = velHist_.data();
+        float* __restrict ah = accHist_.data();
         for (int p = 0; p < np; p++) {
             patchVel_[p] += (double)patchAcc_[p] * invCount_[p];
-            velHist_[(size_t)p * len + now] = patchVel_[p];
-            accHist_[(size_t)p * len + now] = (double)patchAcc_[p];
+            vh[(size_t)(now & velMask_) * np + p] = (float)patchVel_[p];
+            ah[(size_t)now * np + p] = (float)patchAcc_[p];
         }
+        const int* __restrict md = mutDelay_.data();
+        const int* __restrict ms = mutSrc_.data();
+        const float* __restrict mg = mutGain_.data();
         for (int p = 0; p < np; p++) {
-            double f = selfGain_ * (patchVel_[p] - velHist_[(size_t)p * len + ((now - selfDelay_[p]) & histMask_)]);
-            for (int q = mutPtr_[p]; q < mutPtr_[p + 1]; q++)
-                f += mutGain_[q] * accHist_[(size_t)mutSrc_[q] * len + ((now - mutDelay_[q]) & histMask_)];
-            airForce_[p] = (RealP)f;
+            double f = selfGain_ * (patchVel_[p] - (double)vh[(size_t)((now - selfDelay_[p]) & velMask_) * np + p]);
+            float f0 = 0, f1 = 0;
+            int q = mutPtr_[p];
+            const int end = mutPtr_[p + 1];
+            for (; q + 1 < end; q += 2) {
+                f0 += mg[q] * ah[(size_t)((now - md[q]) & histMask_) * np + ms[q]];
+                f1 += mg[q + 1] * ah[(size_t)((now - md[q + 1]) & histMask_) * np + ms[q + 1]];
+            }
+            if (q < end) f0 += mg[q] * ah[(size_t)((now - md[q]) & histMask_) * np + ms[q]];
+            airForce_[p] = (RealP)(f + (double)(f0 + f1));
         }
         histPos_ = (now + 1) & histMask_;
     }

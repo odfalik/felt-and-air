@@ -123,6 +123,16 @@ void Piano::chunkWork(int phase, int index) {
     } else if (c.kind == 1) {
         if (phase == 0) {
             P.applyStencil(w_.data(), vw_.data(), r_.data(), c.from, c.to);
+            // Reaction of the air, as worked out by the radiation task one step ago.
+            if (!airNow_.empty()) {
+                RealP* __restrict r = r_.data();
+                const int* __restrict patch = radiation_.patchOfGrid().data();
+                const RealP* __restrict air = airNow_.data();
+                for (int si = c.from; si < c.to; si++) {
+                    const Plate::Span& sp = P.spans[si];
+                    for (int t = sp.start; t < sp.start + sp.len; t++) r[t] += air[patch[t]];
+                }
+            }
         } else if (phase == 2) {
             RealP* __restrict w = w_.data();
             RealP* __restrict vw = vw_.data();
@@ -280,6 +290,14 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
                 s.lA = sd.EA * k * k / (sd.rhoA * H * H);
                 s.lDamp = 1.0 / (1.0 + 30.0 * k);  // longitudinal modes ring for a few tenths of a second
                 s.lBridge = 2 * std::sin(d.downbearingDeg * M_PI / 180.0);
+                s.lOff = (int)xi_.size();
+                xi_.resize(xi_.size() + StringRT::kLong + 1, 0.0);
+                vxi_.resize(xi_.size(), 0.0);
+            }
+            {
+                const double inv = 1 / (1 + s.s0k);
+                s.cu0 = (RealS)((-2 * s.aT - 6 * s.aB) * inv); s.cu1 = (RealS)((s.aT + 4 * s.aB) * inv); s.cu2 = (RealS)(-s.aB * inv);
+                s.cv0 = (RealS)((1 - s.s0k - 2 * s.aD) * inv); s.cv1 = (RealS)(s.aD * inv);
             }
             s.bridge = sd.bridge;
             s.off = offset + 1;
@@ -367,6 +385,7 @@ Piano::Piano(const PianoDesign& d, const PianoOptions& o) {
     for (size_t i = 0; i < notes_.size(); i++) notes_[i].thumpAt = P.interp(d.notes[i].keyThumpAt);
     pedalAt_ = P.interp({0.70, 0.06});  // the pedal work hangs under the middle of the keybed
     radiation_.build(P, d, fs_);
+    airNow_ = radiation_.airForce();
 
     if (os_ > 1) {  // Kaiser windowed sinc, cutoff at 0.45 of the output rate
         int half = 24 * os_, len = 2 * half + 1;
@@ -407,8 +426,10 @@ void Piano::sleep(StringRT& s) {
     for (auto* a : {&u_, &v_[0], &v_[1]}) std::fill(a->begin() + s.off - 1, a->begin() + s.off + s.N + 2, (RealS)0);
     s.awake = false;
     s.lOn = false; s.lPeak = 0; s.tensionChange = 0;
-    std::fill(s.xi, s.xi + StringRT::kLong + 1, 0.0);
-    std::fill(s.vxi, s.vxi + StringRT::kLong + 1, 0.0);
+    if (s.lCells > 0) {
+        std::fill(&xi_[s.lOff], &xi_[s.lOff] + StringRT::kLong + 1, 0.0);
+        std::fill(&vxi_[s.lOff], &vxi_[s.lOff] + StringRT::kLong + 1, 0.0);
+    }
 }
 
 void Piano::noteOn(int midi, double speed) {
@@ -420,7 +441,7 @@ void Piano::noteOn(int midi, double speed) {
         StringRT& s = strings_[n.first + i];
         wake(s);
         s.dampTarget = s.dampRate = 0;  // the key lifts the damper well before the hammer arrives
-        if (s.lCells > 0) s.lOn = true;
+        if (s.lCells > 0) { s.lOn = true; s.lPeak = 1; }
     }
     if (!(speed > 0)) return;
     knock(n.thumpAt, n.thump * speed, 0.003);
@@ -526,9 +547,7 @@ void Piano::stepString(StringRT& s) {
         double uA = u[N - 1], uB = u[N - 2], vA = v[N - 1];
         s.endForce = s.mNode * (-(s.aT * (uN - uA) + s.aD * (vN - vA)) - s.aB * (uB - 2 * uA + uN));
     }
-    const double inv = 1 / (1 + s.s0k);
-    const RealS cu0 = (RealS)((-2 * s.aT - 6 * s.aB) * inv), cu1 = (RealS)((s.aT + 4 * s.aB) * inv), cu2 = (RealS)(-s.aB * inv);
-    const RealS cv0 = (RealS)((1 - s.s0k - 2 * s.aD) * inv), cv1 = (RealS)(s.aD * inv);
+    const RealS cu0 = s.cu0, cu1 = s.cu1, cu2 = s.cu2, cv0 = s.cv0, cv1 = s.cv1;
     for (int l = 1; l < N; l++)
         vn[l] = cv0 * v[l] + cv1 * (v[l - 1] + v[l + 1]) + cu0 * u[l] + cu1 * (u[l - 1] + u[l + 1]) + cu2 * (u[l - 2] + u[l + 2]);
     vn[0] = 0;
@@ -540,6 +559,8 @@ void Piano::stepString(StringRT& s) {
     s.tensionChange = 0;
     if (s.lOn) {
         const int C = s.lCells, span = s.lSpan;
+        double* __restrict xi = &xi_[s.lOff];
+        double* __restrict vxi = &vxi_[s.lOff];
         const double invh2 = 1.0 / (s.h * s.h);
         double strain[StringRT::kLong];
         double peak = 0;
@@ -548,7 +569,7 @@ void Piano::stepString(StringRT& s) {
             double sq = 0;
             for (int j = l; j < end; j++) { double dq = (double)u[j + 1] - (double)u[j]; sq += dq * dq; }
             double H = (end - l) * s.h;
-            strain[c] = (s.xi[c + 1] - s.xi[c]) / H + 0.5 * sq * invh2 / (end - l);
+            strain[c] = (xi[c + 1] - xi[c]) / H + 0.5 * sq * invh2 / (end - l);
             peak = std::max(peak, std::fabs(strain[c]));
             l = end;
         }
@@ -557,11 +578,16 @@ void Piano::stepString(StringRT& s) {
         for (int c = 1; c < C; c++) {
             double acc = s.lA * H * (strain[c] - strain[c - 1]);
             if (c == C - 1) acc *= lastScale;
-            s.vxi[c] = (s.vxi[c] + acc) * s.lDamp;
-            s.xi[c] += s.vxi[c];
+            vxi[c] = (vxi[c] + acc) * s.lDamp;
+            xi[c] += vxi[c];
         }
         s.tensionChange = s.lEA * strain[C - 1];
         s.lPeak = std::max(peak, 0.999 * s.lPeak);
+        if (s.lPeak < 2e-9) {  // no longer stretching to any effect: stop until it is struck again
+            s.lOn = false;
+            std::fill(xi, xi + StringRT::kLong + 1, 0.0);
+            std::fill(vxi, vxi + StringRT::kLong + 1, 0.0);
+        }
         if (s.attached) s.endForce += k_ * k_ * s.lBridge * s.tensionChange;
     }
 
@@ -747,15 +773,7 @@ void Piano::step(double& pL, double& pR) {
     runChunks(0);  // strings, plate stencil and last step's sound, side by side
     finish(0);
     P.applyExtras(w, r);
-    {   // Reaction of the air, worked out by the radiation task from the motion so far.
-        const std::vector<RealP>& air = radiation_.airForce();
-        const int* __restrict ptr = radiation_.patchPtr().data();
-        const int* __restrict node = radiation_.patchNode().data();
-        for (int p = 0; p < (int)air.size(); p++) {
-            const RealP f = air[p];
-            for (int q = ptr[p]; q < ptr[p + 1]; q++) r[node[q]] += f;
-        }
-    }
+    if (!airNow_.empty()) airNow_ = radiation_.airForce();  // same size: a plain copy, no allocation
     for (int i = 0; i < pulseCount_;) {
         Pulse& pu = pulses_[i];
         double f = pu.peak * std::sin(M_PI * (pu.step + 0.5) / pu.length) * k_ * k_;

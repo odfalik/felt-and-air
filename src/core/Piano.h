@@ -103,6 +103,7 @@ private:
     struct StringRT {
         int note = 0, N = 0, off = 0;
         double h = 0, aT = 0, aB = 0, aD = 0, s0k = 0, mNode = 0, z0 = 0, tension = 0;
+        RealS cu0 = 0, cu1 = 0, cu2 = 0, cv0 = 0, cv1 = 0;  // stencil coefficients of the string update
         double T_h = 0, EI_h3 = 0, damp_h = 0;  // energy coefficients
         bool attached = true, awake = false, hasDamper = false;
         double hamW = 1;   // share of the hammer direction seen by this polarisation
@@ -124,7 +125,7 @@ private:
         int lSpan = 0;             // transverse segments per longitudinal cell
         bool lOn = false;          // only strings that have been struck stretch enough to matter
         double lA = 0, lDamp = 0, lEA = 0, lBridge = 0, lPeak = 0;
-        double xi[kLong + 1] = {0}, vxi[kLong + 1] = {0};
+        int lOff = 0;              // offset into the shared longitudinal state arrays
         double tensionChange = 0;  // at the bridge, N
     };
     struct NoteRT {
@@ -164,6 +165,7 @@ private:
     // All string nodes. Each string owns N+3 entries: a ghost node, nodes 0..N, a ghost node.
     // The per-step increments are double buffered (vb_ selects the current one).
     std::vector<RealS> u_, v_[2];
+    std::vector<double> xi_, vxi_;  // longitudinal displacement and increment, kLong + 1 per stretching string
     int vb_ = 0;
     std::vector<RealP> w_, vw_, r_;      // plate displacement, increment, right hand side (grid storage)
 
@@ -171,6 +173,7 @@ private:
     // Radiation does not act back on the instrument, so it runs one step behind, alongside
     // the next step's string work: the sound of step n is computed during step n+1.
     std::vector<RealP> radIn_;
+    std::vector<RealP> airNow_;  // air reaction per patch being applied this step
     double radL_ = 0, radR_ = 0;
 
     // Decimation when oversampling.
