@@ -10,12 +10,34 @@
 #include <pthread.h>
 #include <vector>
 #include "Engine.h"
+#include "Parameters.h"
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 using namespace pp;
 
 namespace {
 
-const UInt32 kParamVolume = 0;
+// Parameter numbers: 0 is the volume, then the sliders of the shared table, the switches,
+// and the positions of piano and listener on the floor plan.
+const UInt32 kParamVolume = 0, kFirstKnob = 1, kFirstToggle = 100, kFirstPlan = 200;
+const char* const kPlanNames[4] = {"Piano position, along the keyboard", "Piano position, along the strings", "Listener position, along the keyboard", "Listener position, along the strings"};
+
+bool isParameter(UInt32 id) {
+    return id == kParamVolume || (id >= kFirstKnob && id < kFirstKnob + (UInt32)kKnobCount) || (id >= kFirstToggle && id < kFirstToggle + (UInt32)kToggleCount) ||
+           (id >= kFirstPlan && id < kFirstPlan + 4);
+}
+double readOption(const PPOptions& o, UInt32 id) {
+    if (id >= kFirstPlan) return o.*(kPlanFields[id - kFirstPlan]);
+    if (id >= kFirstToggle) return o.*(kToggles[id - kFirstToggle].field) ? 1.0 : 0.0;
+    return o.*(kKnobs[id - kFirstKnob].field);
+}
+void writeOption(PPOptions& o, UInt32 id, double v) {
+    if (id >= kFirstPlan) o.*(kPlanFields[id - kFirstPlan]) = std::fmin(30.0, std::fmax(0.2, v));
+    else if (id >= kFirstToggle) o.*(kToggles[id - kFirstToggle].field) = v >= 0.5;
+    else { const Knob& k = kKnobs[id - kFirstKnob]; o.*(k.field) = std::fmin(k.hi, std::fmax(k.lo, v)); }
+}
 
 struct Listener { AudioUnitPropertyID id; AudioUnitPropertyListenerProc proc; void* user; };
 struct Notify { AURenderCallback proc; void* user; };
@@ -25,6 +47,54 @@ struct Unit {
     AudioComponentPlugInInterface iface;  // must be first
     AudioComponentInstance instance = nullptr;
     std::unique_ptr<Piano> piano;
+    // Changing a parameter means building a new instrument, which takes a fraction of a second.
+    // A worker thread does that; the render thread only swaps pointers.
+    GrandOptions options;
+    std::mutex optionsLock;
+    std::condition_variable optionsChanged;
+    bool dirty = false, quit = false;
+    std::thread builder;
+    std::atomic<Piano*> pending{nullptr}, retired{nullptr};
+
+    Piano* build(const GrandOptions& o) {
+        Piano* p = new Piano(o, sampleRate, 1.5);
+        if (!p->ok()) { delete p; return nullptr; }
+        p->setHelperThreads(3);
+        return p;
+    }
+    void startBuilder() {
+        quit = false;
+        builder = std::thread([this] {
+            std::unique_lock<std::mutex> lk(optionsLock);
+            for (;;) {
+                optionsChanged.wait(lk, [this] { return dirty || quit; });
+                if (quit) return;
+                // Let a burst of changes (a dragged slider) settle into one rebuild.
+                while (optionsChanged.wait_for(lk, std::chrono::milliseconds(150), [this] { return quit; }) == false && dirty) {
+                    dirty = false;
+                    GrandOptions o = options;
+                    lk.unlock();
+                    delete retired.exchange(nullptr);
+                    Piano* fresh = build(o);
+                    delete pending.exchange(fresh);
+                    lk.lock();
+                }
+                if (quit) return;
+            }
+        });
+    }
+    void stopBuilder() {
+        if (!builder.joinable()) return;
+        { std::lock_guard<std::mutex> g(optionsLock); quit = true; }
+        optionsChanged.notify_all();
+        builder.join();
+        delete pending.exchange(nullptr);
+        delete retired.exchange(nullptr);
+    }
+    void optionsTouched() {
+        { std::lock_guard<std::mutex> g(optionsLock); dirty = true; }
+        optionsChanged.notify_all();
+    }
     double sampleRate = 48000;
     UInt32 maxFrames = 1156;
     bool initialized = false;
@@ -62,18 +132,14 @@ struct Unit {
 bool rateSupported(double r) { return r >= 44100.0 && r <= 96000.0; }
 
 OSStatus Open(void* self, AudioComponentInstance inst) { ((Unit*)self)->instance = inst; return noErr; }
-OSStatus Close(void* self) { delete (Unit*)self; return noErr; }
+OSStatus Close(void* self) { ((Unit*)self)->stopBuilder(); delete (Unit*)self; return noErr; }
 
 OSStatus Initialize(void* self) {
     Unit* u = (Unit*)self;
     if (u->initialized) return noErr;
-    GrandOptions g;
-    u->piano = std::make_unique<Piano>(g, u->sampleRate, 1.5);
-    if (!u->piano->ok()) {
-        u->piano.reset();
-        return kAudioUnitErr_FailedInitialization;
-    }
-    u->piano->setHelperThreads(3);
+    u->piano.reset(u->build(u->options));
+    if (!u->piano) return kAudioUnitErr_FailedInitialization;
+    u->startBuilder();
     u->l.assign(u->maxFrames, 0);
     u->r.assign(u->maxFrames, 0);
     u->midi.clear();
@@ -84,6 +150,7 @@ OSStatus Initialize(void* self) {
 
 OSStatus Uninitialize(void* self) {
     Unit* u = (Unit*)self;
+    u->stopBuilder();
     u->piano.reset();
     u->initialized = false;
     return noErr;
@@ -96,8 +163,8 @@ OSStatus Info(Unit* u, AudioUnitPropertyID id, AudioUnitScope scope, AudioUnitEl
     switch (id) {
         case kAudioUnitProperty_ClassInfo: if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope; size = sizeof(CFPropertyListRef); writable = true; return noErr;
         case kAudioUnitProperty_SampleRate: if (scope == kAudioUnitScope_Input) return kAudioUnitErr_InvalidScope; if (elem != 0) return kAudioUnitErr_InvalidElement; size = sizeof(Float64); writable = true; return noErr;
-        case kAudioUnitProperty_ParameterList: size = scope == kAudioUnitScope_Global ? sizeof(AudioUnitParameterID) : 0; return noErr;
-        case kAudioUnitProperty_ParameterInfo: if (scope != kAudioUnitScope_Global || elem != kParamVolume) return kAudioUnitErr_InvalidParameter; size = sizeof(AudioUnitParameterInfo); return noErr;
+        case kAudioUnitProperty_ParameterList: size = scope == kAudioUnitScope_Global ? sizeof(AudioUnitParameterID) * (1 + kKnobCount + kToggleCount + 4) : 0; return noErr;
+        case kAudioUnitProperty_ParameterInfo: if (scope != kAudioUnitScope_Global || !isParameter(elem)) return kAudioUnitErr_InvalidParameter; size = sizeof(AudioUnitParameterInfo); return noErr;
         case kAudioUnitProperty_StreamFormat: if (scope != kAudioUnitScope_Output) return kAudioUnitErr_InvalidScope; if (elem != 0) return kAudioUnitErr_InvalidElement; size = sizeof(AudioStreamBasicDescription); writable = true; return noErr;
         case kAudioUnitProperty_ElementCount: size = sizeof(UInt32); return noErr;
         case kAudioUnitProperty_Latency: if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope; size = sizeof(Float64); return noErr;
@@ -140,22 +207,55 @@ OSStatus GetProperty(void* self, AudioUnitPropertyID id, AudioUnitScope scope, A
             put(CFSTR(kAUPresetSubtypeKey), 'PhPn');
             put(CFSTR(kAUPresetManufacturerKey), 'Odfk');
             CFDictionarySetValue(d, CFSTR(kAUPresetNameKey), u->presetName);
+            // The saved state is the volume followed by the instrument's settings.
+            std::vector<UInt8> blob(sizeof(Float32) + sizeof(PPOptions));
             Float32 vol = u->volume.load();
-            CFDataRef data = CFDataCreate(nullptr, (const UInt8*)&vol, sizeof(vol));
+            memcpy(blob.data(), &vol, sizeof(vol));
+            { std::lock_guard<std::mutex> g(u->optionsLock); memcpy(blob.data() + sizeof(vol), static_cast<PPOptions*>(&u->options), sizeof(PPOptions)); }
+            CFDataRef data = CFDataCreate(nullptr, blob.data(), (CFIndex)blob.size());
             CFDictionarySetValue(d, CFSTR(kAUPresetDataKey), data);
             CFRelease(data);
             *(CFPropertyListRef*)out = d;
             return noErr;
         }
         case kAudioUnitProperty_SampleRate: *(Float64*)out = u->sampleRate; return noErr;
-        case kAudioUnitProperty_ParameterList: if (size) *(AudioUnitParameterID*)out = kParamVolume; return noErr;
+        case kAudioUnitProperty_ParameterList: {
+            if (!size) return noErr;
+            AudioUnitParameterID* ids = (AudioUnitParameterID*)out;
+            *ids++ = kParamVolume;
+            for (int i = 0; i < kKnobCount; i++) *ids++ = kFirstKnob + i;
+            for (int i = 0; i < kToggleCount; i++) *ids++ = kFirstToggle + i;
+            for (int i = 0; i < 4; i++) *ids++ = kFirstPlan + i;
+            return noErr;
+        }
         case kAudioUnitProperty_ParameterInfo: {
             AudioUnitParameterInfo info = {};
-            info.flags = kAudioUnitParameterFlag_IsReadable | kAudioUnitParameterFlag_IsWritable | kAudioUnitParameterFlag_HasCFNameString;
-            info.cfNameString = CFSTR("Volume");
-            strlcpy(info.name, "Volume", sizeof(info.name));
-            info.unit = kAudioUnitParameterUnit_LinearGain;
-            info.minValue = 0; info.maxValue = 3; info.defaultValue = 0.8f;
+            info.flags = kAudioUnitParameterFlag_IsReadable | kAudioUnitParameterFlag_IsWritable | kAudioUnitParameterFlag_HasCFNameString | kAudioUnitParameterFlag_CFNameRelease;
+            const char* name = "Volume";
+            info.unit = kAudioUnitParameterUnit_Generic;
+            GrandOptions reference;
+            if (elem == kParamVolume) {
+                info.unit = kAudioUnitParameterUnit_LinearGain;
+                info.minValue = 0; info.maxValue = 3; info.defaultValue = 0.8f;
+            } else if (elem >= kFirstPlan) {
+                name = kPlanNames[elem - kFirstPlan];
+                info.unit = kAudioUnitParameterUnit_Meters;
+                info.minValue = 0.2f; info.maxValue = 30;
+                info.defaultValue = (float)readOption(reference, elem);
+            } else if (elem >= kFirstToggle) {
+                name = kToggles[elem - kFirstToggle].name;
+                info.unit = kAudioUnitParameterUnit_Boolean;
+                info.minValue = 0; info.maxValue = 1;
+                info.defaultValue = (float)readOption(reference, elem);
+            } else {
+                const Knob& k = kKnobs[elem - kFirstKnob];
+                name = k.name;
+                info.minValue = (float)k.lo; info.maxValue = (float)k.hi;
+                info.defaultValue = (float)readOption(reference, elem);
+                if (k.logScale) info.flags |= kAudioUnitParameterFlag_DisplayLogarithmic;
+            }
+            info.cfNameString = CFStringCreateWithCString(nullptr, name, kCFStringEncodingUTF8);
+            strlcpy(info.name, name, sizeof(info.name));
             *(AudioUnitParameterInfo*)out = info;
             return noErr;
         }
@@ -193,10 +293,15 @@ OSStatus SetProperty(void* self, AudioUnitPropertyID id, AudioUnitScope scope, A
                 !match(CFSTR(kAUPresetManufacturerKey), 'Odfk'))
                 return kAudioUnitErr_InvalidPropertyValue;
             CFDataRef data = (CFDataRef)CFDictionaryGetValue(d, CFSTR(kAUPresetDataKey));
-            if (data && CFGetTypeID(data) == CFDataGetTypeID() && CFDataGetLength(data) == sizeof(Float32)) {
+            if (data && CFGetTypeID(data) == CFDataGetTypeID() && CFDataGetLength(data) == (CFIndex)(sizeof(Float32) + sizeof(PPOptions))) {
                 Float32 vol;
                 CFDataGetBytes(data, CFRangeMake(0, sizeof(vol)), (UInt8*)&vol);
                 u->volume = vol;
+                PPOptions saved;
+                CFDataGetBytes(data, CFRangeMake(sizeof(vol), sizeof(saved)), (UInt8*)&saved);
+                saved.first_key = 1; saved.last_key = 88;
+                { std::lock_guard<std::mutex> g(u->optionsLock); static_cast<PPOptions&>(u->options) = saved; }
+                if (u->initialized) u->optionsTouched();
             }
             return noErr;
         }
@@ -256,14 +361,21 @@ OSStatus RemoveRenderNotify(void* self, AURenderCallback proc, void* user) {
 
 OSStatus GetParameter(void* self, AudioUnitParameterID id, AudioUnitScope scope, AudioUnitElement, AudioUnitParameterValue* out) {
     if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
-    if (id != kParamVolume) return kAudioUnitErr_InvalidParameter;
-    *out = ((Unit*)self)->volume.load();
+    Unit* u = (Unit*)self;
+    if (!isParameter(id)) return kAudioUnitErr_InvalidParameter;
+    if (id == kParamVolume) { *out = u->volume.load(); return noErr; }
+    std::lock_guard<std::mutex> g(u->optionsLock);
+    *out = (AudioUnitParameterValue)readOption(u->options, id);
     return noErr;
 }
 OSStatus SetParameter(void* self, AudioUnitParameterID id, AudioUnitScope scope, AudioUnitElement, AudioUnitParameterValue v, UInt32) {
     if (scope != kAudioUnitScope_Global) return kAudioUnitErr_InvalidScope;
-    if (id != kParamVolume) return kAudioUnitErr_InvalidParameter;
-    ((Unit*)self)->volume = std::fmin(3.0f, std::fmax(0.0f, v));
+    Unit* u = (Unit*)self;
+    if (!isParameter(id)) return kAudioUnitErr_InvalidParameter;
+    if (id == kParamVolume) { u->volume = std::fmin(3.0f, std::fmax(0.0f, v)); return noErr; }
+    // Hosts may call this from the render thread; the lock is held only for a few stores.
+    { std::lock_guard<std::mutex> g(u->optionsLock); writeOption(u->options, id, v); u->dirty = true; }
+    u->optionsChanged.notify_all();
     return noErr;
 }
 OSStatus ScheduleParameters(void* self, const AudioUnitParameterEvent* ev, UInt32 n) {
@@ -301,6 +413,10 @@ OSStatus Render(void* self, AudioUnitRenderActionFlags* ioFlags, const AudioTime
     if (bus != 0) return kAudioUnitErr_InvalidElement;
     if (frames > u->maxFrames) return u->lastError = kAudioUnitErr_TooManyFramesToProcess;
     if (!io || io->mNumberBuffers < 1) return kAudio_ParamError;
+    if (Piano* fresh = u->pending.exchange(nullptr)) {  // a rebuilt instrument is ready: swap it in
+        delete u->retired.exchange(u->piano.release());  // normally empty; the builder frees the old one
+        u->piano.reset(fresh);
+    }
     AudioUnitRenderActionFlags flags = ioFlags ? *ioFlags : 0;
     for (const Notify& nfy : u->notifies) { AudioUnitRenderActionFlags f = flags | kAudioUnitRenderAction_PreRender; nfy.proc(nfy.user, &f, ts, bus, frames, io); }
 

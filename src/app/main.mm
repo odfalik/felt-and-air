@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <vector>
 #include "Engine.h"
+#include "Parameters.h"
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -621,60 +622,6 @@ static bool isBlack(int midi) { int k = midi % 12; return k == 1 || k == 3 || k 
 }
 
 // ---- Instrument window ---------------------------------------------------------------
-// One adjustable quantity of the design. Every one is a physical number.
-struct Knob { int tab; const char* name; double GrandOptions::* field; double lo, hi; bool logScale; const char* format; const char* help; };
-enum { kSpace, kHammers, kStrings, kBoard, kTabCount };
-static const char* kTabNames[] = {"Space", "Hammers", "Strings", "Soundboard"};
-static const Knob kKnobs[] = {
-    {kSpace, "Room length", &GrandOptions::room_lx, 3.0, 30.0, true, "%.1f m", "Along the keyboard direction."},
-    {kSpace, "Room width", &GrandOptions::room_ly, 3.0, 30.0, true, "%.1f m", "Along the strings."},
-    {kSpace, "Room height", &GrandOptions::room_lz, 2.2, 15.0, true, "%.1f m", ""},
-    {kSpace, "Wall absorption", &GrandOptions::room_absorption, 0.03, 0.7, true, "%.2f", "Share of sound each surface soaks up. Low is a tiled hall, high is a carpeted studio."},
-    {kSpace, "Ear height", &GrandOptions::ear_height_m, 0.6, 2.5, false, "%.2f m", "Above the floor. The soundboard sits at 0.75 m."},
-    {kSpace, "Ear spacing", &GrandOptions::ear_spacing_m, 0.1, 1.5, false, "%.2f m", "A spaced pair; wider gives a wider image."},
-    {kSpace, "Lid angle", &GrandOptions::lid_angle_deg, 0.0, 60.0, false, "%.0f deg", "0 takes the lid's reflection away."},
-    {kHammers, "Felt hardness", &GrandOptions::hammer_hardness, 0.2, 5.0, true, "x %.2f", "Felt stiffness. Harder is brighter."},
-    {kHammers, "Hammer mass", &GrandOptions::hammer_mass, 0.5, 2.0, true, "x %.2f", "Heavier stays on the string longer: louder and duller."},
-    {kHammers, "Felt damping", &GrandOptions::felt_damping, 0.0, 5.0, false, "x %.2f", "Energy the felt loses as it is squeezed."},
-    {kHammers, "Strike point", &GrandOptions::strike_position, 0.5, 1.8, false, "x %.2f", "Distance from the agraffe; the reference is about 1/8 of the string."},
-    {kHammers, "Key knock", &GrandOptions::key_thump, 0.0, 30.0, false, "x %.1f", "Knock of the key landing on the keybed."},
-    {kHammers, "Let-off distance", &GrandOptions::let_off_mm, 0.5, 5.0, false, "%.1f mm", "Gap to the string when the hammer is let go. It flies the rest, slowed by gravity."},
-    {kHammers, "Shank springiness", &GrandOptions::shank_hz, 80.0, 2000.0, true, "%.0f Hz", "The wooden shank flexes at impact. High is a rigid hammer."},
-    {kHammers, "Damper strength", &GrandOptions::damper_strength, 0.2, 4.0, true, "x %.2f", "How fast a released note is stopped."},
-    {kHammers, "Damper weight", &GrandOptions::damper_press_n, 0.0, 0.6, false, "%.2f N", "Force each damper rests on its string with. Lifting it lets the string stir."},
-    {kHammers, "Pedal and key noise", &GrandOptions::mechanism_noise, 0.0, 10.0, false, "x %.1f", "Knocks and friction of the pedal work and returning keys."},
-    {kStrings, "Pitch of A4", &GrandOptions::a4_hz, 415.0, 466.0, false, "%.1f Hz", ""},
-    {kStrings, "Unison detune", &GrandOptions::unison_detune_cents, 0.0, 6.0, false, "%.2f cents", "Spread between the strings of one note. More gives beating, then honky-tonk."},
-    {kStrings, "Internal loss", &GrandOptions::string_loss, 0.25, 5.0, true, "x %.2f", "The string's own damping, apart from what the board takes."},
-    {kStrings, "Wire stiffness", &GrandOptions::string_stiffness, 0.25, 4.0, true, "x %.2f", "Bending stiffness. More makes the overtones sharper."},
-    {kStrings, "Downbearing angle", &GrandOptions::downbearing_deg, 0.0, 5.0, false, "%.1f deg", "Bend of the strings over the bridge; sets how hard stretching presses on the board."},
-    {kStrings, "Strike angle", &GrandOptions::hammer_tilt_deg, 0.0, 15.0, false, "%.1f deg", "How far off the upright the hammer hits; this is what sets strings moving sideways."},
-    {kBoard, "Thickness", &GrandOptions::board_thickness_mm, 5.0, 13.0, false, "%.1f mm", ""},
-    {kBoard, "Loss factor", &GrandOptions::board_loss_percent, 0.5, 8.0, true, "%.1f %%", "Internal damping of the wood."},
-    {kBoard, "Rib height", &GrandOptions::rib_height_mm, 10.0, 36.0, false, "%.0f mm", ""},
-    {kBoard, "Rib spacing", &GrandOptions::rib_spacing_mm, 80.0, 220.0, false, "%.0f mm", ""},
-    {kBoard, "Crown radius", &GrandOptions::crown_radius_m, 6.0, 80.0, true, "%.0f m", "Smaller is a more domed, stiffer board."},
-    {kBoard, "Rim grip", &GrandOptions::rim_clamp, 0.0, 1.0, false, "%.2f", "0: edge free to tilt. 1: edge clamped."},
-    {kBoard, "Bridge height", &GrandOptions::bridge_height_mm, 20.0, 50.0, false, "%.0f mm", ""},
-};
-static const int kKnobCount = sizeof(kKnobs) / sizeof(kKnobs[0]);
-// Fields that have no slider but belong to a saved setup.
-static double GrandOptions::* const kPlanFields[] = {&GrandOptions::piano_x, &GrandOptions::piano_y, &GrandOptions::listener_x, &GrandOptions::listener_y};
-static double knobToSlider(const Knob& k, double v) { return k.logScale ? std::log(v / k.lo) / std::log(k.hi / k.lo) : (v - k.lo) / (k.hi - k.lo); }
-static double sliderToKnob(const Knob& k, double t) { return k.logScale ? k.lo * std::pow(k.hi / k.lo, t) : k.lo + t * (k.hi - k.lo); }
-
-struct Toggle { int tab; const char* name; bool GrandOptions::* field; };
-static const Toggle kToggles[] = {
-    {kSpace, "Room (walls, floor, ceiling, reverberation)", &GrandOptions::room_enabled},
-    {kStrings, "Stretch tuning (octaves tuned by matching overtones)", &GrandOptions::stretch_tuning},
-    {kStrings, "Longitudinal motion (stretching: phantom partials, bass ring)", &GrandOptions::longitudinal},
-    {kStrings, "Duplex lengths behind the bridge (treble shimmer)", &GrandOptions::duplex},
-    {kStrings, "Damped strings keep ringing faintly (needed for the pedal stir)", &GrandOptions::damped_strings_ring},
-    {kStrings, "Sideways string motion (of struck strings)", &GrandOptions::two_polarisations},
-    {kBoard, "Air loading (the air's mass and drag on the board)", &GrandOptions::air_loading},
-};
-static const int kToggleCount = sizeof(kToggles) / sizeof(kToggles[0]);
-
 struct Preset { const char* name; void (*apply)(GrandOptions&); };
 static const Preset kPresets[] = {
     {"Recital room, listener by the lid", [](GrandOptions& o) { o = GrandOptions(); }},

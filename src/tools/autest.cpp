@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <dlfcn.h>
+#include <unistd.h>
 #include <vector>
 
 int main(int argc, char** argv) {
@@ -67,6 +68,35 @@ int main(int argc, char** argv) {
     size = sizeof(state);
     check(AudioUnitGetProperty(au, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0, &state, &size) == noErr && state &&
           AudioUnitSetProperty(au, kAudioUnitProperty_ClassInfo, kAudioUnitScope_Global, 0, &state, sizeof(state)) == noErr, "saves and restores its state");
+    UInt32 listSize = 0;
+    AudioUnitGetPropertyInfo(au, kAudioUnitProperty_ParameterList, kAudioUnitScope_Global, 0, &listSize, nullptr);
+    int params = (int)(listSize / sizeof(AudioUnitParameterID));
+    std::vector<AudioUnitParameterID> ids(params);
+    AudioUnitGetProperty(au, kAudioUnitProperty_ParameterList, kAudioUnitScope_Global, 0, ids.data(), &listSize);
+    bool infoOk = params > 30;
+    for (AudioUnitParameterID id : ids) {
+        AudioUnitParameterInfo info = {};
+        UInt32 sz = sizeof(info);
+        infoOk = infoOk && AudioUnitGetProperty(au, kAudioUnitProperty_ParameterInfo, kAudioUnitScope_Global, id, &info, &sz) == noErr && info.maxValue > info.minValue;
+        if (info.cfNameString) CFRelease(info.cfNameString);
+    }
+    std::printf("  %d parameters\n", params);
+    check(infoOk, "every setting of the instrument is a described parameter");
+    // Change one (felt hardness, parameter 8) and give the rebuild time to land.
+    AudioUnitSetParameter(au, 8, kAudioUnitScope_Global, 0, 3.0f, 0);
+    AudioUnitParameterValue back = 0;
+    AudioUnitGetParameter(au, 8, kAudioUnitScope_Global, 0, &back);
+    double after = 0;
+    for (int block = 0; block < 400; block++) {
+        if (block == 300) MusicDeviceMIDIEvent(au, 0x90, 60, 90, 0);
+        io->mBuffers[0] = {1, 512 * 4, l.data()};
+        io->mBuffers[1] = {1, 512 * 4, r.data()};
+        if (block < 300) usleep(2000);
+        AudioUnitRender(au, &flags, &ts, 0, 512, io);
+        ts.mSampleTime += 512;
+        if (block > 300) for (int i = 0; i < 512; i++) after = std::fmax(after, std::fabs(l[i]));
+    }
+    check(back == 3.0f && after > 0.01 && after <= 1.0, "a parameter change rebuilds the instrument and it still plays");
     AudioUnitUninitialize(au);
     AudioComponentInstanceDispose(au);
     std::printf("%s\n", failures ? "FAILED" : "ALL PASSED");
