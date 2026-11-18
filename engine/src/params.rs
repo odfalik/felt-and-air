@@ -134,7 +134,7 @@ pub static PARAMS: &[Param] = &[
     switch!(2, "Stretch tuning (octaves tuned by matching overtones)", stretch_tuning),
     switch!(2, "Longitudinal motion (stretching: phantom partials, bass ring)", longitudinal),
     switch!(2, "Duplex lengths behind the bridge (treble shimmer)", duplex),
-    switch!(2, "Damped strings keep ringing faintly (needed for the pedal stir)", damped_strings_ring),
+    switch!(2, "Damped strings keep ringing faintly (costs as much as holding the pedal)", damped_strings_ring),
     switch!(2, "Sideways string motion (of struck strings)", two_polarisations),
     switch!(3, "Air loading (the air's mass and drag on the board)", air_loading),
     position!("Piano position, along the keyboard", piano_x),

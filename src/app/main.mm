@@ -638,6 +638,8 @@ static const Preset kPresets[] = {
     {"Voicing: mellow", [](GrandOptions& o) { o.hammer_hardness = 0.45; o.felt_damping = 1.6; o.hammer_mass = 1.1; }},
     {"Voicing: reference", [](GrandOptions& o) { GrandOptions d; o.hammer_hardness = d.hammer_hardness; o.felt_damping = d.felt_damping; o.hammer_mass = d.hammer_mass; o.strike_position = d.strike_position; }},
     {"Honky-tonk tuning", [](GrandOptions& o) { o.unison_detune_cents = 5.0; }},
+    {"Light: for a busy machine (no sideways motion, duplex or air loading)", [](GrandOptions& o) { o.two_polarisations = false; o.duplex = false; o.air_loading = false; o.damped_strings_ring = false; }},
+    {"Full: every part of the model on", [](GrandOptions& o) { o.two_polarisations = true; o.duplex = true; o.air_loading = true; o.longitudinal = true; o.damped_strings_ring = true; }},
 };
 static const int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
 

@@ -62,8 +62,7 @@ fn t01_kernel_matches_assembly() {
     let (mut wa, mut va, mut kw, mut dv) = (vec![0.0; pl.n], vec![0.0; pl.n], vec![0.0; pl.n], vec![0.0; pl.n]);
     pl.gather(&w, &mut wa);
     pl.gather(&v, &mut va);
-    let mut scratch = vec![0.0; pl.solve_work_len()];
-    pl.apply(&w, &v, &mut r, &mut scratch);
+    pl.apply(&w, &v, &mut r);
     pl.k.mul(&wa, &mut kw);
     pl.d.mul(&va, &mut dv);
     let k = p.dt();
@@ -588,4 +587,32 @@ fn t15_action() {
         let ms = strike.map_or(f64::NAN, |i| i as f64 / 48.0);
         check!(finite && ms > lo && ms < hi, "hammer let go at {speed:.1} m/s reaches the string after {ms:.2} ms");
     }
+}
+
+#[test]
+fn t16_pedal_stir() {
+    println!("\n16. Pedal: lifting the dampers lets the strings stir");
+    let rms = |p: &mut Piano, steps: usize| {
+        let e: f64 = (0..steps).map(|_| p.step().0.powi(2)).sum();
+        (e / steps as f64).sqrt()
+    };
+    let mut p = Piano::new(&make_grand(&GrandOptions::default()), &options(1)).unwrap();
+    let quiet = rms(&mut p, 24000);
+    let mut e = 0.0;
+    for i in 0..48000 {
+        if i < 5760 && i % 96 == 0 {
+            p.set_pedal(i as f64 / 5760.0); // pedal down over 120 ms
+        }
+        if i == 5760 {
+            p.set_pedal(1.0);
+        }
+        e += p.step().0.powi(2);
+    }
+    let stir = (e / 48000.0f64).sqrt();
+    let mut q = Piano::new(&make_grand(&GrandOptions::default()), &options(1)).unwrap();
+    q.note_on(60, 2.0);
+    let note = rms(&mut q, 48000);
+    let spl = |x: f64| 20.0 * (x / 2e-5).log10();
+    println!("      before: {:.0} dB SPL; pedal going down: {:.0} dB SPL; one mezzo forte C4: {:.0} dB SPL", spl(quiet.max(1e-12)), spl(stir), spl(note));
+    check!(stir > 30.0 * quiet.max(1e-9) && stir < 0.1 * note, "the stir is audible and far below a played note ({:.0} dB under)", spl(note) - spl(stir));
 }

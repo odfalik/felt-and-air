@@ -385,7 +385,7 @@ impl Default for GrandOptions {
             longitudinal: true,
             air_loading: true,
             duplex: true,
-            damped_strings_ring: true,
+            damped_strings_ring: false,
             two_polarisations: true,
             room_enabled: true,
         }

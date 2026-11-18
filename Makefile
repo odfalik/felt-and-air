@@ -6,7 +6,7 @@ ENGINE   := engine/target/release/libpiano_engine.a
 APP      := build/PhysicalPiano.app
 AU       := build/PhysicalPiano.component
 
-.PHONY: all engine test app au clap install-au install-clap clean
+.PHONY: all engine test app au clap vst3 install-au install-clap clean
 all: engine app au clap build/autest build/claptest build/metalbench
 
 # cargo decides what is out of date.
@@ -50,6 +50,16 @@ clap:
 	cp plugin/Info.plist $(CLAP)/Contents/Info.plist
 	cp plugin/target/release/libphysical_piano_plugin.dylib $(CLAP)/Contents/MacOS/PhysicalPiano
 	codesign --force --sign - $(CLAP) >/dev/null 2>&1 || true
+# VST3: same crate with the vst3 feature. Its bindings (vst3-sys) are GPLv3, so a binary
+# built this way must be distributed under the GPL. Not built by default and not host-tested.
+VST3 := build/PhysicalPiano.vst3
+vst3:
+	cd plugin && cargo build --release --features vst3
+	@mkdir -p $(VST3)/Contents/MacOS
+	cp plugin/Info.plist $(VST3)/Contents/Info.plist
+	printf 'BNDL????' > $(VST3)/Contents/PkgInfo
+	cp plugin/target/release/libphysical_piano_plugin.dylib $(VST3)/Contents/MacOS/PhysicalPiano
+	codesign --force --sign - $(VST3) >/dev/null 2>&1 || true
 install-clap: clap
 	mkdir -p "$(HOME)/Library/Audio/Plug-Ins/CLAP"
 	rm -rf "$(HOME)/Library/Audio/Plug-Ins/CLAP/PhysicalPiano.clap"

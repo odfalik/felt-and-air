@@ -265,6 +265,9 @@ impl Triplets {
     }
 }
 
+/// Longest rib run `apply_local` can hold on its stack.
+const RIB_SCRATCH: usize = 1024;
+
 /// The 13 point plate stencil on w and its 5 point damping twin on v, for one span.
 #[inline]
 fn span_kernel(w: &[f64], v: &[f64], c0: &[f64], rs: &mut [f64], start: usize, s: usize, c: &[f64; 9]) {
@@ -427,6 +430,9 @@ impl Plate {
         if p.stability_bound >= 4.0 {
             return Err("plate grid failed the stability bound".into());
         }
+        if p.longest_rib + 2 > RIB_SCRATCH {
+            return Err("a rib is longer than the kernel allows for".into());
+        }
         p.factor(dt)?;
         Ok(p)
     }
@@ -511,9 +517,9 @@ impl Plate {
         self.corr_col.len()
     }
 
-    /// Scratch space `solve_stiff` and `apply_extras` need, so that they allocate nothing.
+    /// Scratch space `solve_stiff` needs, so that it allocates nothing.
     pub fn solve_work_len(&self) -> usize {
-        (self.slots + self.core_n).max(self.longest_rib + 2)
+        self.slots + self.core_n
     }
 
     fn build(&mut self, board: &BoardDesign, att: &[Attachment], dt: f64) {
@@ -823,7 +829,10 @@ impl Plate {
             self.corr_col.clear();
             self.corr_val.clear();
             let mut acc: BTreeMap<usize, f64> = BTreeMap::new();
-            for a in 0..n {
+            // In storage order, so that a range of spans owns a contiguous range of rows.
+            let mut by_storage: Vec<usize> = (0..n).collect();
+            by_storage.sort_by_key(|&a| self.gid[a]);
+            for a in by_storage {
                 acc.clear();
                 for p in kp.row_ptr[a]..kp.row_ptr[a + 1] {
                     *acc.entry(kp.col[p]).or_insert(0.0) += dt * dt * kp.val[p];
@@ -926,10 +935,13 @@ impl Plate {
     }
 
     /// r = -(dt^2 K w + dt D v + dt C0 v), the plate's internal force times dt^2.
-    pub fn apply(&self, w: &[f64], v: &[f64], r: &mut [f64], scratch: &mut [f64]) {
+    pub fn apply(&self, w: &[f64], v: &[f64], r: &mut [f64]) {
         assert!(w.len() == self.grid_size && v.len() == self.grid_size && r.len() == self.grid_size);
-        unsafe { self.apply_stencil(w.as_ptr(), v.as_ptr(), r.as_mut_ptr(), 0, self.spans.len()) };
-        self.apply_extras(w, r, scratch);
+        unsafe {
+            self.apply_stencil(w.as_ptr(), v.as_ptr(), r.as_mut_ptr(), 0, self.spans.len());
+            self.apply_local(w.as_ptr(), r.as_mut_ptr(), 0, self.spans.len());
+        }
+        self.apply_bridges(w, r);
     }
 
     /// The uniform stencil on a range of spans. Ranges are independent of each other, so
@@ -949,18 +961,30 @@ impl Plate {
         }
     }
 
-    /// Everything the uniform stencil leaves out: the rim correction, ribs and bridges.
-    pub fn apply_extras(&self, w: &[f64], r: &mut [f64], scratch: &mut [f64]) {
-        for i in 0..self.corr_row.len() {
+    /// The rim correction and the ribs, for the nodes of a range of spans. Like the stencil,
+    /// ranges are independent of each other. Call after `apply_stencil` for the same range.
+    ///
+    /// # Safety
+    /// As for `apply_stencil`.
+    pub unsafe fn apply_local(&self, w: *const f64, r: *mut f64, span_from: usize, span_to: usize) {
+        if span_from >= span_to {
+            return;
+        }
+        let w = std::slice::from_raw_parts(w, self.grid_size);
+        let lo = self.spans[span_from].start;
+        let hi = self.spans[span_to - 1].start + self.spans[span_to - 1].len;
+        let rows = self.corr_row.partition_point(|&g| g < lo)..self.corr_row.partition_point(|&g| g < hi);
+        for i in rows {
             let mut s = 0.0;
             for p in self.corr_ptr[i]..self.corr_ptr[i + 1] {
                 s += self.corr_val[p] * w[self.corr_col[p]];
             }
-            r[self.corr_row[i]] -= s;
+            *r.add(self.corr_row[i]) -= s;
         }
         // Ribs: bending moment along the run, then its second difference.
-        let m = &mut scratch[..self.longest_rib + 2];
-        for run in &self.rib_runs {
+        let mut m = [0.0f64; RIB_SCRATCH];
+        let runs = self.rib_runs.partition_point(|run| run.start < lo)..self.rib_runs.partition_point(|run| run.start < hi);
+        for run in &self.rib_runs[runs] {
             let ws = &w[run.start - 1..run.start + run.len + 1];
             let cf = &self.rib_coef[run.coef + 1..run.coef + 1 + run.len];
             m[0] = 0.0;
@@ -968,11 +992,15 @@ impl Plate {
                 m[t + 1] = cf[t] * (ws[t] - 2.0 * ws[t + 1] + ws[t + 2]);
             }
             m[run.len + 1] = 0.0;
-            let rs = &mut r[run.start..run.start + run.len];
+            let rs = std::slice::from_raw_parts_mut(r.add(run.start), run.len);
             for t in 0..run.len {
                 rs[t] -= m[t] - 2.0 * m[t + 1] + m[t + 2];
             }
         }
+    }
+
+    /// The bridges, which tie nodes of different spans together and so run on one thread.
+    pub fn apply_bridges(&self, w: &[f64], r: &mut [f64]) {
         for b in &self.beams {
             let mut s = 0.0;
             for q in 0..12 {

@@ -230,8 +230,8 @@ struct Shared {
     // Threads working on strings and the thread working on the board then exchange a handful
     // of cache lines instead of one or two per string.
     end_live: Buf<bool>,
-    end_u: Buf<f64>,
-    end_v: Buf<f64>,
+    /// How each string's end follows the board (never changes).
+    end_at: Vec<Coupling>,
     end_force: Buf<f64>,
     // Plate displacement, increment, right hand side (grid storage).
     w: Buf<f64>,
@@ -294,6 +294,7 @@ impl Shared {
                 if phase == 0 {
                     let p = &self.plate;
                     p.apply_stencil(self.w.ptr(), self.vw.ptr(), self.r.ptr(), from, to);
+                    p.apply_local(self.w.ptr(), self.r.ptr(), from, to);
                     // Reaction of the air, as worked out by the radiation task one step ago.
                     if self.air_now.len > 0 {
                         let r = self.r.ptr();
@@ -346,8 +347,13 @@ impl Shared {
         let n = s.n;
         let k = self.k;
         let vb = self.vb.load(Ordering::Relaxed) as usize;
-        let u_n = *self.end_u.ptr().add(index);
-        let v_n = *self.end_v.ptr().add(index);
+        // Where the board has carried this string's end. The plate is only read in this phase.
+        let at = &self.end_at[index];
+        let (mut u_n, mut v_n) = (0.0, 0.0);
+        for q in 0..at.n {
+            u_n += at.w[q] * *self.w.ptr().add(at.idx[q]);
+            v_n += at.w[q] * *self.vw.ptr().add(at.idx[q]);
+        }
         let end_force = self.end_force.ptr().add(index);
 
         if !s.awake {
@@ -553,8 +559,6 @@ pub struct Piano {
     step_count: u64,
     quiet_checks: u32,
     hammer_iters_max: usize,
-    /// How each string's end follows the board (never changes).
-    end_at: Vec<Coupling>,
 }
 
 impl Piano {
@@ -767,6 +771,7 @@ impl Piano {
                     t.ham_w = nd.hammer_tilt.sin();
                     t.sideways = true;
                     t.l_cells = 0; // stretching is computed once, on the upright motion
+                    t.press_k = 0.0; // the damper rests on the string from above, not from the side
                     t.off = offset + 1;
                     offset += t.n + 3;
                     strings.push(t);
@@ -935,8 +940,7 @@ impl Piano {
             xi: Buf::from_vec(vec![0.0; xi_len]),
             vxi: Buf::from_vec(vec![0.0; xi_len]),
             end_live: Buf::from_vec(end_live),
-            end_u: Buf::from_vec(vec![0.0; ns]),
-            end_v: Buf::from_vec(vec![0.0; ns]),
+            end_at,
             end_force: Buf::from_vec(vec![0.0; ns]),
             w: Buf::from_vec(vec![0.0; grid]),
             vw: Buf::from_vec(vec![0.0; grid]),
@@ -987,7 +991,6 @@ impl Piano {
             step_count: 0,
             quiet_checks: 1 << 20,
             hammer_iters_max: 0,
-            end_at,
         };
         piano.sh.active.store(false, Ordering::Relaxed);
         Ok(piano)
@@ -1055,12 +1058,39 @@ impl Piano {
         }
         // Start from the static shape for the current bridge position, so waking is silent.
         let (w, vw) = unsafe { (self.sh.w.all(), self.sh.vw.all()) };
-        let (u_n, v_n) = if s.attached { (self.end_at[index].eval(w), self.end_at[index].eval(vw)) } else { (0.0, 0.0) };
+        let (u_n, v_n) = if s.attached { (self.sh.end_at[index].eval(w), self.sh.end_at[index].eval(vw)) } else { (0.0, 0.0) };
         let u = self.nodes(&self.sh.u, s);
         let v = self.nodes(&self.sh.v[self.vb()], s);
         for l in 0..=s.n {
             u[l] = u_n * l as f64 / s.n as f64;
             v[l] = v_n * l as f64 / s.n as f64;
+        }
+        // A sleeping string lies under its damper, pressed slightly out of line. Wake it in that
+        // shape (the string's tension against the damper's weight, solved along the string), so
+        // that lifting the damper lets it go.
+        let press = s.press_k * s.damp_rate / self.sh.damp_max;
+        if press > 0.0 && s.n > 2 {
+            let scratch = self.nodes(&self.sh.v[self.vb() ^ 1], s); // overwritten by the next step anyway
+            // a_t (-d[l-1] + 2 d[l] - d[l+1]) = -press on the damper's nodes, d = 0 at both ends.
+            let load = |l: usize| if l >= s.dmp0 && l < s.dmp1 { -press / s.a_t } else { 0.0 };
+            let mut prev_c = 0.0;
+            let mut prev_d = 0.0;
+            for l in 1..s.n {
+                let denom = 2.0 + prev_c;
+                prev_c = -1.0 / denom;
+                prev_d = (load(l) + prev_d) / denom;
+                scratch[l] = prev_c;
+                u[l] += prev_d; // the forward-swept right hand side, corrected below
+            }
+            // Back substitution on the deflection alone: keep it apart from the straight line.
+            let mut d_next = 0.0;
+            for l in (1..s.n).rev() {
+                let line = u_n * l as f64 / s.n as f64;
+                let d = (u[l] - line) - scratch[l] * d_next;
+                u[l] = line + d;
+                d_next = d;
+            }
+            scratch[..=s.n].fill(0.0);
         }
         s.awake = true;
         unsafe { *self.sh.end_live.at(index) = true };
@@ -1522,8 +1552,12 @@ impl Piano {
             if s.damped_steps < settle {
                 continue;
             }
-            s.end_peak = end.abs().max(0.97 * s.end_peak);
-            if deviation(u) < 1e-8 + 3.0 * s.end_peak && !self.never_sleep {
+            // Under its damper the string rests bent, so judge by motion, not by shape.
+            let v = self.nodes(&self.sh.v[self.vb()], s);
+            let v_end = v[s.n];
+            s.end_peak = v_end.abs().max(0.97 * s.end_peak);
+            let moving = (1..s.n).map(|l| (v[l] - v_end * l as f64 / s.n as f64).abs()).fold(0.0f64, f64::max);
+            if moving < 1e-6 * self.k + 3.0 * s.end_peak && !self.never_sleep {
                 self.sleep(i);
             }
         }
@@ -1573,7 +1607,7 @@ impl Piano {
         finish(0);
         // From here to the next post only this thread touches the shared state.
         let (r, w, vw) = unsafe { (sh.r.all_mut(), sh.w.all_mut(), sh.vw.all_mut()) };
-        sh.plate.apply_extras(w, r, &mut self.solve_work);
+        sh.plate.apply_bridges(w, r);
         if sh.air_now.len > 0 {
             // same size: a plain copy, no allocation
             unsafe { sh.air_now.all_mut().copy_from_slice(sh.radiation.get().air_force()) };
@@ -1614,7 +1648,7 @@ impl Piano {
                 if f == 0.0 {
                     continue;
                 }
-                let at = &self.end_at[i];
+                let at = &self.sh.end_at[i];
                 for q in 0..at.n {
                     r[at.idx[q]] += at.w[q] * f;
                 }
@@ -1634,29 +1668,12 @@ impl Piano {
         sh.plate.solve_stiff(r, &mut self.solve_work);
         finish(1);
         {
-            // Advance the plate, keep what radiates for the next step's radiation task, and read
-            // off where every string's end now is.
+            // Advance the plate and keep what radiates for the next step's radiation task.
             let keep = unsafe { sh.rad_in.all_mut() };
             let scale = sh.plate.diag_scale();
             for sp in &sh.plate.spans {
                 let range = sp.start..sp.start + sp.len;
                 plate_advance(&r[range.clone()], &scale[range.clone()], &mut vw[range.clone()], &mut w[range.clone()], &mut keep[range]);
-            }
-            let (live, eu, ev) = unsafe { (sh.end_live.all(), sh.end_u.all_mut(), sh.end_v.all_mut()) };
-            for i in 0..live.len() {
-                if !live[i] {
-                    continue;
-                }
-                let at = &self.end_at[i];
-                let (mut su, mut sv) = (0.0, 0.0);
-                for q in 0..at.n {
-                    unsafe {
-                        su += at.w[q] * *w.get_unchecked(at.idx[q]);
-                        sv += at.w[q] * *vw.get_unchecked(at.idx[q]);
-                    }
-                }
-                eu[i] = su;
-                ev[i] = sv;
             }
         }
         let out = unsafe { *sh.rad_out.get() };
@@ -1789,8 +1806,8 @@ impl Piano {
                 x[l] = 2.0 * u[l] - vv[l];
             }
             if s.attached {
-                vv[n] = self.end_at[i].eval(vw);
-                x[n] = self.end_at[i].eval(&xg);
+                vv[n] = self.sh.end_at[i].eval(vw);
+                x[n] = self.sh.end_at[i].eval(&xg);
             }
             let v2 = |y: &[f64]| {
                 let mut e = 0.0;
