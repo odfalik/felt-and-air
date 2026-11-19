@@ -125,11 +125,3 @@ FELT_AND_AIR_DEMOS="$PWD/demos" build/FeltAndAir.app/Contents/MacOS/FeltAndAir
 ```
 
 Finder launches use the per-user directory unless their environment supplies the override.
-
-## Licence
-
-Original project source: MIT. Dependencies, Rust runtime components, and bundled fonts retain
-their own licences; a GUI binary is not an MIT-only distribution. See the VST3 note above and
-[release licence/source requirements](docs/RELEASING.md#assets-and-licenses).
-The demo recordings fetched by `tools/fetch_demos.py` are not part of this repository and
-carry their own licence (CC BY-NC-SA 4.0).

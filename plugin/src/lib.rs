@@ -491,7 +491,7 @@ impl PhysicalPiano {
 impl Plugin for PhysicalPiano {
     const NAME: &'static str = "Felt & Air";
     const VENDOR: &'static str = "odfalik";
-    const URL: &'static str = "https://github.com/odfalik/physical-piano";
+    const URL: &'static str = "https://github.com/odfalik/felt-and-air";
     const EMAIL: &'static str = "";
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
     const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
