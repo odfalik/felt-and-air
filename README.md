@@ -80,8 +80,10 @@ make vst3            # VST3 bundle in build/ (see the licence note below)
 Every physical setting is a host parameter in both plug-ins; changing one rebuilds the
 instrument in the background. CLAP and VST3 have the integrated egui editor; the Audio Unit
 uses its host's generic parameter controls. CLAP/VST3 also expose board grid as a parameter.
-Release builds explicitly disable symbol stripping because Rust 1.85's debuginfo stripping
-can produce a Mach-O string table that macOS 27's dynamic loader rejects.
+Rust's built-in symbol stripping is disabled because its 1.85 implementation can produce a
+Mach-O string table that macOS 27 rejects. Release packaging uses Apple's Xcode `strip -S`
+for linker debug maps instead, verifies code-section bytes remain unchanged, preserves host
+exports, and checks offline AU/CLAP loading after processing.
 
 The pinned `vst3-sys` bindings grant GPLv3-or-later. The original project sources remain
 MIT; a combined VST3 binary is distributed on GPLv3-compatible terms, with matching source

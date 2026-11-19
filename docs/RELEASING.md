@@ -51,8 +51,9 @@ Release choices are explicit:
 - C++ `-arch arm64 -mcpu=apple-m1 -mmacosx-version-min=13.0` passed on the **make command line**.
 - Build children receive only a small parent environment allowlist, not credential/token variables, wrappers, encoded Rust flags, target-specific flags, jobservers, or remote caches. Native Cargo build scripts receive explicit Xcode `CC`/`CXX`, M1/minimum-13/path-remapping `CFLAGS`/`CXXFLAGS` too; Makefile C++ flags are also overridden on its command line.
 - Checkout, output/temp, Cargo home, Rustup home, and home diagnostic prefixes are remapped to placeholders.
+- Apple Xcode `strip -S` removes absolute linker `N_OSO` debug-map paths, including prebuilt runtime object paths that Rust remapping cannot rewrite. Every actual `__TEXT` section is byte-hashed before/after stripping and final postprocessing. This is not Rust 1.85's broken built-in stripping path; exports are retained.
 - Rust cdylib `LC_ID_DYLIB` build paths are normalized before final signing.
-- The full `make test` gate runs offline, followed by distinct app, CLAP, and VST3 builds. AU is built/tested by that gate.
+- The full `make test` gate runs offline, followed by distinct app, CLAP, and VST3 builds. AU is built/tested by that gate. Offline AU/CLAP hosts also load the delivered stripped/signed copies, not only the unprocessed build outputs.
 - Every Mach-O inside each bundle is checked for arm64, macOS platform and numeric deployment version exactly `(13, 0, 0)`, system-only imports, unexpected runtime search paths, and remaining private build/home prefixes, including Cargo/Rustup homes outside `HOME`.
 - Format exports are checked: VST3 factory present; CLAP entry present with no VST3 factory; current AU factory present with no obsolete factory. These sanity gates do not certify real-host compatibility.
 - The final signed asset tree, resources, install instructions and provenance are byte-scanned for actual private prefixes before ZIP creation; source-owned metadata is also checked. The owner's full native/source audit remains separate.

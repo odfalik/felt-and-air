@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import stat
+import struct
 import subprocess
 import tarfile
 import tempfile
@@ -479,6 +480,29 @@ def prepare(args, root, output):
     print(f"Prepared {packed.name}; extracted offline metadata passed. Build verification NOT RUN.")
 
 
+def text_sections_digest(binary):
+    """Hash actual __TEXT sections, excluding mutable Mach-O load-command headers."""
+    data = binary.read_bytes()
+    assert data[:4] == bytes.fromhex("cffaedfe"), "expected little-endian 64-bit Mach-O"
+    digest, count, offset = hashlib.sha256(), 0, 32
+    for _ in range(struct.unpack_from("<I", data, 16)[0]):
+        command, length = struct.unpack_from("<II", data, offset)
+        assert length >= 8 and offset + length <= len(data)
+        if command == 0x19 and data[offset + 8:offset + 24].rstrip(b"\0") == b"__TEXT":
+            for i in range(struct.unpack_from("<I", data, offset + 64)[0]):
+                section = offset + 72 + i * 80
+                size = struct.unpack_from("<Q", data, section + 40)[0]
+                start = struct.unpack_from("<I", data, section + 48)[0]
+                assert start + size <= len(data)
+                digest.update(data[section:section + 16])
+                digest.update(struct.pack("<Q", size))
+                digest.update(data[start:start + size])
+                count += 1
+        offset += length
+    assert count, "no __TEXT sections"
+    return digest.hexdigest()
+
+
 def audit_bundle(bundle, env, log, private_prefixes, version, build_number):
     plist = plistlib.loads((bundle / "Contents/Info.plist").read_bytes())
     assert check_bundle_version(plist, version) == build_number, "delivered build number differs from source"
@@ -494,8 +518,15 @@ def audit_bundle(bundle, env, log, private_prefixes, version, build_number):
                     binaries.append(f)
     assert main in binaries, "missing bundle executable"
     result = []
+    strip = run(["xcrun", "--sdk", "macosx", "--find", "strip"], bundle.parent, env).strip()
     for binary in binaries:
         assert run(["lipo", "-archs", str(binary)], bundle.parent, env).strip() == "arm64"
+        text = text_sections_digest(binary)
+        # Apple's linker adds absolute N_OSO debug-map paths (including prebuilt
+        # runtime objects). Rust remapping cannot remove those. Do NOT enable the
+        # broken Rust 1.85 strip path: use Xcode's tool, preserving every code section.
+        run([strip, "-S", str(binary)], bundle.parent, env, log)
+        assert text_sections_digest(binary) == text, "debug stripping changed __TEXT sections"
         # Rust cdylibs normally contain the PRIVATE build path as LC_ID_DYLIB.
         # It is not an import: normalize this ID before the final ad-hoc signature.
         ids = run(["otool", "-D", str(binary)], bundle.parent, env).splitlines()[1:]
@@ -517,7 +548,7 @@ def audit_bundle(bundle, env, log, private_prefixes, version, build_number):
         data = binary.read_bytes()
         assert not any(str(p).encode() in data for p in private_prefixes), "private build/home path remains in binary"
         result.append({"path": str(binary.relative_to(bundle)), "architecture": "arm64", "minos": "13.0",
-                       "imports": [x.strip() for x in imports]})
+                       "text_sections_sha256": text, "imports": [x.strip() for x in imports]})
     symbols = {line.split()[-1].removeprefix("_") for line in run(["nm", "-gU", str(main)], bundle.parent, env).splitlines() if line.strip()}
     if bundle.suffix == ".vst3":
         assert "GetPluginFactory" in symbols, "missing VST3 factory export"
@@ -535,8 +566,10 @@ def audit_bundle(bundle, env, log, private_prefixes, version, build_number):
     for binary in binaries:
         run(["codesign", "--verify", "--strict", str(binary)], bundle.parent, env, log)
     for record, binary in zip(result, binaries):
+        assert text_sections_digest(binary) == record["text_sections_sha256"], "postprocessing changed __TEXT sections"
         record["sha256"] = sha(binary)
     return {"mach_o": result, "plist_minimum": plist.get("LSMinimumSystemVersion"),
+            "debug_map_policy": "Apple Xcode strip -S; __TEXT sections byte-identical",
             "format_exports_checked": True, "signature": "ad-hoc; verified", "older_os_runtime_test": "NOT PERFORMED"}
 
 
@@ -641,6 +674,13 @@ def build(root, output):
         # No resource edits after this point: notices must survive dragging the bundle
         # into place and be sealed by the final signature, not left only beside it.
         audit = audit_bundle(delivered, env, log, prefixes, info["version"], info["bundle_build_number"])
+        # These hosts render offline and never open devices. Test delivered, stripped
+        # bytes too, not only the pre-packaging binaries exercised by make test.
+        host = {"au": "autest", "clap": "claptest"}.get(format_)
+        if host:
+            executable = plistlib.loads((delivered / "Contents/Info.plist").read_bytes())["CFBundleExecutable"]
+            run([str(source / "build" / host), str(delivered / "Contents/MacOS" / executable)], source, env, log)
+            audit["offline_host_load"] = "PASS"
         (folder / "NOTICE.txt").write_text(notice + "License resources are inside the bundle: Contents/Resources/licenses.\n")
         (folder / "INSTALL.txt").write_text(install_instructions(info, format_))
         dump(folder / "RELEASE-PROVENANCE.json", {**bundle_info, "binary_audit": audit})
