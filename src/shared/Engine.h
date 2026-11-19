@@ -1,5 +1,4 @@
-// A thin C++ face on the engine's C interface (engine/include/piano_engine.h), shared by
-// the app and the Audio Unit.
+// The Audio Unit's thin C++ face on the engine's C interface (engine/include/piano_engine.h).
 #pragma once
 #include <functional>
 #include <string>

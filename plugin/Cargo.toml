@@ -1,25 +1,42 @@
 [package]
 name = "physical_piano_plugin"
-version = "0.1.0"
+version = "0.1.0-preview.1"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
-description = "Physical Piano as a CLAP (and optionally VST3) instrument"
+description = "Felt & Air as a CLAP (and optionally VST3) instrument"
 
 [lib]
-crate-type = ["cdylib"]
+# cdylib for the CLAP/VST3 bundles, lib for the standalone binary.
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "felt-and-air"
+path = "src/main.rs"
+required-features = ["standalone"]
 
 [dependencies]
 piano_engine = { path = "../engine" }
 # nih-plug is not on crates.io; pinned to the commit this was written against.
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a", default-features = false }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+crossbeam = "0.8"
+midir = { version = "0.9.1", optional = true }
 
 [features]
 # VST3 goes through the vst3-sys bindings, which are GPLv3: a binary built with this
 # feature has to be distributed under the GPL. CLAP has no such condition.
 vst3 = ["nih_plug/vst3"]
+# The Mac app: nih-plug's standalone wrapper (CoreAudio through cpal), plus our own MIDI
+# listener that connects every source.
+standalone = ["nih_plug/standalone", "dep:midir"]
 
 [profile.release]
+# Rust 1.85's debuginfo stripping produces a misaligned Mach-O string table rejected by
+# macOS 27 dyld. Keep the symbol table intact (no effect on rendering performance).
+strip = "none"
 opt-level = 3
 lto = "fat"
 codegen-units = 1

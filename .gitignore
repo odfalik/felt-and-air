@@ -1,9 +1,11 @@
 build/
 out/
 *.wav
+.pi-loop.json
 .pi-loop.json.lock
 .DS_Store
 demos/*.mid
 demos/demos.txt
 engine/target/
 plugin/target/
+vendor/

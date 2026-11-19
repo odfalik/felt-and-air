@@ -1,21 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleName</key><string>Physical Piano</string>
-<key>CFBundleIdentifier</key><string>com.odfalik.physical-piano.au</string>
-<key>CFBundleExecutable</key><string>PhysicalPiano</string>
+<key>CFBundleName</key><string>Felt &amp; Air</string>
+<key>CFBundleDisplayName</key><string>Felt &amp; Air</string>
+<key>CFBundleIdentifier</key><string>com.odfalik.felt-and-air.au</string>
+<key>CFBundleExecutable</key><string>FeltAndAir</string>
 <key>CFBundlePackageType</key><string>BNDL</string>
-<key>CFBundleShortVersionString</key><string>0.1</string>
+<key>CFBundleShortVersionString</key><string>0.1.0</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>AudioComponents</key>
 <array><dict>
   <key>type</key><string>aumu</string>
-  <key>subtype</key><string>PhPn</string>
+  <key>subtype</key><string>FtAr</string>
   <key>manufacturer</key><string>Odfk</string>
-  <key>name</key><string>odfalik: Physical Piano</string>
+  <key>name</key><string>odfalik: Felt &amp; Air</string>
   <key>description</key><string>Physically modelled grand piano</string>
-  <key>version</key><integer>65536</integer>
-  <key>factoryFunction</key><string>PhysicalPianoFactory</string>
+  <key>version</key><integer>256</integer>
+  <key>factoryFunction</key><string>FeltAndAirFactory</string>
   <key>sandboxSafe</key><true/>
   <key>tags</key><array><string>Synth</string></array>
 </dict></array>

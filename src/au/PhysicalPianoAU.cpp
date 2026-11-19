@@ -189,7 +189,7 @@ OSStatus GetProperty(void* self, AudioUnitPropertyID id, AudioUnitScope scope, A
             auto put = [&](CFStringRef k, SInt32 v) { CFNumberRef n = num(v); CFDictionarySetValue(d, k, n); CFRelease(n); };
             put(CFSTR(kAUPresetVersionKey), 0);
             put(CFSTR(kAUPresetTypeKey), kAudioUnitType_MusicDevice);
-            put(CFSTR(kAUPresetSubtypeKey), 'PhPn');
+            put(CFSTR(kAUPresetSubtypeKey), 'FtAr');
             put(CFSTR(kAUPresetManufacturerKey), 'Odfk');
             CFDictionarySetValue(d, CFSTR(kAUPresetNameKey), u->presetName);
             // The saved state is the volume followed by the instrument's settings.
@@ -264,7 +264,7 @@ OSStatus SetProperty(void* self, AudioUnitPropertyID id, AudioUnitScope scope, A
                 SInt32 v = 0;
                 return n && CFGetTypeID(n) == CFNumberGetTypeID() && CFNumberGetValue(n, kCFNumberSInt32Type, &v) && v == want;
             };
-            if (!match(CFSTR(kAUPresetTypeKey), kAudioUnitType_MusicDevice) || !match(CFSTR(kAUPresetSubtypeKey), 'PhPn') ||
+            if (!match(CFSTR(kAUPresetTypeKey), kAudioUnitType_MusicDevice) || !match(CFSTR(kAUPresetSubtypeKey), 'FtAr') ||
                 !match(CFSTR(kAUPresetManufacturerKey), 'Odfk'))
                 return kAudioUnitErr_InvalidPropertyValue;
             CFDataRef data = (CFDataRef)CFDictionaryGetValue(d, CFSTR(kAUPresetDataKey));
@@ -455,7 +455,7 @@ AudioComponentMethod Lookup(SInt16 selector) {
 
 }  // namespace
 
-extern "C" __attribute__((visibility("default"))) void* PhysicalPianoFactory(const AudioComponentDescription*) {
+extern "C" __attribute__((visibility("default"))) void* FeltAndAirFactory(const AudioComponentDescription*) {
     Unit* u = new Unit;
     u->iface.Open = Open;
     u->iface.Close = Close;

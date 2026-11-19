@@ -8,13 +8,13 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    const char* path = argc > 1 ? argv[1] : "build/PhysicalPiano.component/Contents/MacOS/PhysicalPiano";
+    const char* path = argc > 1 ? argv[1] : "build/FeltAndAir.component/Contents/MacOS/FeltAndAir";
     void* lib = dlopen(path, RTLD_NOW);
     if (!lib) { std::printf("cannot load %s: %s\n", path, dlerror()); return 1; }
-    auto factory = (AudioComponentFactoryFunction)dlsym(lib, "PhysicalPianoFactory");
+    auto factory = (AudioComponentFactoryFunction)dlsym(lib, "FeltAndAirFactory");
     if (!factory) { std::printf("factory not found\n"); return 1; }
-    AudioComponentDescription desc = {kAudioUnitType_MusicDevice, 'PhPn', 'Odfk', 0, 0};
-    AudioComponent comp = AudioComponentRegister(&desc, CFSTR("odfalik: Physical Piano"), 0x10000, factory);
+    AudioComponentDescription desc = {kAudioUnitType_MusicDevice, 'FtAr', 'Odfk', 0, 0};
+    AudioComponent comp = AudioComponentRegister(&desc, CFSTR("odfalik: Felt & Air"), 0x10000, factory);
     AudioUnit au = nullptr;
     if (!comp || AudioComponentInstanceNew(comp, &au) != noErr) { std::printf("cannot instantiate\n"); return 1; }
 

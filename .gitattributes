@@ -1,0 +1,2 @@
+# Pinned upstream license texts retain original bytes, including blank EOF lines.
+licenses/upstream/*.txt whitespace=-blank-at-eof

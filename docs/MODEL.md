@@ -1,8 +1,10 @@
-# Model, validation, and limits
+# Felt & Air: model, validation, and limits
 
-Numbers are from `make test`, the tools listed in the README and the app's `--loadtest`, on a
-MacBook Air M3 at 48 kHz in double precision. The engine is Rust; an earlier C++ version of
-it produced the same output to within the precision of a 32 bit WAV file (-155 dB).
+The engine uses double precision. Representative numerical results below are from
+`make test` on a MacBook Pro M4 Max at 48 kHz (2026-11-18), with higher rates where stated.
+These checks establish numerical properties, not agreement with measurements of a real
+piano. Performance measurements are identified separately; offline deadlines are not
+proof of dropout-free operation on a real audio device.
 
 ## What is simulated
 
@@ -30,6 +32,20 @@ part consistently.
 | Radiation | Each side of the board radiates into its own half space with opposite sign, summed node by node to two ears |
 | Room | Floor, open lid, walls and ceiling as mirror images up to second order over quarter-metre board patches; a late field from a feedback delay network scaled to Sabine's decay time and level |
 
+## Touch and timing
+
+A MIDI note-on starts the hammer at let-off, not at string contact. MIDI velocity sets
+hammer speed through `0.25 + 5.5 * (velocity / 127)^1.7` m/s. The configured release gap
+(default 2 mm), gravity and moving string determine the subsequent contact time: roughly
+7.6 ms at 0.3 m/s, 1 ms at 2 m/s and 0.4 ms at 5 m/s in the test case.
+
+The same velocity uses the same launch speed and gap across the keyboard; there is no
+extra bass-note delay. Different hammer masses affect contact, but mass alone does not
+slow free flight at a given initial speed. The current masses are assumed per-string values
+multiplied by unison count, not a measured monotonically decreasing hammer-weight scale.
+The preceding finger/key/linkage motion is not part of live synthesis. Adding its whole
+stroke duration after a MIDI event would duplicate latency already incurred by the keyboard.
+
 ## Numerics
 
 - Leapfrog in time. Explicit for strings and bare plate, implicit (theta = 1/4) for ribs and
@@ -38,36 +54,41 @@ part consistently.
   (bound 3.93 against a limit of 4). Strings satisfy their closed-form condition. The sum of
   the parts is then stable, because the coupled energy is a sum of positive pieces.
 - Felt contact uses the discrete gradient of the felt potential, which makes the contact
-  energy-exact. The equations are solved by a damped Newton iteration (at most 4 iterations seen).
+  energy-exact. The equations are solved by a damped Newton iteration (3 iterations in the
+  representative contact test, up to 12 in the full-compass stress test).
 - Each string's two grid coefficients are fitted so that the fundamental is exact and the
   partial series follows the continuous stiff string. The physical stiffness enters through
   the inharmonicity coefficient.
-- Sound is computed one time step behind the mechanics. It does not act back on the
-  instrument, so this only delays the output by 21 microseconds.
+- Feed-forward sound is computed one time step behind the mechanics, delaying output by
+  about 21 microseconds. The separate air-loading force does feed back into the board.
+- The string stencil updates interior nodes only. The bridge endpoint follows the board;
+  its sampled increment is retained explicitly for the damper sleep decision.
 
 ## What the tests show
 
 | Check | Result |
 |---|---|
-| Fast plate kernel equals the energy-derived operator | 4e-16 relative |
-| Energy through a hammer strike, losses off | drift 3e-14 |
-| Energy in free vibration, losses off, 2 s | drift 2e-13 |
+| Fast plate kernel equals the energy-derived operator | 5.3e-16 relative |
+| Energy through a hammer strike, losses off | drift 8.6e-14 |
+| Energy in free vibration, losses off, 2 s | drift 1.2e-12 |
 | Energy with losses on (strike, hold, release) | never rises |
-| Reciprocity, string to string through the board | 3e-14 |
-| Plate modes against the analytic orthotropic plate | within 0.6 % (0.3 % at 2x rate) |
+| Reciprocity, string to string through the board | 4.7e-14 |
+| Plate modes against the analytic orthotropic plate | within 0.62 % (0.32 % at 2x rate) |
 | Simulated partials against the scheme's closed form | 0.00 cents |
-| Grid error of partials against the continuous string, C4 | under 3 cents to 4.4 kHz, -8 cents at 7 kHz, -36 cents at 10 kHz |
-| Same, C6 | -10 cents at 9 kHz, -69 cents at 14 kHz |
-| Felt pulse, C4 at 2 m/s | 10.1 N, 2.0 ms; peak moves 0.5 % from 48 to 96 kHz |
-| Board drains the strings | 4 dB extra decay over 1.6 s |
+| Grid error of partials against the continuous string, C4 | about 3 cents to 4.4 kHz, -7 cents at 7 kHz, -33 cents at 10 kHz |
+| Same, C6 | -10 cents at 9 kHz, -67 cents at 14 kHz |
+| Felt pulse, C4 at 2 m/s | 8.38 N per string, 2.40 ms; peak moves 0.1 % from 48 to 96 kHz |
+| Board drains the strings | 11.9 dB extra decay over 1.6 s relative to rigid supports |
 | Helper threads | output bit-identical to one thread |
 | Room | direct sound arrives on time; decay 0.81 s against Sabine 0.89 s |
 | Longitudinal motion | tension pulses at twice the fundamental; longitudinal mode at 2402 Hz against 2413 Hz expected |
-| Air loading | lowest resonance 44.2 Hz in vacuum, 40.7 Hz in air; fortissimo with pedal rings down |
+| Air loading | lowest resonance 43.8 Hz in vacuum, 40.4 Hz in air; fortissimo with pedal rings down |
 | Action | hammer reaches the string 7.6, 1.0 and 0.4 ms after let-off at 0.3, 2 and 5 m/s |
 | Pedal stir | 53 dB SPL against 79 dB SPL for one mezzo forte note, from silence at -146 dB |
 | Audio Unit, driven in-process as a host would | 11 checks pass (formats, MIDI, own buffers, slice limit, state, 42 parameters, rebuild on change) |
-| CLAP plug-in, driven in-process as a host would | 6 checks pass (descriptor, 42 parameters, notes in, sound out) |
+| CLAP plug-in, driven in-process as a host would | 43 parameters, editor capability/size, sample-timed notes, pedal isolation across parameter changes, 48→96 kHz reactivation |
+| Plugin rebuild lifecycle, real engine tests | stale sample-rate builds rejected; matching geometry/audio swap; source-owned pedals and sostenuto capture preserved |
+| Boundary and scheduling regressions | prescribed endpoints, history-ring wrapping, and stereo/state equality with 0 vs 3 helpers through retriggers and pedals |
 | Fortissimo abuse over the full compass with pedal | finite, bounded |
 
 Measured, not tested against a target: bridge driving-point impedance 300 to 3000 kg/s across
@@ -76,47 +97,87 @@ about 2 dB per second after.
 
 ## Processor budget
 
-The work of one time step is shared between the audio thread and three helper threads that
-join the audio device's realtime thread group and spin only while a block is being rendered.
-Output is bit-identical to the single-thread result.
+Each sample has one shared pass across the audio thread and three helper threads. Strings
+without an active hammer advance immediately after their forces are computed. Hammer-contact
+strings advance after the serial contact solve. Helpers spin only while a block is being
+rendered. Their output matches the single-thread result bit for bit.
 
-Work per step on one thread, in processor cycles, which do not depend on how busy the
-machine is: about 121,000 for a pedalled virtuoso piece (Liszt, La Campanella) at board grid
-1.5x with everything on. One sample at 48 kHz allows 84,000 on one performance core, so one
-thread alone cannot do it; sideways motion accounts for 5 % of that work.
+The engine accepts realtime-workgroup hooks. The Rust standalone wrapper does **not** expose
+the selected device's workgroup, so its helpers currently do not join one. Do not infer
+real-device scheduling performance from the offline benchmark.
 
-On the real audio thread, output silenced, same settings, on a machine that was also busy
-with other work (load average about 5):
+### M4 Max offline measurements
 
-| Material | Mean load | Worst blocks |
+Development measurements use M4-native builds at 48 kHz, board grid 1.5, with the full
+model enabled. Portable release builds target the M1 instruction set; these numbers are
+not a performance guarantee for every Apple Silicon Mac:
+
+| Measurement | Result and scope |
+|---|---|
+| One-pass string scheduling | 109,120–109,255 cycles/sample versus 119,329–119,564 for the corrected two-pass reference: about 8.6 % less work in alternating-order runs of the Liszt demo |
+| Single-thread pedalled benchmark | Median block deadline use 158–159 % versus about 171 % for the two-pass reference; still too slow for one core |
+| Three helpers, pedalled benchmark | Median 74–93 %, p99 99–108 % in short runs on a shared machine; occasional missed deadlines remain |
+| Flattened air-history indexing | About 4.8 % less time in an isolated `Radiation::step` benchmark; whole-engine gain not established |
+| Fresh, unexcited instrument, no helpers | Median block deadline use 0.1 %, versus 78.8–79.0 % with ordinary stepping |
+| Fresh, unexcited instrument, three helpers | Median 0.1–0.2 %, versus 50.5–50.6 % with ordinary stepping |
+
+The one-pass and air-index optimizations preserve the corrected reference output exactly,
+including a full 16-second stereo phrase with note releases. The string-boundary correctness
+fix is separate: it changes when damped strings sleep and therefore changes some release
+tails relative to the version with the out-of-bounds stencil read.
+
+The pristine-idle figures come from three alternating runs per variant at 128 frames,
+grid 1.5 and one second per scenario. They measure wall-clock block deadline use, not the
+sum of CPU time across helper threads. The first block still executes one genuine tick and
+its zero-state check: measured maxima including that work were 2.8 % without helpers and
+4.7 % with three. A finer-grid cold snapshot took about 58 µs for tick plus check versus
+17 µs for an ordinary tick; that one-time check is a real cost, not a timing guarantee.
+Active cases showed no clear improvement or regression from this idle optimization.
+
+### Exact pristine-idle path
+
+An eligible new instrument executes one ordinary sample, then checks that its mechanical,
+coupling, solver, output-history and acoustic/filter state is exactly zero. Nonzero and
+nonfinite results reject the fast path. Constructors with awake dampers or damped-string
+ringing enabled are excluded: damper preload can create sound without any key press.
+
+For a proven zero state, only the delay clocks, buffer parity and ordinary housekeeping
+advance; the process/oversampling/FIR loop is unchanged. Any excitation, changed pedal state
+or mutable state-slice exposure disables the shortcut permanently for that instance.
+No-op initialization setters retain eligibility. The shortcut never detects tails, never
+re-arms after note-off, and never freezes an instrument merely because output is muted.
+Tests compare exact sample/state bits across silent lead-ins, delay wraps, oversampling,
+helper configurations, pedals, retriggers and mutable-state access.
+
+Cycle counts remain sensitive to core placement, cache contention and power management.
+Use alternating comparisons on the same machine, and use `bench` for wall-clock deadlines.
+These are not real-device or sustained thermal measurements. A coarser board grid and the
+Light preset reduce work, but also change the model; neither is counted as a quality-preserving
+optimization.
+
+### Precision and GPU
+
+Double precision remains the default. A measured single-precision soundboard variant saved
+about 27 % but introduced relative noise around -55 dB in the 16–24 kHz band. Single-precision
+strings also changed tuning by a few hundredths of a cent. Neither substitution meets the
+exact-output requirement.
+
+`make build/metalbench && ./build/metalbench` measures synthetic float32 5-/7-point stencils,
+not the double-precision orthotropic plate, stiffeners or coupled piano. M4 Max results:
+
+| Workload | GPU, batched time per step | One CPU core |
 |---|---|---|
-| Bach prelude | 65 to 76 % | about 100 % |
-| Chopin nocturne, pedalled | 82 to 88 % | 103 to 107 %, a few per cent of blocks over budget |
+| Board-sized 64×58 update | 6.2 µs | 0.8 µs |
+| 256×256 update | 3.9 µs | 13.1 µs |
+| 128³ air volume (2.10 million cells) | 42.7 µs | 577.1 µs |
+| 21-million-cell room | 761.0 µs | 5,380.1 µs |
 
-That is too little headroom on a busy machine: expect occasional dropouts in pedalled
-passages. The "Light" preset (no sideways motion, duplex or air loading) and a coarser board
-grid buy room. Timings taken minutes apart on this machine differed by a factor of two to
-three, so these figures are a range, not a constant. Sustained thermal behaviour on the
-fanless Air has not been measured separately.
-
-**Single precision** was tried and rejected for now. For the soundboard it saves about 27 %
-but adds noise at -55 dB relative to the signal in the 16 to 24 kHz band. For the strings
-alone the noise is lower (-81 dB in 8 to 16 kHz) but rounding of the stencil coefficients
-detunes each string by a few hundredths of a cent, which changes unison beating.
-
-**Metal** was measured rather than assumed:
-
-| Workload | GPU | One CPU core |
-|---|---|---|
-| Board-sized 2D update, per step | 6.4 us (plus a 12 us round trip if the CPU needs the result every step) | 0.9 us |
-| 3D air, 2 million cells, per step | 292 us | 649 us |
-| 3D air, throughput | about 7 billion cell updates per second | 2 to 3.7 billion |
-
-So the GPU loses for the coupled instrument, which must exchange data every 20.8 us, and
-wins by about 2.5x for a volume of air. That is still far short of a full-band room: a
-4 x 3.2 x 3.2 m room at 12 mm needs 21 million cells and 3 ms per step, 146 times over
-budget. A real-time air simulation on this GPU is limited to roughly a 7 m room below
-1.5 kHz, with nothing left over. The room model above is geometric for that reason.
+An empty GPU command-buffer commit/wait costs at least 16 µs in this run. That is a separate
+lower-bound synchronization measurement, not a measured CPU/GPU coupled step. The instrument
+exchanges forces every 20.8 µs; its small board is cheaper on the CPU even before that overhead.
+The large-room GPU stencil alone is about 36.5 times over the per-sample budget. GPU batching
+could suit independent offline renders, but no GPU baking implementation or equivalence proof
+exists. Peak throughput is not a realtime-latency guarantee.
 
 ## Not modelled, or guessed
 
@@ -138,13 +199,6 @@ budget. A real-time air simulation on this GPU is limited to roughly a 7 m room 
   taken as the moment the damper meets the string. Felt constants of the key rails and the
   backcheck, the key's mass, the share of their force that reaches the board, and the soft
   pedal's felt hardness are assumptions. Pedal friction is a noise source, not a friction model.
-- **Front duplex lengths, agraffe and pin compliance, the iron plate.** Rear duplex lengths
-  are ideal thirds and halves, not a maker's scaling.
-- **Action.** The key, wippen, jack and repetition lever are not simulated as bodies. With
-  MIDI input their result, the hammer's speed and timing at let-off, is what the note-on
-  already carries; hammer speed is a fixed curve of MIDI velocity. Shank flex, key and pedal
-  knocks and damper mechanics are modelled, with guessed strengths. Pedal friction is a
-  noise source, not a friction model. Una corda and sostenuto pedals are missing.
 - **Geometry.** A generic 2 m grand: outline, scale, rib and bridge sizes are plausible
   values, not measurements of an instrument.
 - **Material and felt data.** Spruce and maple constants are textbook values. Felt stiffness
@@ -155,9 +209,13 @@ budget. A real-time air simulation on this GPU is limited to roughly a 7 m room 
 
 ## Plug-ins
 
-An Audio Unit (`aumu` / `PhPn` / `Odfk`) and a CLAP plug-in, both with every setting as a
-host parameter and neither with an editor window of its own. Both pass a host-style test
-run in-process. Apple's `auval` has not been run: the system's component registry had not
-picked the new Audio Unit up, and refreshing it needs a log-out or administrator rights.
-Neither has been loaded in a real host. A VST3 build exists behind a switch, untested, and
-its bindings are GPL (see the README).
+The Audio Unit (`aumu` / `FtAr` / `Odfk`) exposes physical settings through its host's generic
+controls. CLAP and optional VST3 share the standalone app's integrated egui editor and also
+expose board-grid choice. AU and CLAP pass in-process host tests; CLAP additionally checks
+pedal behavior and reactivation at a different sample rate without opening an audio device.
+Deterministic real-engine tests establish accepted rebuild and stale-generation behavior;
+the external host test's parameter event alone does not prove a background rebuild completed.
+
+Real-DAW editor embedding, real MIDI/audio-device behavior and Apple's `auval` remain
+unverified. VST3 builds, but has not been exercised in a host; its bindings require GPL binary
+distribution (see the README). No audio-device or microphone access is required by `make test`.

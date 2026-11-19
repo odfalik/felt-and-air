@@ -21,6 +21,14 @@ use std::f64::consts::PI;
 
 const LINES: usize = 8;
 
+#[inline]
+fn mutual_history_index(base: usize, offset: usize, len: usize) -> usize {
+    // Both base and offset are below len. One ring length cancels unsigned underflow;
+    // len (time slots * patches) need not be a power of two.
+    let index = base.wrapping_sub(offset);
+    if index >= len { index.wrapping_add(len) } else { index }
+}
+
 /// Sources grouped by their delay to one ear.
 #[derive(Default)]
 struct Bins {
@@ -87,8 +95,8 @@ pub struct Radiation {
     acc_hist: Vec<f32>,
     vel_mask: usize,
     self_delay: Vec<usize>,
-    mut_delay: Vec<usize>,
-    mut_src: Vec<usize>,
+    // delay * patch_count - source: positive because every delay is at least one tick.
+    mut_offset: Vec<usize>,
     mut_ptr: Vec<usize>,
     mut_gain: Vec<f32>,
     self_gain: f64,
@@ -198,13 +206,12 @@ impl Radiation {
                     }
                     let r = (centre[a].x - centre[b].x).hypot(centre[a].y - centre[b].y);
                     let dl = delay_of(r).max(1);
-                    rad.mut_delay.push(dl);
-                    rad.mut_src.push(b);
+                    rad.mut_offset.push(dl.checked_mul(np).expect("air history offset overflow") - b);
                     // Both faces; acts on the patch's summed dt^2 * accel.
                     rad.mut_gain.push((-rho * ds * ds / (PI * r)) as f32);
                     far = far.max(dl);
                 }
-                rad.mut_ptr.push(rad.mut_delay.len());
+                rad.mut_ptr.push(rad.mut_offset.len());
             }
             rad.self_gain = -2.0 * rho * c * k * ds; // both faces; acts on the mean increment per step
             let len = (far + 2).next_power_of_two();
@@ -212,7 +219,8 @@ impl Radiation {
             let vlen = (near_max + 2).next_power_of_two();
             rad.vel_mask = vlen - 1;
             rad.vel_hist = vec![0.0; np * vlen];
-            rad.acc_hist = vec![0.0; np * len];
+            rad.acc_hist = vec![0.0; np.checked_mul(len).expect("air history size overflow")];
+            debug_assert!(rad.mut_offset.iter().all(|&offset| offset < rad.acc_hist.len()));
         }
 
         let mut max_delay = 0usize;
@@ -375,6 +383,29 @@ impl Radiation {
         (g * (y[0] - y[1] + y[2] - y[3] + y[4] - y[5] + y[6] - y[7]), g * (y[0] + y[1] - y[2] - y[3] + y[4] + y[5] - y[6] - y[7]))
     }
 
+    /// One-time proof after a real zero-input tick, not a tail/silence threshold.
+    pub(crate) fn is_pristine_zero(&self) -> bool {
+        let zero = |s: &[f64]| s.iter().all(|&v| v == 0.0);
+        self.ring.iter().all(|s| zero(s)) && self.line.iter().all(|s| zero(s))
+            && zero(&self.patch_acc) && zero(&self.patch_vel) && zero(&self.air_force)
+            && self.vel_hist.iter().chain(&self.acc_hist).all(|&v| v == 0.0)
+            && zero(&self.line_lp) && self.hp_state == 0.0
+    }
+
+    /// Only the constructor-proven zero fixed point may use this. Histories remain
+    /// zero, but all delay clocks retain the same phase as ordinary stepping.
+    pub(crate) fn advance_pristine_zero(&mut self) {
+        self.ring_pos = (self.ring_pos + 1) & self.ring_mask;
+        if self.air {
+            self.hist_pos = (self.hist_pos + 1) & self.hist_mask;
+        }
+        if self.reverb {
+            for i in 0..LINES {
+                self.line_pos[i] = if self.line_pos[i] + 1 == self.line[i].len() { 0 } else { self.line_pos[i] + 1 };
+            }
+        }
+    }
+
     /// `r`: change of the plate increment this step (dt^2 * acceleration), grid storage.
     /// Returns the pressure at the two ears. Allocation free.
     pub fn step(&mut self, r: &[f64]) -> (f64, f64) {
@@ -410,16 +441,18 @@ impl Radiation {
                 let f = self.self_gain * (self.patch_vel[p] - self.vel_hist[(now.wrapping_sub(self.self_delay[p]) & vm) * np + p] as f64);
                 let (mut f0, mut f1) = (0.0f32, 0.0f32);
                 let (lo, hi) = (self.mut_ptr[p], self.mut_ptr[p + 1]);
-                let (md, ms, mg) = (&self.mut_delay[lo..hi], &self.mut_src[lo..hi], &self.mut_gain[lo..hi]);
+                let (offset, mg) = (&self.mut_offset[lo..hi], &self.mut_gain[lo..hi]);
+                let base = now * np;
+                let history_index = |offset: usize| mutual_history_index(base, offset, ah.len());
                 let mut q = 0;
                 unsafe {
-                    while q + 1 < md.len() {
-                        f0 += mg.get_unchecked(q) * ah.get_unchecked((now.wrapping_sub(*md.get_unchecked(q)) & hm) * np + ms.get_unchecked(q));
-                        f1 += mg.get_unchecked(q + 1) * ah.get_unchecked((now.wrapping_sub(*md.get_unchecked(q + 1)) & hm) * np + ms.get_unchecked(q + 1));
+                    while q + 1 < offset.len() {
+                        f0 += mg.get_unchecked(q) * ah.get_unchecked(history_index(*offset.get_unchecked(q)));
+                        f1 += mg.get_unchecked(q + 1) * ah.get_unchecked(history_index(*offset.get_unchecked(q + 1)));
                         q += 2;
                     }
-                    if q < md.len() {
-                        f0 += mg.get_unchecked(q) * ah.get_unchecked((now.wrapping_sub(*md.get_unchecked(q)) & hm) * np + ms.get_unchecked(q));
+                    if q < offset.len() {
+                        f0 += mg.get_unchecked(q) * ah.get_unchecked(history_index(*offset.get_unchecked(q)));
                     }
                 }
                 self.air_force[p] = f + (f0 + f1) as f64;
@@ -471,5 +504,127 @@ impl Radiation {
             right += rr;
         }
         (left, right)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::design::{make_grand, GrandOptions};
+
+    fn same_radiation(a: &Radiation, b: &Radiation) {
+        let bits = |s: &[f64]| s.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for (a, b) in a.ring.iter().chain(&a.line).zip(b.ring.iter().chain(&b.line)) {
+            assert_eq!(bits(a), bits(b));
+        }
+        let arrays: [(&[f64], &[f64]); 4] = [(&a.patch_acc, &b.patch_acc), (&a.patch_vel, &b.patch_vel),
+            (&a.air_force, &b.air_force), (&a.line_lp, &b.line_lp)];
+        for (a, b) in arrays {
+            assert_eq!(bits(a), bits(b));
+        }
+        for (a, b) in a.vel_hist.iter().chain(&a.acc_hist).zip(b.vel_hist.iter().chain(&b.acc_hist)) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        assert_eq!(a.hp_state.to_bits(), b.hp_state.to_bits());
+        assert_eq!(a.ring_pos, b.ring_pos);
+        assert_eq!(a.hist_pos, b.hist_pos);
+        assert_eq!(a.line_pos, b.line_pos);
+    }
+
+    #[test]
+    fn pristine_zero_clocks_match_full_radiation_across_all_wraps() {
+        let fs = 8000.0;
+        for room in [false, true] {
+            for air in [false, true] {
+                let d = make_grand(&GrandOptions { room_enabled: room, air_loading: air, ..GrandOptions::default() });
+                let plate = Plate::new(&d.board, &[], 1.0 / fs, 2.0).unwrap();
+                let mut fast = Radiation::new(&plate, &d, fs);
+                let mut normal = Radiation::new(&plate, &d, fs);
+                let mut input = vec![0.0; plate.grid_size];
+                assert_eq!(fast.step(&input), normal.step(&input));
+                assert!(fast.is_pristine_zero());
+                let longest = fast.ring[0].len().max(fast.hist_mask + 1)
+                    .max(fast.line.iter().map(Vec::len).max().unwrap());
+                for tick in 0..2 * longest + 3 {
+                    fast.advance_pristine_zero();
+                    let out = normal.step(&input);
+                    assert_eq!((out.0.to_bits(), out.1.to_bits()), (0.0f64.to_bits(), 0.0f64.to_bits()));
+                    assert_eq!(fast.ring_pos, normal.ring_pos, "ring tick {tick}");
+                    assert_eq!(fast.hist_pos, normal.hist_pos, "air tick {tick}");
+                    assert_eq!(fast.line_pos, normal.line_pos, "FDN tick {tick}");
+                }
+                assert!(fast.is_pristine_zero() && normal.is_pristine_zero());
+                same_radiation(&fast, &normal);
+                for tick in 0..2 * longest + 3 {
+                    input[plate.gid[0]] = if tick == 0 { 1e-12 } else { 0.0 };
+                    let a = fast.step(&input);
+                    let b = normal.step(&input);
+                    assert_eq!((a.0.to_bits(), a.1.to_bits()), (b.0.to_bits(), b.1.to_bits()), "room={room} air={air} active tick {tick}");
+                    for (a, b) in fast.air_force.iter().zip(&normal.air_force) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                }
+                same_radiation(&fast, &normal);
+                let mut pristine = Radiation::new(&plate, &d, fs);
+                pristine.hp_state = f64::NAN;
+                assert!(!pristine.is_pristine_zero());
+                pristine.hp_state = 0.0;
+                if let Some(slot) = pristine.acc_hist.last_mut() {
+                    *slot = f32::INFINITY;
+                    assert!(!pristine.is_pristine_zero());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flattened_history_all_positions_delays_and_sources() {
+        for np in [1usize, 3, 8, 40] {
+            for slots in [2usize, 4, 16, 128] {
+                for now in 0..slots {
+                    for delay in 1..slots {
+                        for src in 0..np {
+                            let actual = mutual_history_index(now * np, delay * np - src, slots * np);
+                            let expected = (now.wrapping_sub(delay) & (slots - 1)) * np + src;
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mutual_air_flat_offsets_match_time_patch_reference_across_wraps() {
+        let mut d = make_grand(&GrandOptions::default());
+        d.room.enabled = false;
+        d.air_loading = true;
+        let plate = Plate::new(&d.board, &[], 1.0 / 48000.0, 1.0).unwrap();
+        let mut rad = Radiation::new(&plate, &d, 48000.0);
+        let np = rad.patch_count;
+        assert!(np > 1);
+        let mut input = vec![0.0; plate.grid_size];
+        for tick in 0..2 * (rad.hist_mask + 1) + 3 {
+            for (i, x) in input.iter_mut().enumerate() {
+                *x = ((i + tick) as f64 * 0.31).sin() * 1e-12;
+            }
+            let now = rad.hist_pos;
+            rad.step(&input);
+            for p in 0..np {
+                let self_force = rad.self_gain * (rad.patch_vel[p]
+                    - rad.vel_hist[(now.wrapping_sub(rad.self_delay[p]) & rad.vel_mask) * np + p] as f64);
+                let (mut f0, mut f1) = (0.0f32, 0.0f32);
+                for (lane, q) in (rad.mut_ptr[p]..rad.mut_ptr[p + 1]).enumerate() {
+                    // Original source order is 0..np, excluding p; derive delay only, then
+                    // evaluate the original time-slot mask and source indexing independently.
+                    let src = if lane < p { lane } else { lane + 1 };
+                    let delay = (rad.mut_offset[q] + src) / np;
+                    let value = rad.mut_gain[q]
+                        * rad.acc_hist[(now.wrapping_sub(delay) & rad.hist_mask) * np + src];
+                    if lane & 1 == 0 { f0 += value; } else { f1 += value; }
+                }
+                assert_eq!(rad.air_force[p].to_bits(), (self_force + (f0 + f1) as f64).to_bits());
+            }
+        }
     }
 }

@@ -65,6 +65,8 @@ struct StringRt {
     damp_h: f64,
     attached: bool,
     awake: bool,
+    /// Active hammers must correct the next increment before displacement advances.
+    defer_advance: bool,
     has_damper: bool,
     /// The second polarisation of another string.
     sideways: bool,
@@ -245,11 +247,9 @@ struct Shared {
     /// Air reaction per patch being applied this step.
     air_now: Buf<f64>,
     chunks: Vec<Chunk>,
-    phase_chunks: [Vec<usize>; 2],
 
-    // One word holds the whole job: generation, phase and the next unclaimed chunk. A chunk is
-    // claimed by compare-and-swap on that word, so a thread can never pair a chunk of a new
-    // job with the phase of an old one.
+    // One word holds the whole job: generation, inactive flag and next unclaimed chunk.
+    // Compare-and-swap prevents a stale claim from consuming a new job's chunk.
     ticket: AtomicU64,
     done: AtomicI32,
     stop: AtomicBool,
@@ -263,71 +263,69 @@ struct Shared {
 const NO_JOB: u64 = 3 << 32;
 
 impl Shared {
-    fn claim(&self) -> Option<(usize, usize)> {
+    fn claim(&self) -> Option<usize> {
         let mut t = self.ticket.load(Ordering::Acquire);
         loop {
             let idx = (t & 0xffff_ffff) as usize;
-            let phase = ((t >> 32) & 3) as usize;
-            if phase > 1 || idx >= self.phase_chunks[phase].len() {
+            if t & NO_JOB != 0 || idx >= self.chunks.len() {
                 return None;
             }
             match self.ticket.compare_exchange_weak(t, t + 1, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Some((phase, idx)),
+                Ok(_) => return Some(idx),
                 Err(now) => t = now,
             }
         }
     }
 
-    /// Phase 0 computes forces from the state of the previous step (strings, plate stencil) and
-    /// the sound of the previous step. Phase 1 advances the string displacements.
+    /// Compute forces and advance strings not awaiting hammer contact. The bridge sees the
+    /// saved end force, not the updated string displacement, so no second barrier is needed.
     ///
     /// # Safety
-    /// Must be called once per (job, index); the chunks of a phase touch disjoint state.
-    unsafe fn chunk_work(&self, phase: usize, index: usize) {
-        match self.chunks[self.phase_chunks[phase][index]] {
+    /// Must be called once per (job, index); chunks touch disjoint state.
+    unsafe fn chunk_work(&self, index: usize) {
+        match self.chunks[index] {
             Chunk::Radiation => {
-                if phase == 0 {
-                    *self.rad_out.get() = self.radiation.get().step(self.rad_in.all());
-                }
+                *self.rad_out.get() = self.radiation.get().step(self.rad_in.all());
             }
             Chunk::PlateSpans(from, to) => {
-                if phase == 0 {
-                    let p = &self.plate;
-                    p.apply_stencil(self.w.ptr(), self.vw.ptr(), self.r.ptr(), from, to);
-                    p.apply_local(self.w.ptr(), self.r.ptr(), from, to);
-                    // Reaction of the air, as worked out by the radiation task one step ago.
-                    if self.air_now.len > 0 {
-                        let r = self.r.ptr();
-                        let patch = self.radiation_patches();
-                        let air = self.air_now.ptr();
-                        for sp in &p.spans[from..to] {
-                            for t in sp.start..sp.start + sp.len {
-                                *r.add(t) += *air.add(*patch.get_unchecked(t) as usize);
-                            }
+                let p = &self.plate;
+                p.apply_stencil(self.w.ptr(), self.vw.ptr(), self.r.ptr(), from, to);
+                p.apply_local(self.w.ptr(), self.r.ptr(), from, to);
+                // Reaction of the air, as worked out by the radiation task one step ago.
+                if self.air_now.len > 0 {
+                    let r = self.r.ptr();
+                    let patch = self.radiation_patches();
+                    let air = self.air_now.ptr();
+                    for sp in &p.spans[from..to] {
+                        for t in sp.start..sp.start + sp.len {
+                            *r.add(t) += *air.add(*patch.get_unchecked(t) as usize);
                         }
                     }
                 }
             }
             Chunk::Strings(from, to) => {
-                if phase == 0 {
-                    for i in from..to {
-                        self.step_string(i);
-                    }
-                } else {
-                    let vb = self.vb.load(Ordering::Relaxed) as usize;
-                    for i in from..to {
-                        let s = &*self.strings.ptr().add(i);
-                        if !s.awake {
-                            continue;
-                        }
-                        let u = std::slice::from_raw_parts_mut(self.u.ptr().add(s.off + 1), s.n - 1);
-                        let v = std::slice::from_raw_parts(self.v[vb].ptr().add(s.off + 1), s.n - 1);
-                        for (ul, vl) in u.iter_mut().zip(v) {
-                            *ul += *vl;
-                        }
+                let next = self.vb.load(Ordering::Relaxed) as usize ^ 1;
+                for i in from..to {
+                    self.step_string(i);
+                    let s = &*self.strings.ptr().add(i);
+                    if !s.defer_advance {
+                        self.advance_string(s, next);
                     }
                 }
             }
+        }
+    }
+
+    /// # Safety
+    /// Caller has exclusive access to this string, after its increment has been computed.
+    unsafe fn advance_string(&self, s: &StringRt, vb: usize) {
+        if !s.awake {
+            return;
+        }
+        let u = std::slice::from_raw_parts_mut(self.u.ptr().add(s.off + 1), s.n - 1);
+        let v = std::slice::from_raw_parts(self.v[vb].ptr().add(s.off + 1), s.n - 1);
+        for (ul, vl) in u.iter_mut().zip(v) {
+            *ul += *vl;
         }
     }
 
@@ -377,6 +375,9 @@ impl Shared {
         }
         string_kernel(u, v, vn, [s.cu0, s.cu1, s.cu2, s.cv0, s.cv1]);
         vn[1] = 0.0;
+        // The bridge is prescribed, not a stencil unknown. Keep its sampled increment for
+        // housekeeping (like u[n + 1], this is from before the plate advances this step).
+        vn[n + 1] = v_n;
 
         // Stretching. The strain of a cell is its end-to-end stretch plus the extra length the
         // transverse wave takes up, half the mean squared slope. Tension follows the strain; where
@@ -523,6 +524,13 @@ pub struct Snapshot {
 
 pub type ThreadHook = Arc<dyn Fn() + Send + Sync>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pristine {
+    Candidate,
+    Zero,
+    Disabled,
+}
+
 pub struct Piano {
     sh: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -559,6 +567,8 @@ pub struct Piano {
     step_count: u64,
     quiet_checks: u32,
     hammer_iters_max: usize,
+    // One-way constructor experiment: prove a real zero tick once, never detect tails.
+    pristine: Pristine,
 }
 
 impl Piano {
@@ -720,6 +730,7 @@ impl Piano {
                     damp_h: 2.0 * sd.sigma1 * sd.rho_a / h,
                     attached: sd.attached,
                     awake: false,
+                    defer_advance: false,
                     has_damper,
                     sideways: false,
                     ham_w: if duplex { 0.0 } else { 1.0 },
@@ -896,8 +907,6 @@ impl Piano {
                 }
             }
         }
-        let phase0: Vec<usize> = (0..chunks.len()).collect();
-        let phase1: Vec<usize> = (0..chunks.len()).filter(|&c| matches!(chunks[c], Chunk::Strings(..))).collect();
 
         // Kaiser windowed sinc, cutoff at 0.45 of the output rate.
         let (mut fir, mut hist) = (Vec::new(), [Vec::new(), Vec::new()]);
@@ -950,7 +959,6 @@ impl Piano {
             rad_out: Cell::new((0.0, 0.0)),
             air_now: Buf::from_vec(air_now),
             chunks,
-            phase_chunks: [phase0, phase1],
             ticket: AtomicU64::new(NO_JOB),
             done: AtomicI32::new(0),
             stop: AtomicBool::new(false),
@@ -959,6 +967,11 @@ impl Piano {
             park: Mutex::new(()),
             wake: Condvar::new(),
         });
+        let pristine = if !d.damped_strings_ring && !sh.strings._own.iter().any(|s| s.awake && s.has_damper) {
+            Pristine::Candidate
+        } else {
+            Pristine::Disabled
+        };
         #[allow(unused_mut)]
         let mut piano = Piano {
             sh,
@@ -991,6 +1004,7 @@ impl Piano {
             step_count: 0,
             quiet_checks: 1 << 20,
             hammer_iters_max: 0,
+            pristine,
         };
         piano.sh.active.store(false, Ordering::Relaxed);
         Ok(piano)
@@ -1003,7 +1017,7 @@ fn string_kernel(u: &[f64], v: &[f64], vn: &mut [f64], c: [f64; 5]) {
     let [cu0, cu1, cu2, cv0, cv1] = c;
     let len = vn.len();
     assert!(len >= 5 && u.len() == len && v.len() == len);
-    for l in 2..len - 1 {
+    for l in 2..len - 2 {
         unsafe {
             let (ul, vl) = (|j: usize| *u.get_unchecked(j), |j: usize| *v.get_unchecked(j));
             *vn.get_unchecked_mut(l) = cu2.mul_add(ul(l - 2) + ul(l + 2), cu1.mul_add(ul(l - 1) + ul(l + 1), cu0.mul_add(ul(l), cv1.mul_add(vl(l - 1) + vl(l + 1), cv0 * vl(l)))));
@@ -1092,6 +1106,15 @@ impl Piano {
             }
             scratch[..=s.n].fill(0.0);
         }
+        // The other buffer may have been used as the damper-shape scratch space. Its
+        // endpoints are prescribed too; the string kernel writes only interior nodes.
+        for buf in &self.sh.v {
+            let v = unsafe { std::slice::from_raw_parts_mut(buf.ptr().add(s.off - 1), s.n + 3) };
+            v[1] = 0.0;
+            v[s.n + 1] = v_n;
+            v[0] = -v[2];
+            v[s.n + 2] = 2.0 * v_n - v[s.n];
+        }
         s.awake = true;
         unsafe { *self.sh.end_live.at(index) = true };
     }
@@ -1134,6 +1157,7 @@ impl Piano {
     /// `speed`: hammer speed at let-off, m/s. Call from the same thread as `process`.
     pub fn note_on(&mut self, midi: i32, speed: f64) {
         let Some(ni) = self.note_of_midi[(midi & 127) as usize] else { return };
+        self.pristine = Pristine::Disabled; // Even speed 0 wakes the bent, preloaded string.
         let mut n = self.notes[ni].clone();
         n.key_down = true;
         for i in 0..n.total {
@@ -1165,6 +1189,9 @@ impl Piano {
             n.xi = n.eta; // head and shank arrive together, the shank unbent
             n.vxi = n.veta;
             n.hammer_active = true;
+            for s in &mut self.strings_mut()[n.first..n.first + n.total] {
+                s.defer_advance = true;
+            }
             for i in 0..n.count {
                 let zeta = n.eta - self.along(&n, i, &self.sh.u);
                 let zeta_prev = zeta - (n.veta - self.along(&n, i, &self.sh.v[self.vb()]));
@@ -1184,6 +1211,7 @@ impl Piano {
         if !self.notes[ni].key_down {
             return;
         }
+        self.pristine = Pristine::Disabled;
         let release_speed = release_speed.clamp(0.25, 4.0);
         let target = self.sh.damp_max * self.pedal_damping;
         let n = &mut self.notes[ni];
@@ -1214,6 +1242,9 @@ impl Piano {
 
     /// Sustain pedal position, 0 (up) to 1 (down).
     pub fn set_pedal(&mut self, position: f64) {
+        if position != self.pedal_pos {
+            self.pristine = Pristine::Disabled;
+        }
         // Dampers start to leave the strings around 34 % of the pedal travel and are clear by
         // 47 %; in between the felt only grazes the string, modelled as a weaker damper. The
         // range is inferred from recorded performances: players release a bass key with the pedal
@@ -1263,11 +1294,17 @@ impl Piano {
 
     /// Una corda: the action shifts so each hammer misses one string of its three.
     pub fn set_soft_pedal(&mut self, down: bool) {
+        if down != self.soft {
+            self.pristine = Pristine::Disabled;
+        }
         self.soft = down;
     }
 
     /// Sostenuto: dampers of the keys held at this moment stay up until the pedal is released.
     pub fn set_sostenuto(&mut self, down: bool) {
+        if down || self.notes.iter().any(|n| n.sost) {
+            self.pristine = Pristine::Disabled;
+        }
         let target = self.sh.damp_max * self.pedal_damping;
         for ni in 0..self.notes.len() {
             let n = &mut self.notes[ni];
@@ -1570,41 +1607,51 @@ impl Piano {
 
     /// One internal time step; returns the two ear pressures in pascal at the internal rate.
     pub fn step(&mut self) -> (f64, f64) {
+        if self.pristine == Pristine::Zero {
+            // All dynamic buffers are an exact zero fixed point, proven by the first
+            // real tick. Only clocks advance. The process/FIR loop remains unchanged.
+            unsafe { (&mut *self.sh.radiation.get()).advance_pristine_zero() };
+            self.sh.vb.fetch_xor(1, Ordering::Relaxed);
+            self.step_count += 1;
+            if self.step_count & 63 == 0 {
+                self.housekeeping();
+            }
+            return unsafe { *self.sh.rad_out.get() };
+        }
         // A plain reference that does not tie up `self`: the shared state outlives this call.
         let sh: &Shared = unsafe { &*Arc::as_ptr(&self.sh) };
         let k = self.k;
         let shared = !self.threads.is_empty() && sh.active.load(Ordering::Relaxed);
-        // Start a pass over all chunks of a phase. With helpers active the caller may do other
-        // work before finishing it; without them the pass runs here and now.
-        let post = |phase: usize| {
+        // One shared pass per sample; hammer-contact strings finish serially below.
+        let post = || {
             if shared {
                 sh.done.store(0, Ordering::Release);
                 let generation = (sh.ticket.load(Ordering::Relaxed) >> 34) + 1;
-                sh.ticket.store((generation << 34) | ((phase as u64) << 32), Ordering::Release);
+                sh.ticket.store(generation << 34, Ordering::Release);
             } else {
-                for c in 0..sh.phase_chunks[phase].len() {
-                    unsafe { sh.chunk_work(phase, c) };
+                for c in 0..sh.chunks.len() {
+                    unsafe { sh.chunk_work(c) };
                 }
             }
         };
         // Finish a shared pass: take whatever chunks are left, then wait for the helpers' ones.
-        let finish = |phase: usize| {
+        let finish = || {
             if !shared {
                 return;
             }
-            while let Some((ph, c)) = sh.claim() {
-                unsafe { sh.chunk_work(ph, c) };
+            while let Some(c) = sh.claim() {
+                unsafe { sh.chunk_work(c) };
                 sh.done.fetch_add(1, Ordering::Release);
             }
-            let all = sh.phase_chunks[phase].len() as i32;
+            let all = sh.chunks.len() as i32;
             while sh.done.load(Ordering::Acquire) < all {
                 spin();
             }
             sh.ticket.store(NO_JOB | (sh.ticket.load(Ordering::Relaxed) & !0x3_ffff_ffff), Ordering::Release);
         };
 
-        post(0); // strings, plate stencil and last step's sound, side by side
-        finish(0);
+        post(); // strings, plate stencil and last step's sound, side by side
+        finish();
         // From here to the next post only this thread touches the shared state.
         let (r, w, vw) = unsafe { (sh.r.all_mut(), sh.w.all_mut(), sh.vw.all_mut()) };
         sh.plate.apply_bridges(w, r);
@@ -1657,6 +1704,11 @@ impl Piano {
         for ni in 0..self.notes.len() {
             if self.notes[ni].hammer_active {
                 self.step_hammer(ni);
+                let n = &self.notes[ni];
+                for s in &mut self.strings_mut()[n.first..n.first + n.total] {
+                    unsafe { sh.advance_string(s, self.vb() ^ 1) };
+                    s.defer_advance = n.hammer_active;
+                }
             }
             let n = &mut self.notes[ni];
             if n.key_phase == 1 || n.key_phase == 3 || n.returning {
@@ -1664,9 +1716,7 @@ impl Piano {
             }
         }
         sh.vb.fetch_xor(1, Ordering::Relaxed);
-        post(1); // advance the string displacements while this thread solves for the stiffeners
         sh.plate.solve_stiff(r, &mut self.solve_work);
-        finish(1);
         {
             // Advance the plate and keep what radiates for the next step's radiation task.
             let keep = unsafe { sh.rad_in.all_mut() };
@@ -1681,7 +1731,35 @@ impl Piano {
         if self.step_count & 63 == 0 {
             self.housekeeping();
         }
+        if self.pristine == Pristine::Candidate {
+            self.pristine = if self.zero_tick(out) { Pristine::Zero } else { Pristine::Disabled };
+        }
         out
+    }
+
+    // Called once, after a genuine normal tick exercised the private plate factors,
+    // coupling coefficients and radiation filters. Equality rejects NaN/Inf as well as
+    // nonzero values, without a separate validation mirror of every static coefficient.
+    fn zero_tick(&self, out: (f64, f64)) -> bool {
+        let sh = &self.sh;
+        let zero = |s: &[f64]| s.iter().all(|&x| x == 0.0);
+        let buffers = [&sh.u, &sh.v[0], &sh.v[1], &sh.xi, &sh.vxi, &sh.end_force,
+            &sh.w, &sh.vw, &sh.r, &sh.rad_in, &sh.air_now];
+        let rad_out = unsafe { *sh.rad_out.get() };
+        out.0 == 0.0 && out.1 == 0.0 && rad_out.0 == 0.0 && rad_out.1 == 0.0
+            && buffers.iter().all(|b| zero(unsafe { b.all() }))
+            && zero(&self.solve_work) && self.hist.iter().all(|h| zero(h))
+            && self.notes.iter().all(|n| !n.hammer_active && !n.key_down && !n.sost
+                && n.key_phase == 0 && !n.returning && !n.checked
+                && zero(&[n.eta, n.veta, n.xi, n.vxi, n.ky, n.kv, n.k_force,
+                    n.k_slow, n.hy, n.hv, n.h_slow]))
+            && self.strings().iter().all(|s| !(s.awake && s.has_damper)
+                && !s.defer_advance && !s.l_on && s.damped_steps == 0
+                && s.damp_rate == s.damp_target
+                && zero(&[s.zeta, s.zeta_prev, s.force, s.end_peak, s.l_peak, s.tension_change]))
+            && self.pulse_count == 0 && self.ext_f == 0.0
+            && self.pedal_hiss == 0.0 && self.pedal_speed == 0.0
+            && unsafe { (&*sh.radiation.get()).is_pristine_zero() }
     }
 
     /// Renders stereo frames. Allocation and lock free.
@@ -1755,8 +1833,8 @@ impl Piano {
                         });
                         continue;
                     }
-                    if let Some((phase, c)) = sh.claim() {
-                        unsafe { sh.chunk_work(phase, c) };
+                    if let Some(c) = sh.claim() {
+                        unsafe { sh.chunk_work(c) };
                         sh.done.fetch_add(1, Ordering::Release);
                     } else {
                         spin();
@@ -1861,9 +1939,11 @@ impl Piano {
         unsafe { self.sh.w.all() }
     }
     pub fn plate_u_mut(&mut self) -> &mut [f64] {
+        self.pristine = Pristine::Disabled;
         unsafe { self.sh.w.all_mut() }
     }
     pub fn plate_v_mut(&mut self) -> &mut [f64] {
+        self.pristine = Pristine::Disabled;
         unsafe { self.sh.vw.all_mut() }
     }
     pub fn string_count(&self) -> usize {
@@ -1886,10 +1966,12 @@ impl Piano {
         self.nodes(&self.sh.u, &self.strings()[index])
     }
     pub fn string_u_mut(&mut self, index: usize) -> &mut [f64] {
+        self.pristine = Pristine::Disabled;
         self.nodes(&self.sh.u, &self.strings()[index])
     }
     /// Per-step increment at nodes 0..=N of a string.
     pub fn string_v_mut(&mut self, index: usize) -> &mut [f64] {
+        self.pristine = Pristine::Disabled;
         self.nodes(&self.sh.v[self.vb()], &self.strings()[index])
     }
     pub fn string_nodes(&self, index: usize) -> usize {
@@ -1946,6 +2028,7 @@ impl Piano {
     }
     /// External point force on the board for the next step only (measurement hook).
     pub fn push_board(&mut self, piano_xy: Vec2, newtons: f64) {
+        self.pristine = Pristine::Disabled;
         self.ext_at = self.sh.plate.interp(piano_xy);
         self.ext_f = newtons;
     }
@@ -2003,5 +2086,294 @@ impl Piano {
 impl Drop for Piano {
     fn drop(&mut self) {
         self.set_helper_threads(0, None, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn same_state(a: &Piano, b: &Piano) {
+        let bits = |s: &[f64]| s.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for (x, y) in [(&a.sh.u, &b.sh.u), (&a.sh.v[0], &b.sh.v[0]), (&a.sh.v[1], &b.sh.v[1]),
+            (&a.sh.w, &b.sh.w), (&a.sh.vw, &b.sh.vw), (&a.sh.r, &b.sh.r),
+            (&a.sh.rad_in, &b.sh.rad_in), (&a.sh.air_now, &b.sh.air_now),
+            (&a.sh.end_force, &b.sh.end_force), (&a.sh.xi, &b.sh.xi), (&a.sh.vxi, &b.sh.vxi)] {
+            assert_eq!(bits(unsafe { x.all() }), bits(unsafe { y.all() }));
+        }
+        assert_eq!(a.step_count, b.step_count);
+        assert_eq!(a.vb(), b.vb());
+        assert_eq!(a.hist_pos, b.hist_pos);
+        assert_eq!(a.quiet_checks, b.quiet_checks);
+        assert_eq!(a.sh.active.load(Ordering::Relaxed), b.sh.active.load(Ordering::Relaxed));
+        assert_eq!(bits(&a.solve_work), bits(&b.solve_work));
+        for i in 0..2 { assert_eq!(bits(&a.hist[i]), bits(&b.hist[i])); }
+        assert_eq!(a.rng, b.rng);
+        assert_eq!(a.pedal_step, b.pedal_step);
+        assert_eq!(a.pulse_count, b.pulse_count);
+        assert_eq!(a.awake_strings(), b.awake_strings());
+        for (a, b) in a.strings().iter().zip(b.strings()) {
+            assert_eq!((a.awake, a.defer_advance, a.l_on, a.damped_steps),
+                (b.awake, b.defer_advance, b.l_on, b.damped_steps));
+            assert_eq!(bits(&[a.damp_rate, a.damp_target, a.damp_land, a.zeta, a.zeta_prev,
+                a.force, a.end_peak, a.l_peak, a.tension_change]),
+                bits(&[b.damp_rate, b.damp_target, b.damp_land, b.zeta, b.zeta_prev,
+                    b.force, b.end_peak, b.l_peak, b.tension_change]));
+        }
+        for (a, b) in a.notes.iter().zip(&b.notes) {
+            assert_eq!((a.hammer_active, a.key_down, a.sost, a.key_phase, a.returning, a.checked),
+                (b.hammer_active, b.key_down, b.sost, b.key_phase, b.returning, b.checked));
+            assert_eq!(bits(&[a.eta, a.veta, a.xi, a.vxi, a.ky, a.kv, a.k_force, a.k_slow, a.hy, a.hv, a.h_slow]),
+                bits(&[b.eta, b.veta, b.xi, b.vxi, b.ky, b.kv, b.k_force, b.k_slow, b.hy, b.hv, b.h_slow]));
+        }
+        assert_eq!(a.energy().to_bits(), b.energy().to_bits());
+    }
+
+    fn paired_render(fast: &mut Piano, normal: &mut Piano, frames: usize) {
+        let (mut a, mut b) = ([vec![0.0; frames], vec![0.0; frames]], [vec![0.0; frames], vec![0.0; frames]]);
+        let [l, r] = &mut a;
+        fast.process(l, r);
+        let [l, r] = &mut b;
+        normal.process(l, r);
+        for (a, b) in a.iter().flatten().zip(b.iter().flatten()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "stereo sample bits");
+        }
+        same_state(fast, normal);
+    }
+
+    fn initial_noops(p: &mut Piano) {
+        p.set_pedal(0.0);
+        p.set_sustain(false);
+        p.set_soft_pedal(false);
+        p.set_sostenuto(false);
+        for midi in 21..=108 { p.note_off(midi, 1.0); }
+    }
+
+    #[test]
+    fn pristine_mixed_steps_fir_helpers_and_pedals_match_normal_bits() {
+        for os in [1, 2, 4] {
+            for (room, air) in [(false, false), (false, true), (true, false), (true, true)] {
+                for helpers in [0, 3] {
+                    let d = make_grand(&GrandOptions { first_key: 40, last_key: 88,
+                        room_enabled: room, air_loading: air, ..GrandOptions::default() });
+                    let o = PianoOptions { oversample: os, board_grid_scale: 2.0, ..PianoOptions::default() };
+                    let mut fast = Piano::new(&d, &o).unwrap();
+                    let mut normal = Piano::new(&d, &o).unwrap();
+                    normal.pristine = Pristine::Disabled;
+                    for p in [&mut fast, &mut normal] {
+                        p.set_helper_threads(helpers, None, None);
+                        initial_noops(p);
+                    }
+                    let lead = if os > 1 && room && air && helpers == 3 { 10003 } else {
+                        [0, 1, 63, 64, 65, 4097][(os + helpers + room as usize + air as usize) % 6]
+                    };
+                    for _ in 0..lead {
+                        let a = fast.step();
+                        let b = normal.step();
+                        assert_eq!((a.0.to_bits(), a.1.to_bits()), (b.0.to_bits(), b.1.to_bits()));
+                    }
+                    for frames in [1, 7, 65, 3, 127] {
+                        paired_render(&mut fast, &mut normal, frames);
+                        initial_noops(&mut fast);
+                        initial_noops(&mut normal);
+                    }
+                    assert!(fast.pristine == Pristine::Zero, "verified no-ops disabled fast path");
+                    for stage in 0..7 {
+                        for p in [&mut fast, &mut normal] {
+                            match stage {
+                                0 => p.note_on(60, 0.3),
+                                1 => p.set_sustain(true),
+                                2 => { p.set_sostenuto(true); p.note_on(84, 5.0); }
+                                3 => p.note_off(60, 1.0),
+                                4 => { p.set_sustain(false); p.set_soft_pedal(true); }
+                                5 => { p.set_sostenuto(false); p.note_off(84, 1.0); }
+                                _ => p.push_board(Vec2 { x: 0.5, y: 0.5 }, 0.1),
+                            }
+                        }
+                        paired_render(&mut fast, &mut normal, 257);
+                        assert!(fast.pristine == Pristine::Disabled);
+                    }
+                    println!("pristine stereo/state bits: os={os}, room={room}, air={air}, helpers={helpers}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pristine_mutators_and_slice_exposure_disable_permanently() {
+        let d = make_grand(&GrandOptions { first_key: 40, last_key: 88, ..GrandOptions::default() });
+        let o = PianoOptions { board_grid_scale: 2.0, ..PianoOptions::default() };
+        for proved in [false, true] {
+        for case in 0..11 {
+            let mut fast = Piano::new(&d, &o).unwrap();
+            let mut normal = Piano::new(&d, &o).unwrap();
+            normal.pristine = Pristine::Disabled;
+            if proved {
+                paired_render(&mut fast, &mut normal, 65);
+                assert!(fast.pristine == Pristine::Zero);
+            }
+            for p in [&mut fast, &mut normal] {
+                let node = p.plate().gid[0];
+                let s = p.strings().iter().position(|s| !s.has_damper).unwrap();
+                match case {
+                    0 => p.note_on(60, 0.0),
+                    1 => p.set_pedal(0.1), // Below damper lift: pedal hiss still advances RNG.
+                    2 => p.set_soft_pedal(true),
+                    3 => p.set_sostenuto(true),
+                    4 => p.push_board(Vec2 { x: 0.5, y: 0.5 }, 1.0),
+                    5 => p.plate_u_mut()[node] = 1e-10,
+                    6 => p.plate_v_mut()[node] = 1e-10,
+                    7 => p.string_u_mut(s)[1] = 1e-10,
+                    8 => p.string_v_mut(s)[1] = 1e-10,
+                    9 => p.push_board(Vec2 { x: 0.0, y: 0.0 }, 0.0),
+                    _ => p.set_sustain(true),
+                }
+            }
+            assert!(fast.pristine == Pristine::Disabled, "mutator {case}");
+            paired_render(&mut fast, &mut normal, 257);
+            for p in [&mut fast, &mut normal] { p.note_on(60, 2.0); p.note_off(60, 1.0); }
+            paired_render(&mut fast, &mut normal, 257);
+            assert!(fast.pristine == Pristine::Disabled);
+        }
+        }
+        // Even a no-write slice borrow permanently invalidates; it is not a zero test.
+        let mut p = Piano::new(&d, &o).unwrap();
+        let _ = p.string_u_mut(0);
+        p.process(&mut [0.0; 4], &mut [0.0; 4]);
+        assert!(p.pristine == Pristine::Disabled);
+    }
+
+    #[test]
+    fn pristine_rejects_awake_dampers_nonfinite_and_nonzero_tick() {
+        for (ring, press, attached) in [(true, 0.1, true), (true, 0.0, true), (false, 0.1, false), (false, 0.0, false)] {
+            let mut d = make_grand(&GrandOptions { first_key: 40, last_key: 40,
+                damped_strings_ring: ring, damper_press_n: press, ..GrandOptions::default() });
+            d.notes[0].strings[0].attached = attached;
+            let mut p = Piano::new(&d, &PianoOptions::default()).unwrap();
+            assert!(p.pristine == Pristine::Disabled);
+            p.step();
+            assert!(p.pristine == Pristine::Disabled);
+        }
+        let d = make_grand(&GrandOptions { first_key: 40, last_key: 40, ..GrandOptions::default() });
+        for value in [1e-20, f64::NAN, f64::INFINITY] {
+            let mut p = Piano::new(&d, &PianoOptions::default()).unwrap();
+            // Simulate a bad derived coefficient/result before the one-time proof.
+            unsafe { *p.sh.rad_out.get() = (value, 0.0) };
+            assert!(!p.zero_tick((value, 0.0)));
+            unsafe { p.sh.w.all_mut()[p.plate().gid[0]] = value };
+            p.step();
+            assert!(p.pristine == Pristine::Disabled);
+        }
+    }
+
+    #[test]
+    fn pristine_silence_matches_normal_ticks_and_first_note_bits() {
+        let d = make_grand(&GrandOptions { first_key: 40, last_key: 88, ..GrandOptions::default() });
+        let o = PianoOptions { board_grid_scale: 2.0, ..PianoOptions::default() };
+        let mut fast = Piano::new(&d, &o).unwrap();
+        let mut normal = Piano::new(&d, &o).unwrap();
+        normal.pristine = Pristine::Disabled;
+        for i in 0..10000 {
+            let before = std::time::Instant::now();
+            let a = fast.step();
+            let fast_wall = before.elapsed();
+            let before = std::time::Instant::now();
+            let b = normal.step();
+            if i == 0 {
+                println!("one cold first tick: real tick + zero proof {:?}; forced-normal {:?} (wall snapshot, not a CPU sum)", fast_wall, before.elapsed());
+            }
+            assert_eq!((a.0.to_bits(), a.1.to_bits()), (b.0.to_bits(), b.1.to_bits()), "silent tick {i}");
+            if [0, 1, 62, 63, 64, 9999].contains(&i) { same_state(&fast, &normal); }
+        }
+        assert!(fast.pristine == Pristine::Zero);
+        for p in [&mut fast, &mut normal] {
+            // Helpers may be installed after an arbitrary amount of pristine stepping.
+            p.set_helper_threads(3, None, None);
+            p.note_on(60, 2.0);
+        }
+        for i in 0..5000 {
+            let a = fast.step();
+            let b = normal.step();
+            assert_eq!((a.0.to_bits(), a.1.to_bits()), (b.0.to_bits(), b.1.to_bits()), "active tick {i}");
+        }
+        same_state(&fast, &normal);
+    }
+
+    #[test]
+    fn string_kernel_leaves_prescribed_endpoints_and_ghosts_alone() {
+        for n in [2, 3, 8, 200] {
+            let u: Vec<f64> = (0..n + 3).map(|i| (i as f64).sin()).collect();
+            let v = vec![0.0; n + 3];
+            let mut next = vec![123.0; n + 3];
+            string_kernel(&u, &v, &mut next, [1.0, 0.0, 0.0, 0.0, 0.0]);
+            assert_eq!(&next[2..n + 1], &u[2..n + 1]);
+            for i in [0, 1, n + 1, n + 2] {
+                assert_eq!(next[i], 123.0, "N={n}, prescribed/ghost index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn fused_strings_match_helpers_through_retrigger_pedals_and_wake() {
+        let d = make_grand(&GrandOptions { first_key: 64, last_key: 64, ..GrandOptions::default() });
+        let o = PianoOptions { board_grid_scale: 1.5, ..PianoOptions::default() };
+        let mut engines = [Piano::new(&d, &o).unwrap(), Piano::new(&d, &o).unwrap()];
+        engines[1].set_helper_threads(3, None, None);
+        let mut output = [[[0.0f32; 64]; 2]; 2];
+        for block in 0..600 {
+            for (p, out) in engines.iter_mut().zip(&mut output) {
+                match block {
+                    0 => p.note_on(84, 3.0),
+                    5 => p.note_on(84, 2.0),
+                    20 | 70 | 280 => p.note_off(84, 1.0),
+                    30 => p.set_sustain(true),
+                    50 => p.set_sostenuto(true),
+                    60 => p.note_on(84, 2.0),
+                    80 => { p.set_soft_pedal(true); p.set_sustain(false); }
+                    90 => p.set_sostenuto(false),
+                    250 => p.note_on(84, 0.0),
+                    255 => p.note_on(84, 0.3),
+                    _ => {}
+                }
+                let [left, right] = out;
+                p.process(left, right);
+                let n = &p.notes[0];
+                for (i, s) in p.strings().iter().enumerate() {
+                    let struck = i >= n.first && i < n.first + n.total;
+                    assert_eq!(s.defer_advance, struck && n.hammer_active, "block {block}, string {i}");
+                }
+            }
+            assert_eq!(output[0], output[1], "stereo output at block {block}");
+            for (a, b) in engines[0].strings().iter().zip(engines[1].strings()) {
+                assert_eq!(a.awake, b.awake);
+                assert_eq!(engines[0].nodes(&engines[0].sh.u, a), engines[1].nodes(&engines[1].sh.u, b));
+                assert_eq!(engines[0].nodes(&engines[0].sh.v[engines[0].vb()], a), engines[1].nodes(&engines[1].sh.v[engines[1].vb()], b));
+            }
+        }
+    }
+
+    #[test]
+    fn string_bridge_increment_survives_wake_and_both_buffer_parities() {
+        let d = make_grand(&GrandOptions { first_key: 40, last_key: 40, ..GrandOptions::default() });
+        let mut piano = Piano::new(&d, &PianoOptions::default()).unwrap();
+        for pass in 0..2 {
+            piano.sleep(0);
+            unsafe { piano.sh.vw.all_mut().fill(1e-9 * (pass + 1) as f64) };
+            piano.wake(0);
+            let s = &piano.strings()[0];
+            let expected = piano.sh.end_at[0].eval(unsafe { piano.sh.vw.all() });
+            assert!(expected.abs() > 0.0);
+            for buf in &piano.sh.v {
+                assert_eq!(piano.nodes(buf, s)[0], 0.0);
+                assert_eq!(piano.nodes(buf, s)[s.n], expected);
+            }
+            for vb in 0..2 {
+                piano.sh.vb.store(vb, Ordering::Relaxed);
+                unsafe { piano.sh.step_string(0) };
+                let next = piano.nodes(&piano.sh.v[vb as usize ^ 1], s);
+                assert_eq!(next[0], 0.0);
+                assert_eq!(next[s.n], expected);
+            }
+        }
     }
 }
