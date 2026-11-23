@@ -141,4 +141,9 @@ pub static PARAMS: &[Param] = &[
     position!("Piano position, along the strings", piano_y),
     position!("Listener position, along the keyboard", listener_x),
     position!("Listener position, along the strings", listener_y),
+    slider!(0, "Room shape", room_shape, 0.0, 3.0, false, "%.0f", "Floor-plan geometry: 0 rectangular, 1 fan concert hall, 2 angled studio, 3 L-shaped alcove."),
+    slider!(0, "Ceiling slope", ceiling_slope_deg, -15.0, 15.0, false, "%.0f deg", "Tilt of the ceiling along the room length. Positive rises toward the listener."),
+    slider!(0, "Wall splay", wall_splay, -0.30, 0.30, false, "%.2f", "Tapers side walls wider or narrower toward the listener; drag corners on the floor plan too."),
+    slider!(0, "Wall skew", wall_skew, -0.25, 0.25, false, "%.2f", "Angled wall shear to break parallel-wall flutter echoes; drag corners on the floor plan too."),
+    switch!(0, "Binaural head shadow", binaural_head),
 ];

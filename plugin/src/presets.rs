@@ -34,6 +34,8 @@ pub fn apply(i: usize, o: &mut GrandOptions) {
         }
         2 => {
             o.room_enabled = true;
+            o.room_shape = 2.0; // Angled Studio
+            o.ceiling_slope_deg = 0.0;
             o.room_lx = 5.0;
             o.room_ly = 4.2;
             o.room_lz = 2.7;
@@ -47,6 +49,8 @@ pub fn apply(i: usize, o: &mut GrandOptions) {
         }
         3 => {
             o.room_enabled = true;
+            o.room_shape = 1.0; // Concert Hall (Fan)
+            o.ceiling_slope_deg = 4.0;
             o.room_lx = 28.0;
             o.room_ly = 18.0;
             o.room_lz = 12.0;
@@ -60,6 +64,8 @@ pub fn apply(i: usize, o: &mut GrandOptions) {
         }
         4 => {
             o.room_enabled = true;
+            o.room_shape = 0.0;
+            o.ceiling_slope_deg = 8.0;
             o.room_lx = 16.0;
             o.room_ly = 8.0;
             o.room_lz = 9.0;

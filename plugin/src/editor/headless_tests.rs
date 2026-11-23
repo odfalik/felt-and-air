@@ -155,12 +155,9 @@ impl Fixture {
             data.remove::<Vec<SelectorTrace>>(Id::new("selector:responses"));
             for kind in ["preset","demo"] {data.remove::<(Rect,Rect)>(Id::new(format!("selector:popup:{kind}")));}
             data.remove::<crate::editor::illustration::action::PaintTrace>(Id::new("action:paint"));
-            data.remove::<(Rect,Rect)>(Id::new("compact:anatomy-panel:3"));
-            data.remove::<(Rect,Vec2,Vec2)>(Id::new("left:scroll"));
-            for name in ["room-panel","decay-header","decay-body","decay-plot","strings-panel"] {
+            for name in ["room-panel","strings-panel","board-panel"] {
                 data.remove::<(Rect,Rect)>(Id::new(format!("left:{name}")));
             }
-            data.remove::<bool>(Id::new("left:decay-open"));
             data.remove::<bool>(Id::new("editor:setup-name-focused"));
             for name in ["editor:save-open", "editor:setup-name", "editor:setup-cancel",
                 "editor:pedal-sustain", "editor:pedal-soft", "editor:pedal-sostenuto"] {
@@ -246,7 +243,7 @@ fn check_room_editor_wheel() {
                 let overflows = content.y > viewport.height() + 1.0;
                 if overflows { overflow_cases += 1; }
                 else {
-                    let last = PARAMS.iter().rev().find(|p| p.tab == 0 && p.kind != piano_engine::params::Kind::Switch).unwrap();
+                    let last = PARAMS.iter().find(|p| p.name == "Listener position, along the strings").unwrap();
                     let (rect, clip, _) = f.trace("control", last.name).expect("actual final Room control");
                     assert!(rect.intersect(clip).intersect(viewport).intersect(f.screen()).height() > 8.0,
                         "fitting content must have its final control already visible");
@@ -312,7 +309,7 @@ fn check_room_last_control_and_factory_resets() {
         if content.y > viewport.height() + 1.0 { assert!(offset.y > 0.0); }
         else { assert_eq!(offset.y, 0.0, "fitting Room controls must already be visible"); }
         assert!(offset.y <= (content.y - viewport.height()).max(0.0) + 1.0);
-        let last = PARAMS.iter().rev().find(|p| p.tab == 0 && p.kind != piano_engine::params::Kind::Switch).unwrap();
+        let last = PARAMS.iter().find(|p| p.name == "Listener position, along the strings").unwrap();
         let (rect, clip, _) = f.trace("control", last.name).expect("actual final Room slider response");
         assert!(rect.intersect(clip).intersect(viewport).intersect(f.screen()).height() > 8.0, "last Room control unreachable: {}", last.name);
         for p in PARAMS.iter().filter(|p| p.tab == 0) {

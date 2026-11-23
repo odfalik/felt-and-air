@@ -217,6 +217,13 @@ pub extern "C" fn pp_snapshot_copy(dst: *mut Snapshot, src: *const Snapshot) {
     d.focus_midi = s.focus_midi;
     d.awake = s.awake;
     d.action = s.action;
+    d.damper_lift = s.damper_lift;
+    d.damper_span = s.damper_span;
+    d.key_depression = s.key_depression;
+    d.shank_flex_m = s.shank_flex_m;
+    d.felt_compression_m = s.felt_compression_m;
+    d.key_hammer_lift = s.key_hammer_lift;
+    d.key_damper_lift = s.key_damper_lift;
 }
 #[no_mangle]
 pub extern "C" fn pp_snapshot_view(s: *const Snapshot, out: *mut SnapshotView) {

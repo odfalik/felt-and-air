@@ -20,9 +20,14 @@ pub(crate) fn grid_scale(index: i32) -> Option<f64> {
 }
 
 impl Setup {
-    /// Reject corrupt/incompatible snapshots rather than silently baking different settings.
+    /// Accept current-length setups and older setups (padding missing trailing defaults),
+    /// while rejecting corrupt/out-of-range values.
     pub fn options(&self) -> Result<GrandOptions, String> {
-        if self.values.len() != PARAMS.len()
+        let len = self.values.len();
+        let valid_len = len == PARAMS.len()
+            || len == PARAMS.len().saturating_sub(3)
+            || len == PARAMS.len().saturating_sub(5);
+        if !valid_len
             || !(0..=3).contains(&self.grid)
             || !self.volume.is_finite()
             || !(0.0..=3.0).contains(&self.volume)

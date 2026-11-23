@@ -515,7 +515,7 @@ struct Pulse {
 
 /// A copy of what a display needs. Make one with `Piano::new_snapshot`, then fill it from the
 /// audio thread (allocation free).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Snapshot {
     /// Plate displacement, grid storage, metres.
     pub board: Vec<f32>,
@@ -529,6 +529,44 @@ pub struct Snapshot {
     pub awake: usize,
     /// Read-only real action history; identity is also labelled by Display.generation.
     pub action: ActionTrace,
+    /// Focus note real-time simulation telemetry (copied at 30 Hz, zero audio-step work).
+    /// Damper lift: 0.0 resting on wire .. 1.0 fully lifted.
+    pub damper_lift: f32,
+    /// Focus note damper contact span [start, end] normalized along speaking length (0..1).
+    /// [0.0, 0.0] when the note has no damper (high treble).
+    pub damper_span: [f32; 2],
+    /// Focus key depression: 0.0 at rest .. 1.0 full key travel.
+    pub key_depression: f32,
+    /// Focus wooden shank elastic flex (eta - xi), metres during hammer flight.
+    pub shank_flex_m: f32,
+    /// Focus hammer felt compression max(0, head - wire), metres during contact.
+    pub felt_compression_m: f32,
+    /// Per-key (A0=0..C8=87) real normalized hammer elevation (0.0 rest .. 1.0 string).
+    pub key_hammer_lift: [f32; 88],
+    /// Per-key (A0=0..C8=87) real normalized damper lift (0.0 resting .. 1.0 lifted).
+    pub key_damper_lift: [f32; 88],
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            board: Vec::new(),
+            string_level: Vec::new(),
+            shape: [Vec::new(), Vec::new(), Vec::new()],
+            shape_nodes: [0; 3],
+            hammer_force: [0.0; 3],
+            focus_midi: -1,
+            awake: 0,
+            action: ActionTrace::default(),
+            damper_lift: 0.0,
+            damper_span: [0.0, 0.0],
+            key_depression: 0.0,
+            shank_flex_m: 0.0,
+            felt_compression_m: 0.0,
+            key_hammer_lift: [0.0; 88],
+            key_damper_lift: [0.0; 88],
+        }
+    }
 }
 
 pub type ThreadHook = Arc<dyn Fn() + Send + Sync>;
@@ -2106,6 +2144,13 @@ impl Piano {
             focus_midi: -1,
             awake: 0,
             action: ActionTrace::default(),
+            damper_lift: 0.0,
+            damper_span: [0.0, 0.0],
+            key_depression: 0.0,
+            shank_flex_m: 0.0,
+            felt_compression_m: 0.0,
+            key_hammer_lift: [0.0; 88],
+            key_damper_lift: [0.0; 88],
         }
     }
 
@@ -2128,20 +2173,71 @@ impl Piano {
             }
             snap.string_level[i] = m;
         }
+        // Populate real per-key hammer & damper elevations for the receding perspective bank.
+        snap.key_hammer_lift.fill(0.0);
+        snap.key_damper_lift.fill(0.0);
+        let rest_dist = self.action.rest_distance.max(1e-4);
+        let damp_max = self.sh.damp_max.max(1e-6);
+        let strings = self.strings();
+        for n in &self.notes {
+            if (21..=108).contains(&n.midi) {
+                let k = (n.midi - 21) as usize;
+                let h_lift = if n.hammer_active {
+                    ((n.eta + rest_dist) / rest_dist).clamp(0.0, 1.05) as f32
+                } else if n.returning || n.checked {
+                    ((rest_dist - n.hy) / rest_dist).clamp(0.0, 1.0) as f32
+                } else {
+                    0.0
+                };
+                snap.key_hammer_lift[k] = h_lift;
+                if n.count > 0 {
+                    let s0 = &strings[n.first];
+                    snap.key_damper_lift[k] = if s0.has_damper {
+                        (1.0 - s0.damp_rate / damp_max).clamp(0.0, 1.0) as f32
+                    } else {
+                        1.0
+                    };
+                }
+            }
+        }
         snap.focus_midi = focus_midi;
         snap.shape_nodes = [0; 3];
         snap.hammer_force = [0.0; 3];
+        snap.damper_lift = 0.0;
+        snap.damper_span = [0.0, 0.0];
+        snap.key_depression = 0.0;
+        snap.shank_flex_m = 0.0;
+        snap.felt_compression_m = 0.0;
         let Some(ni) = (if focus_midi >= 0 { self.note_of_midi[(focus_midi & 127) as usize] } else { None }) else { return };
         let n = &self.notes[ni];
+        snap.key_depression = (n.ky / self.action.key_travel.max(1e-6)).clamp(0.0, 1.0) as f32;
+        if n.hammer_active && n.s_mass > 0.0 {
+            snap.shank_flex_m = (n.eta - n.xi) as f32;
+        }
+        let mut max_comp = 0.0f64;
         for i in 0..n.count {
-            let s = &self.strings()[n.first + i];
+            let s = &strings[n.first + i];
             let u = self.nodes(&self.sh.u, s);
             snap.shape_nodes[i] = s.n + 1;
             for l in 0..=s.n {
                 snap.shape[i][l] = if s.awake { u[l] as f32 } else { 0.0 };
             }
             snap.hammer_force[i] = s.force as f32;
+            if i == 0 {
+                if s.has_damper && s.n > 0 {
+                    snap.damper_lift = (1.0 - s.damp_rate / damp_max).clamp(0.0, 1.0) as f32;
+                    snap.damper_span = [s.dmp0 as f32 / s.n as f32, s.dmp1 as f32 / s.n as f32];
+                } else {
+                    snap.damper_lift = 1.0;
+                    snap.damper_span = [0.0, 0.0];
+                }
+            }
+            if n.hammer_active && s.force > 0.0 {
+                let y_str = s.ham_g[0] * u[s.ham_l] + s.ham_g[1] * u[s.ham_l + 1];
+                max_comp = max_comp.max((n.eta - y_str).max(0.0));
+            }
         }
+        snap.felt_compression_m = max_comp as f32;
     }
 }
 

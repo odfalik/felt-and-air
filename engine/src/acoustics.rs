@@ -15,7 +15,7 @@
 //! low and resistive at high frequency) and the delayed acceleration of every other patch.
 //! Both faces of the board count.
 
-use crate::design::{PianoDesign, Vec2};
+use crate::design::{point_in_polygon, LidDesign, PianoDesign, RoomDesign, RoomShape, Vec2};
 use crate::plate::Plate;
 use std::f64::consts::PI;
 
@@ -29,6 +29,220 @@ pub fn room_decay_time(lx: f64, ly: f64, lz: f64, absorption: f64) -> f64 {
     let surface = 2.0 * (lx * ly + lx * lz + ly * lz);
     let absorb = absorption * surface;
     0.161 * volume / absorb
+}
+
+/// Exact volume (m^3) and total surface area (m^2) for any room shape and sloped ceiling.
+pub fn room_geometry_metrics(room: &RoomDesign) -> (f64, f64) {
+    if room.is_plain_shoebox() {
+        let volume = room.lx * room.ly * room.lz;
+        let surface = 2.0 * (room.lx * room.ly + room.lx * room.lz + room.ly * room.lz);
+        return (volume, surface);
+    }
+    let poly = room.floor_polygon();
+    let n = poly.len();
+    let mut area2 = 0.0;
+    let mut cx_num = 0.0;
+    let mut wall_area = 0.0;
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[(i + 1) % n];
+        let cross = a.x * b.y - b.x * a.y;
+        area2 += cross;
+        cx_num += (a.x + b.x) * cross;
+        let len = (b.x - a.x).hypot(b.y - a.y);
+        wall_area += len * 0.5 * (room.ceiling_z_at(a.x) + room.ceiling_z_at(b.x));
+    }
+    let floor_area = (0.5 * area2).abs().max(1e-3);
+    let cx = if area2.abs() > 1e-9 { cx_num / (3.0 * area2) } else { 0.5 * room.lx };
+    let slope = room.ceiling_slope_tan();
+    let ceiling_area = floor_area * slope.hypot(1.0);
+    let volume = (floor_area * room.ceiling_z_at(cx)).max(1e-3);
+    let surface = (floor_area + ceiling_area + wall_area).max(1e-3);
+    (volume, surface)
+}
+
+#[derive(Clone, Copy)]
+enum FacetKind {
+    Floor,
+    Ceiling,
+    Wall { a: Vec2, b: Vec2, len2: f64 },
+}
+
+#[derive(Clone, Copy)]
+struct Facet {
+    /// Unit inward normal.
+    n: [f64; 3],
+    /// Plane equation: n . p = d.
+    d: f64,
+    kind: FacetKind,
+}
+
+impl Facet {
+    #[inline]
+    fn signed_dist(&self, p: [f64; 3]) -> f64 {
+        self.n[0] * p[0] + self.n[1] * p[1] + self.n[2] * p[2] - self.d
+    }
+
+    #[inline]
+    fn mirror(&self, p: [f64; 3]) -> [f64; 3] {
+        let dist = self.signed_dist(p);
+        [p[0] - 2.0 * dist * self.n[0], p[1] - 2.0 * dist * self.n[1], p[2] - 2.0 * dist * self.n[2]]
+    }
+
+    #[inline]
+    fn intersect_segment(&self, p0: [f64; 3], p1: [f64; 3]) -> Option<(f64, [f64; 3])> {
+        let s0 = self.signed_dist(p0);
+        let s1 = self.signed_dist(p1);
+        if s0 * s1 >= 0.0 {
+            return None;
+        }
+        let denom = s0 - s1;
+        if denom.abs() < 1e-12 {
+            return None;
+        }
+        let u = s0 / denom;
+        if u <= 1e-6 || u >= 1.0 - 1e-6 {
+            return None;
+        }
+        Some((u, [p0[0] + u * (p1[0] - p0[0]), p0[1] + u * (p1[1] - p0[1]), p0[2] + u * (p1[2] - p0[2])]))
+    }
+
+    fn contains(&self, p: [f64; 3], poly: &[Vec2], room: &RoomDesign) -> bool {
+        match self.kind {
+            FacetKind::Floor | FacetKind::Ceiling => point_in_polygon(poly, Vec2 { x: p[0], y: p[1] }),
+            FacetKind::Wall { a, b, len2 } => {
+                if len2 < 1e-12 {
+                    return false;
+                }
+                let t = ((p[0] - a.x) * (b.x - a.x) + (p[1] - a.y) * (b.y - a.y)) / len2;
+                if !(-1e-4..=1.0 + 1e-4).contains(&t) {
+                    return false;
+                }
+                let cz = room.ceiling_z_at(p[0]);
+                p[2] >= -1e-4 && p[2] <= cz + 1e-4
+            }
+        }
+    }
+}
+
+fn build_room_facets(room: &RoomDesign, poly: &[Vec2]) -> Vec<Facet> {
+    let mut facets = Vec::with_capacity(poly.len() + 2);
+    // Floor: z = 0, inward normal +z.
+    facets.push(Facet { n: [0.0, 0.0, 1.0], d: 0.0, kind: FacetKind::Floor });
+    // Ceiling: z = lz + (x - 0.5*lx) * s -> s*x - z = 0.5*lx*s - lz, inward normal (s, 0, -1)/norm.
+    let s = room.ceiling_slope_tan();
+    let inv = 1.0 / s.hypot(1.0);
+    let cn = [s * inv, 0.0, -inv];
+    let cd = cn[0] * (0.5 * room.lx) + cn[2] * room.lz;
+    facets.push(Facet { n: cn, d: cd, kind: FacetKind::Ceiling });
+    // Vertical walls (CCW polygon -> inward normal (-dy, dx)/len).
+    for i in 0..poly.len() {
+        let a = poly[i];
+        let b = poly[(i + 1) % poly.len()];
+        let dx = b.x - a.x;
+        let dy = b.y - a.y;
+        let len2 = dx * dx + dy * dy;
+        let len = len2.sqrt();
+        if len < 1e-9 {
+            continue;
+        }
+        let n = [-dy / len, dx / len, 0.0];
+        let d = n[0] * a.x + n[1] * a.y;
+        facets.push(Facet { n, d, kind: FacetKind::Wall { a, b, len2 } });
+    }
+    facets
+}
+
+fn segment_occluded(
+    p0: [f64; 3],
+    p1: [f64; 3],
+    facets: &[Facet],
+    poly: &[Vec2],
+    room: &RoomDesign,
+    ignore_a: usize,
+    ignore_b: usize,
+) -> bool {
+    for (idx, facet) in facets.iter().enumerate() {
+        if idx == ignore_a || idx == ignore_b {
+            continue;
+        }
+        if let Some((u, hit)) = facet.intersect_segment(p0, p1) {
+            if u > 1e-4 && u < 1.0 - 1e-4 && facet.contains(hit, poly, room) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// First-order geometric reflection bounce points (room coordinates, metres) for UI visualization,
+/// computed using the exact same planar mirror equations as `Radiation::new`.
+#[derive(Clone, Debug, Default)]
+pub struct RoomPreviewRays {
+    pub wall_hits: Vec<[f64; 3]>,
+    pub floor_hit: Option<[f64; 3]>,
+    pub ceiling_hit: Option<[f64; 3]>,
+    pub lid_hit: Option<[f64; 3]>,
+}
+
+pub fn room_preview_rays(
+    room: &RoomDesign,
+    lid: &LidDesign,
+    source_room: [f64; 3],
+    listener_room: [f64; 3],
+) -> RoomPreviewRays {
+    let mut out = RoomPreviewRays::default();
+    if room.enabled {
+        let poly = room.floor_polygon();
+        let facets = build_room_facets(room, &poly);
+        for (idx, facet) in facets.iter().enumerate() {
+            if facet.signed_dist(listener_room) <= 1e-6 || facet.signed_dist(source_room) <= 1e-6 {
+                continue;
+            }
+            let mir = facet.mirror(listener_room);
+            let Some((_, hit)) = facet.intersect_segment(source_room, mir) else { continue; };
+            if !facet.contains(hit, &poly, room) {
+                continue;
+            }
+            if segment_occluded(source_room, hit, &facets, &poly, room, idx, usize::MAX)
+                || segment_occluded(hit, listener_room, &facets, &poly, room, idx, usize::MAX)
+            {
+                continue;
+            }
+            match facet.kind {
+                FacetKind::Floor => out.floor_hit = Some(hit),
+                FacetKind::Ceiling => out.ceiling_hit = Some(hit),
+                FacetKind::Wall { .. } => out.wall_hits.push(hit),
+            }
+        }
+    }
+    if lid.open {
+        let th = lid.angle_deg * PI / 180.0;
+        let (nxl, nzl) = (-th.sin(), th.cos());
+        let ex = listener_room[0] - room.piano_x;
+        let ey = listener_room[1] - room.piano_y;
+        let ez = listener_room[2] - room.board_height;
+        let sx = source_room[0] - room.piano_x;
+        let sy = source_room[1] - room.piano_y;
+        let dist = nxl * ex + nzl * (ez - lid.hinge_height);
+        if dist < 0.0 {
+            let (mx, mz) = (ex - 2.0 * dist * nxl, ez - 2.0 * dist * nzl);
+            let sd = nxl * sx + nzl * (0.0 - lid.hinge_height);
+            let denom = nxl * (mx - sx) + nzl * mz;
+            if denom.abs() > 1e-9 {
+                let u = -sd / denom;
+                if u > 0.0 && u < 1.0 {
+                    let hx = sx + u * (mx - sx);
+                    let hy = sy + u * (ey - sy);
+                    let hz = u * mz;
+                    if hx >= 0.0 && hx <= lid.width * th.cos() && hy >= 0.0 && hy <= lid.length {
+                        out.lid_hit = Some([hx + room.piano_x, hy + room.piano_y, hz + room.board_height]);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 #[inline]
@@ -87,6 +301,13 @@ pub struct Radiation {
     img_delay: [Vec<usize>; 2],
     img_patch: [Vec<usize>; 2],
     img_gain: [Vec<f64>; 2],
+    // Optional Woodworth contralateral head-shadow split (empty when disabled).
+    binaural: bool,
+    node_shadow: [Bins; 2],
+    img_shadow_gain: [Vec<f64>; 2],
+    ring_shadow: [Vec<f64>; 2],
+    head_lp: [f64; 2],
+    head_lp_coef: f64,
     patch_ptr: Vec<usize>,
     patch_node: Vec<usize>,
     patch_acc: Vec<f64>,
@@ -235,51 +456,167 @@ impl Radiation {
 
         let mut max_delay = 0usize;
         let mut images = 0usize;
+        rad.binaural = room.binaural_head;
+        rad.head_lp_coef = 1.0 - (-2.0 * PI * 1400.0 / fs).exp();
+        // Outward unit normal for each ear (left ear points toward ear[0]-ear[1], right opposite).
+        let ear_axis = [d.ears[1].x - d.ears[0].x, d.ears[1].y - d.ears[0].y, d.ears[1].z - d.ears[0].z];
+        let ear_axis_len = (ear_axis[0] * ear_axis[0] + ear_axis[1] * ear_axis[1] + ear_axis[2] * ear_axis[2]).sqrt().max(1e-6);
+        let ear_outward = [
+            [-ear_axis[0] / ear_axis_len, -ear_axis[1] / ear_axis_len, -ear_axis[2] / ear_axis_len],
+            [ear_axis[0] / ear_axis_len, ear_axis[1] / ear_axis_len, ear_axis[2] / ear_axis_len],
+        ];
+        let shadow_frac = |e: usize, dx: f64, dy: f64, dz: f64, r: f64| -> f64 {
+            if !rad.binaural || r < 1e-6 {
+                return 0.0;
+            }
+            let n = ear_outward[e];
+            let cos_t = ((dx * n[0] + dy * n[1] + dz * n[2]) / r).clamp(-1.0, 1.0);
+            ((1.0 - cos_t) * 0.5).powf(1.4) * 0.58
+        };
+
         for e in 0..2 {
             let ear = d.ears[e];
             // Direct sound, node by node. Delays are rounded to the nearest step (a path error
             // under 4 mm at 48 kHz, well below the grid spacing).
             let (mut delay, mut src, mut gain) = (Vec::with_capacity(p.n), Vec::with_capacity(p.n), Vec::with_capacity(p.n));
+            let mut sgain = if rad.binaural { Vec::with_capacity(p.n) } else { Vec::new() };
             for a in 0..p.n {
                 let pos = p.node_position(a);
-                let r = ((pos.x - ear.x).powi(2) + (pos.y - ear.y).powi(2) + ear.z * ear.z).sqrt();
+                let (dx, dy, dz) = (pos.x - ear.x, pos.y - ear.y, -ear.z);
+                let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                let g_full = strength / r * if ear.z >= 0.0 { 1.0 } else { -1.0 };
+                let sh = shadow_frac(e, dx, dy, dz, r);
                 delay.push(delay_of(r));
                 src.push(p.gid[a]);
-                gain.push(strength / r * if ear.z >= 0.0 { 1.0 } else { -1.0 });
+                if rad.binaural {
+                    gain.push(g_full * (1.0 - sh));
+                    sgain.push(g_full * sh);
+                } else {
+                    gain.push(g_full);
+                }
                 max_delay = max_delay.max(delay[a]);
             }
             rad.node[e] = Bins::build(&delay, &src, &gain);
+            if rad.binaural {
+                rad.node_shadow[e] = Bins::build(&delay, &src, &sgain);
+            }
 
             let (mut idelay, mut isrc, mut igain): (Vec<usize>, Vec<usize>, Vec<f64>) = (Vec::new(), Vec::new(), Vec::new());
+            let mut isgain: Vec<f64> = Vec::new();
+            let mut push_img = |dl: usize, pi: usize, g_full: f64, dx: f64, dy: f64, dz: f64, r: f64| {
+                idelay.push(dl);
+                isrc.push(pi);
+                if rad.binaural {
+                    let sh = shadow_frac(e, dx, dy, dz, r);
+                    igain.push(g_full * (1.0 - sh));
+                    isgain.push(g_full * sh);
+                } else {
+                    igain.push(g_full);
+                }
+            };
             if room.enabled {
-                // Shoebox images of the ear, up to two reflections. Room coordinates put the floor
-                // at z = 0; the board sits at board_height. A path that leaves upward comes from
-                // the top side, downward from the underside.
-                let l = [room.lx, room.ly, room.lz];
                 let ear_room = [ear.x + room.piano_x, ear.y + room.piano_y, ear.z + room.board_height];
                 let refl = (1.0 - room.absorption).sqrt();
-                for nx in -2i32..=2 {
-                    for ny in -2i32..=2 {
-                        for nz in -2i32..=2 {
-                            let order = nx.abs() + ny.abs() + nz.abs();
-                            if order == 0 || order > 2 {
+                if room.is_plain_shoebox() {
+                    // Shoebox images of the ear, up to two reflections. Room coordinates put the floor
+                    // at z = 0; the board sits at board_height. A path that leaves upward comes from
+                    // the top side, downward from the underside.
+                    let l = [room.lx, room.ly, room.lz];
+                    for nx in -2i32..=2 {
+                        for ny in -2i32..=2 {
+                            for nz in -2i32..=2 {
+                                let order = nx.abs() + ny.abs() + nz.abs();
+                                if order == 0 || order > 2 {
+                                    continue;
+                                }
+                                let n = [nx, ny, nz];
+                                let mut im = [0.0; 3];
+                                for q in 0..3 {
+                                    im[q] = n[q] as f64 * l[q] + if n[q] & 1 != 0 { l[q] - ear_room[q] } else { ear_room[q] };
+                                }
+                                let (ex, ey, ez) = (im[0] - room.piano_x, im[1] - room.piano_y, im[2] - room.board_height);
+                                let amplitude = refl.powi(order);
+                                for (pi, cp) in centre.iter().enumerate() {
+                                    let (dx, dy, dz) = (cp.x - ex, cp.y - ey, -ez);
+                                    let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                                    let dl = delay_of(r);
+                                    push_img(dl, pi, strength / r * amplitude * if ez >= 0.0 { 1.0 } else { -1.0 }, dx, dy, dz, r);
+                                    max_delay = max_delay.max(dl);
+                                }
+                                images += 1;
+                            }
+                        }
+                    }
+                } else {
+                    // Generalized planar image-source method (Borish) for non-rectangular rooms
+                    // and sloped ceilings, up to 2nd order with visibility & occlusion checks.
+                    let poly = room.floor_polygon();
+                    let facets = build_room_facets(room, &poly);
+                    let nf = facets.len();
+                    let non_convex = room.shape == RoomShape::LAlcove;
+                    for i in 0..nf {
+                        if facets[i].signed_dist(ear_room) <= 1e-6 {
+                            continue;
+                        }
+                        let im1 = facets[i].mirror(ear_room);
+                        let (ex1, ey1, ez1) = (im1[0] - room.piano_x, im1[1] - room.piano_y, im1[2] - room.board_height);
+                        let mut any1 = false;
+                        for (pi, cp) in centre.iter().enumerate() {
+                            let src_pt = [cp.x + room.piano_x, cp.y + room.piano_y, room.board_height];
+                            let Some((_, hit)) = facets[i].intersect_segment(src_pt, im1) else { continue; };
+                            if !facets[i].contains(hit, &poly, room) {
                                 continue;
                             }
-                            let n = [nx, ny, nz];
-                            let mut im = [0.0; 3];
-                            for q in 0..3 {
-                                im[q] = n[q] as f64 * l[q] + if n[q] & 1 != 0 { l[q] - ear_room[q] } else { ear_room[q] };
+                            if non_convex && (segment_occluded(src_pt, hit, &facets, &poly, room, i, usize::MAX)
+                                || segment_occluded(hit, ear_room, &facets, &poly, room, i, usize::MAX)) {
+                                continue;
                             }
-                            let (ex, ey, ez) = (im[0] - room.piano_x, im[1] - room.piano_y, im[2] - room.board_height);
-                            let amplitude = refl.powi(order);
-                            for (pi, cp) in centre.iter().enumerate() {
-                                let r = ((cp.x - ex).powi(2) + (cp.y - ey).powi(2) + ez * ez).sqrt();
-                                idelay.push(delay_of(r));
-                                isrc.push(pi);
-                                igain.push(strength / r * amplitude * if ez >= 0.0 { 1.0 } else { -1.0 });
-                                max_delay = max_delay.max(delay_of(r));
-                            }
+                            let r = ((cp.x - ex1).powi(2) + (cp.y - ey1).powi(2) + ez1 * ez1).sqrt().max(1e-3);
+                            let dl = delay_of(r);
+                            let (hdx, hdy, hdz) = (hit[0] - ear_room[0], hit[1] - ear_room[1], hit[2] - ear_room[2]);
+                            let hr = (hdx * hdx + hdy * hdy + hdz * hdz).sqrt().max(1e-3);
+                            push_img(dl, pi, strength / r * refl * if hit[2] >= room.board_height { 1.0 } else { -1.0 }, hdx, hdy, hdz, hr);
+                            max_delay = max_delay.max(dl);
+                            any1 = true;
+                        }
+                        if any1 {
                             images += 1;
+                        }
+                        // 2nd-order image: ear reflected across i, then across j != i.
+                        for j in 0..nf {
+                            if j == i || facets[j].signed_dist(im1) <= 1e-6 {
+                                continue;
+                            }
+                            let im2 = facets[j].mirror(im1);
+                            let (ex2, ey2, ez2) = (im2[0] - room.piano_x, im2[1] - room.piano_y, im2[2] - room.board_height);
+                            let amp2 = refl * refl;
+                            let mut any2 = false;
+                            for (pi, cp) in centre.iter().enumerate() {
+                                let src_pt = [cp.x + room.piano_x, cp.y + room.piano_y, room.board_height];
+                                let Some((_, hit2)) = facets[j].intersect_segment(src_pt, im2) else { continue; };
+                                if !facets[j].contains(hit2, &poly, room) {
+                                    continue;
+                                }
+                                let Some((_, hit1)) = facets[i].intersect_segment(hit2, im1) else { continue; };
+                                if !facets[i].contains(hit1, &poly, room) {
+                                    continue;
+                                }
+                                if non_convex && (segment_occluded(src_pt, hit2, &facets, &poly, room, j, usize::MAX)
+                                    || segment_occluded(hit2, hit1, &facets, &poly, room, i, j)
+                                    || segment_occluded(hit1, ear_room, &facets, &poly, room, i, usize::MAX)) {
+                                    continue;
+                                }
+                                let r = ((cp.x - ex2).powi(2) + (cp.y - ey2).powi(2) + ez2 * ez2).sqrt().max(1e-3);
+                                let dl = delay_of(r);
+                                let (hdx, hdy, hdz) = (hit1[0] - ear_room[0], hit1[1] - ear_room[1], hit1[2] - ear_room[2]);
+                                let hr = (hdx * hdx + hdy * hdy + hdz * hdz).sqrt().max(1e-3);
+                                push_img(dl, pi, strength / r * amp2 * if hit2[2] >= room.board_height { 1.0 } else { -1.0 }, hdx, hdy, hdz, hr);
+                                max_delay = max_delay.max(dl);
+                                any2 = true;
+                            }
+                            if any2 {
+                                images += 1;
+                            }
                         }
                     }
                 }
@@ -309,10 +646,11 @@ impl Radiation {
                             continue;
                         }
                         let r = ((cp.x - mx).powi(2) + (cp.y - ear.y).powi(2) + mz * mz).sqrt();
-                        idelay.push(delay_of(r));
-                        isrc.push(pi);
-                        igain.push(strength / r * d.lid.reflection);
-                        max_delay = max_delay.max(delay_of(r));
+                        let dl = delay_of(r);
+                        let (hdx, hdy, hdz) = (hx - ear.x, hy - ear.y, u * mz - ear.z);
+                        let hr = (hdx * hdx + hdy * hdy + hdz * hdz).sqrt().max(1e-3);
+                        push_img(dl, pi, strength / r * d.lid.reflection, hdx, hdy, hdz, hr);
+                        max_delay = max_delay.max(dl);
                     }
                     images += 1;
                 }
@@ -320,12 +658,16 @@ impl Radiation {
             rad.img_delay[e] = idelay;
             rad.img_patch[e] = isrc;
             rad.img_gain[e] = igain;
+            rad.img_shadow_gain[e] = isgain;
         }
         rad.image_count = images / 2;
 
         let ring_len = (max_delay + 4).next_power_of_two();
         rad.ring_mask = ring_len - 1;
         rad.ring = [vec![0.0; ring_len], vec![0.0; ring_len]];
+        if rad.binaural {
+            rad.ring_shadow = [vec![0.0; ring_len], vec![0.0; ring_len]];
+        }
 
         // Late field. Sabine: T60 = 0.161 V / A. A steady source of volume acceleration q gives a
         // diffuse field of mean square pressure rho^2 q^2 / (pi A); the network is scaled so that
@@ -333,10 +675,13 @@ impl Radiation {
         // already carry (everything arriving within about two mean free paths).
         rad.reverb = room.enabled;
         if rad.reverb {
-            let volume = room.lx * room.ly * room.lz;
-            let surface = 2.0 * (room.lx * room.ly + room.lx * room.lz + room.ly * room.lz);
+            let (volume, surface) = room_geometry_metrics(room);
             let absorb = room.absorption * surface;
-            rad.reverb_time = room_decay_time(room.lx, room.ly, room.lz, room.absorption);
+            rad.reverb_time = if room.is_plain_shoebox() {
+                room_decay_time(room.lx, room.ly, room.lz, room.absorption)
+            } else {
+                0.161 * volume / absorb
+            };
             let base = [0.0297, 0.0371, 0.0411, 0.0437, 0.0533, 0.0617, 0.0683, 0.0739];
             for i in 0..LINES {
                 let len = (base[i] * fs) as usize | 1;
@@ -396,7 +741,10 @@ impl Radiation {
     /// One-time proof after a real zero-input tick, not a tail/silence threshold.
     pub(crate) fn is_pristine_zero(&self) -> bool {
         let zero = |s: &[f64]| s.iter().all(|&v| v == 0.0);
-        self.ring.iter().all(|s| zero(s)) && self.line.iter().all(|s| zero(s))
+        self.ring.iter().all(|s| zero(s))
+            && self.ring_shadow.iter().all(|s| zero(s))
+            && zero(&self.head_lp)
+            && self.line.iter().all(|s| zero(s))
             && zero(&self.patch_acc) && zero(&self.patch_vel) && zero(&self.air_force)
             && self.vel_hist.iter().chain(&self.acc_hist).all(|&v| v == 0.0)
             && zero(&self.line_lp) && self.hp_state == 0.0
@@ -504,9 +852,35 @@ impl Radiation {
             for q in 0..dl.len() {
                 ring[(pos + dl[q]) & mask] += g[q] * self.patch_acc[src[q]];
             }
+            if self.binaural {
+                let sring = &mut self.ring_shadow[e];
+                let sb = &self.node_shadow[e];
+                let base = pos + sb.first;
+                for k in 0..sb.ptr.len() - 1 {
+                    let (lo, hi) = (sb.ptr[k], sb.ptr[k + 1]);
+                    let (idx, g) = (&sb.idx[lo..hi], &sb.gain[lo..hi]);
+                    let mut s = 0.0;
+                    for q in 0..idx.len() {
+                        s += g[q] * r[idx[q]];
+                    }
+                    sring[(base + k) & mask] += s;
+                }
+                let sg = &self.img_shadow_gain[e];
+                for q in 0..dl.len() {
+                    sring[(pos + dl[q]) & mask] += sg[q] * self.patch_acc[src[q]];
+                }
+            }
         }
         let mut left = std::mem::take(&mut self.ring[0][pos]);
         let mut right = std::mem::take(&mut self.ring[1][pos]);
+        if self.binaural {
+            let sl = std::mem::take(&mut self.ring_shadow[0][pos]);
+            let sr = std::mem::take(&mut self.ring_shadow[1][pos]);
+            self.head_lp[0] += self.head_lp_coef * (sl - self.head_lp[0]);
+            self.head_lp[1] += self.head_lp_coef * (sr - self.head_lp[1]);
+            left += self.head_lp[0];
+            right += self.head_lp[1];
+        }
         self.ring_pos = (pos + 1) & mask;
         if self.reverb {
             let (l, rr) = self.reverb_tick(total);
@@ -653,5 +1027,73 @@ mod tests {
                 assert_eq!(rad.air_force[p].to_bits(), (self_force + (f0 + f1) as f64).to_bits());
             }
         }
+    }
+
+    #[test]
+    fn non_rectangular_rooms_and_sloped_ceilings_produce_valid_reflections_and_metrics() {
+        let fs = 48000.0;
+        let base_opts = GrandOptions::default();
+        let base_d = make_grand(&base_opts);
+        let plate = Plate::new(&base_d.board, &[], 1.0 / fs, 1.5).unwrap();
+        let base_rad = Radiation::new(&plate, &base_d, fs);
+        for (shape, slope) in [
+            (1.0, 0.0),
+            (2.0, 0.0),
+            (3.0, 0.0),
+            (0.0, 8.0),
+            (1.0, 6.0),
+            (3.0, -7.0),
+        ] {
+            let mut o = base_opts;
+            o.room_shape = shape;
+            o.ceiling_slope_deg = slope;
+            let d = make_grand(&o);
+            let (vol, surf) = room_geometry_metrics(&d.room);
+            assert!(vol.is_finite() && vol > 10.0 && surf.is_finite() && surf > 20.0);
+            let mut rad = Radiation::new(&plate, &d, fs);
+            assert!(rad.image_count >= 4, "shape={shape} slope={slope} images={}", rad.image_count);
+            assert!(rad.reverb_time.is_finite() && rad.reverb_time > 0.1);
+            let mut input = vec![0.0; plate.grid_size];
+            let zeros = vec![0.0; plate.grid_size];
+            input[plate.gid[0]] = 1e-9;
+            let mut energy = 0.0;
+            for tick in 0..4096 {
+                let (l, r) = rad.step(if tick == 0 { &input } else { &zeros });
+                assert!(l.is_finite() && r.is_finite());
+                energy += l * l + r * r;
+            }
+            assert!(energy > 0.0);
+            let rays = room_preview_rays(
+                &d.room,
+                &d.lid,
+                [o.piano_x + 0.7, o.piano_y + 0.7, d.room.board_height],
+                [o.listener_x, o.listener_y, o.ear_height_m],
+            );
+            assert!(rays.floor_hit.is_some() && rays.ceiling_hit.is_some());
+            assert!(!rays.wall_hits.is_empty());
+        }
+        // Test wall splay, wall skew, and binaural head shadow
+        let mut bo = base_opts;
+        bo.wall_splay = 0.22;
+        bo.wall_skew = -0.15;
+        bo.binaural_head = true;
+        let bd = make_grand(&bo);
+        let mut brad = Radiation::new(&plate, &bd, fs);
+        let mut b_energy = 0.0;
+        let mut inp = vec![0.0; plate.grid_size];
+        let zeros = vec![0.0; plate.grid_size];
+        inp[plate.gid[0]] = 1e-9;
+        for tick in 0..4096 {
+            let (l, r) = brad.step(if tick == 0 { &inp } else { &zeros });
+            assert!(l.is_finite() && r.is_finite());
+            b_energy += l * l + r * r;
+        }
+        assert!(b_energy > 0.0 && brad.image_count >= 4);
+
+        // Rectangular + 0 slope keeps exact default volume/surface/reverb time.
+        let (v0, s0) = room_geometry_metrics(&base_d.room);
+        assert_eq!(v0.to_bits(), (base_opts.room_lx * base_opts.room_ly * base_opts.room_lz).to_bits());
+        assert_eq!(s0.to_bits(), (2.0 * (base_opts.room_lx * base_opts.room_ly + base_opts.room_lx * base_opts.room_lz + base_opts.room_ly * base_opts.room_lz)).to_bits());
+        assert!(base_rad.reverb_time > 0.1);
     }
 }

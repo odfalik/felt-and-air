@@ -16,8 +16,8 @@ typedef struct PPOptions {
     double hammer_hardness, hammer_mass, felt_damping, strike_position, key_thump, shank_hz, let_off_mm;
     double damper_strength, damper_press_n, mechanism_noise;
     double board_thickness_mm, board_loss_percent, rib_height_mm, rib_spacing_mm, crown_radius_m, rim_clamp, bridge_height_mm;
-    double room_lx, room_ly, room_lz, room_absorption, piano_x, piano_y, listener_x, listener_y, ear_height_m, ear_spacing_m, lid_angle_deg;
-    bool stretch_tuning, longitudinal, air_loading, duplex, damped_strings_ring, two_polarisations, room_enabled;
+    double room_lx, room_ly, room_lz, room_absorption, piano_x, piano_y, listener_x, listener_y, ear_height_m, ear_spacing_m, lid_angle_deg, room_shape, ceiling_slope_deg, wall_splay, wall_skew;
+    bool binaural_head, stretch_tuning, longitudinal, air_loading, duplex, damped_strings_ring, two_polarisations, room_enabled;
 } PPOptions;
 
 typedef struct PPPiano PPPiano;

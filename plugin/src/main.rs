@@ -1,6 +1,7 @@
 //! Standalone shell. CoreAudio output only; no audio inputs are requested. Automatic MIDI
 //! is owned by the discovery thread, not the audio callback. `--backend dummy` bypasses all
 //! MIDI construction as well as audio devices; explicit --midi-input remains NIH-owned.
+mod macos_menu;
 mod midi_input;
 use midi_input::MidiWatcher;
 use physical_piano_plugin::{
@@ -23,6 +24,11 @@ fn main() {
     }
     if backend(&args).is_none() {
         args.extend(["--backend".into(), "core-audio".into()]);
+    }
+    if backend(&args) != Some("dummy")
+        && !args.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "--version" | "-V"))
+    {
+        macos_menu::install();
     }
     let midi = if auto_midi(&args) {
         match MidiWatcher::start() {

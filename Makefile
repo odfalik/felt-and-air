@@ -32,8 +32,9 @@ test: engine build/autest build/claptest au clap
 # Same Rust editor as CLAP/VST3. Demos remain external (never bundled or committed).
 app:
 	cd plugin && CARGO_TARGET_DIR="$(abspath $(PLUGIN_TARGET_DIR))" $(PLUGIN_CARGO) build -j$(CARGO_JOBS) --release $(CARGO_ARGS) --features standalone --bin felt-and-air
-	@mkdir -p $(APP)/Contents/MacOS
+	@mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp src/app/Info.plist $(APP)/Contents/Info.plist
+	cp assets/icon/FeltAndAir.icns $(APP)/Contents/Resources/FeltAndAir.icns
 	cp $(PLUGIN_TARGET_DIR)/$(RELEASE_DIR)/felt-and-air $(APP)/Contents/MacOS/FeltAndAir
 	codesign --force --sign - $(APP)
 

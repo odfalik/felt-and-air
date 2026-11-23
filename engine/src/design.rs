@@ -138,7 +138,77 @@ pub struct Listener {
     pub z: f64,
 }
 
-/// A rectangular room. The piano's coordinate origin (bass end of the keyboard side of the
+/// Floor-plan shape of the room. Rectangular uses the exact shoebox image-source path;
+/// non-rectangular shapes and sloped ceilings use generalized planar image sources.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum RoomShape {
+    #[default]
+    Rectangular = 0,
+    /// Symmetric fan-shaped concert hall widening from stage toward listener.
+    FanHall = 1,
+    /// Acoustic studio with splayed non-parallel walls to break flutter echoes.
+    AngledStudio = 2,
+    /// Living / recital space with an L-shaped alcove.
+    LAlcove = 3,
+}
+
+impl RoomShape {
+    pub const ALL: [RoomShape; 4] = [
+        RoomShape::Rectangular,
+        RoomShape::FanHall,
+        RoomShape::AngledStudio,
+        RoomShape::LAlcove,
+    ];
+
+    pub fn from_value(v: f64) -> Self {
+        match v.round() as i32 {
+            1 => RoomShape::FanHall,
+            2 => RoomShape::AngledStudio,
+            3 => RoomShape::LAlcove,
+            _ => RoomShape::Rectangular,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RoomShape::Rectangular => "Rectangular",
+            RoomShape::FanHall => "Concert Hall (Fan)",
+            RoomShape::AngledStudio => "Angled Studio",
+            RoomShape::LAlcove => "L-Shaped Alcove",
+        }
+    }
+
+    /// Counter-clockwise 2D floor polygon in room metres inside [0, lx] x [0, ly].
+    pub fn floor_polygon(self, lx: f64, ly: f64) -> Vec<Vec2> {
+        let pt = |x, y| Vec2 { x, y };
+        match self {
+            RoomShape::Rectangular => vec![pt(0.0, 0.0), pt(lx, 0.0), pt(lx, ly), pt(0.0, ly)],
+            RoomShape::FanHall => vec![
+                pt(0.0, 0.12 * ly),
+                pt(lx, 0.0),
+                pt(lx, ly),
+                pt(0.0, 0.88 * ly),
+            ],
+            RoomShape::AngledStudio => vec![
+                pt(0.0, 0.0),
+                pt(lx, 0.07 * ly),
+                pt(0.93 * lx, ly),
+                pt(0.05 * lx, 0.94 * ly),
+            ],
+            RoomShape::LAlcove => vec![
+                pt(0.0, 0.0),
+                pt(lx, 0.0),
+                pt(lx, 0.62 * ly),
+                pt(0.60 * lx, 0.62 * ly),
+                pt(0.60 * lx, ly),
+                pt(0.0, ly),
+            ],
+        }
+    }
+}
+
+/// Room geometry. The piano's coordinate origin (bass end of the keyboard side of the
 /// board) sits at (piano_x, piano_y) on the floor plan, the board `board_height` above the floor.
 #[derive(Clone, Copy, Debug)]
 pub struct RoomDesign {
@@ -146,11 +216,148 @@ pub struct RoomDesign {
     pub lx: f64,
     pub ly: f64,
     pub lz: f64,
+    pub shape: RoomShape,
+    /// Ceiling tilt along the room length (x), degrees. Positive rises toward +x (listener).
+    pub ceiling_slope_deg: f64,
+    /// Wall taper (-0.30..0.30): widens +x end vs -x end for custom fan/trapezoid sculpting.
+    pub wall_splay: f64,
+    /// Wall skew (-0.25..0.25): shears upper wall horizontally to break parallel-wall flutter.
+    pub wall_skew: f64,
+    /// Woodworth spherical head-shadow low-pass cue on contralateral ears (ideal for headphones).
+    pub binaural_head: bool,
     pub piano_x: f64,
     pub piano_y: f64,
     pub board_height: f64,
     /// Mean absorption coefficient of all surfaces.
     pub absorption: f64,
+}
+
+impl RoomDesign {
+    #[inline]
+    pub fn is_plain_shoebox(&self) -> bool {
+        self.shape == RoomShape::Rectangular
+            && self.ceiling_slope_deg.abs() < 1e-9
+            && self.wall_splay.abs() < 1e-9
+            && self.wall_skew.abs() < 1e-9
+    }
+
+    /// Ceiling height at horizontal room coordinate `x`, clamped safely above floor.
+    pub fn ceiling_z_at(&self, x: f64) -> f64 {
+        let slope = self.ceiling_slope_deg.clamp(-15.0, 15.0).to_radians().tan();
+        // Clamp slope so neither end of the room drops below 1.6 m.
+        let max_slope = ((self.lz - 1.6).max(0.0)) / (0.5 * self.lx.max(0.1));
+        let s = slope.clamp(-max_slope, max_slope);
+        self.lz + (x - 0.5 * self.lx) * s
+    }
+
+    /// Effective clamped ceiling slope dz/dx.
+    pub fn ceiling_slope_tan(&self) -> f64 {
+        let slope = self.ceiling_slope_deg.clamp(-15.0, 15.0).to_radians().tan();
+        let max_slope = ((self.lz - 1.6).max(0.0)) / (0.5 * self.lx.max(0.1));
+        slope.clamp(-max_slope, max_slope)
+    }
+
+    pub fn floor_polygon(&self) -> Vec<Vec2> {
+        let mut poly = self.shape.floor_polygon(self.lx, self.ly);
+        let splay = self.wall_splay.clamp(-0.30, 0.30);
+        let skew = self.wall_skew.clamp(-0.25, 0.25);
+        if splay.abs() < 1e-9 && skew.abs() < 1e-9 {
+            return poly;
+        }
+        let lx = self.lx.max(0.5);
+        let ly = self.ly.max(0.5);
+        let cy = 0.5 * ly;
+        for v in &mut poly {
+            let u = (v.x / lx).clamp(0.0, 1.0);
+            let t = (v.y / ly).clamp(0.0, 1.0);
+            // Splay scales y distance from center symmetrically along x (positive = wider at +x).
+            let scale_y = (1.0 + splay * (2.0 * u - 1.0)).clamp(0.55, 1.30);
+            v.y = (cy + (v.y - cy) * scale_y).clamp(0.0, ly);
+            // Skew shifts upper vertices gently along x without crossing edges.
+            v.x = (v.x + skew * lx * (t - 0.5) * 0.65).clamp(0.0, lx);
+        }
+        poly
+    }
+}
+
+/// Point-in-polygon test (ray casting) for simple 2D polygons.
+pub fn point_in_polygon(poly: &[Vec2], p: Vec2) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[j];
+        if ((a.y > p.y) != (b.y > p.y))
+            && (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x)
+        {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Project `p` back inside `poly` with a margin if it falls outside or too close to a wall.
+pub fn clamp_point_to_polygon(poly: &[Vec2], p: Vec2, margin: f64) -> Vec2 {
+    if poly.len() < 3 {
+        return p;
+    }
+    // Find nearest point on polygon boundary.
+    let mut best_dist2 = f64::INFINITY;
+    let mut best_pt = p;
+    let mut best_inward = Vec2 { x: 0.0, y: 0.0 };
+    let n = poly.len();
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[(i + 1) % n];
+        let abx = b.x - a.x;
+        let aby = b.y - a.y;
+        let len2 = abx * abx + aby * aby;
+        if len2 < 1e-12 {
+            continue;
+        }
+        let t = (((p.x - a.x) * abx + (p.y - a.y) * aby) / len2).clamp(0.0, 1.0);
+        let q = Vec2 { x: a.x + t * abx, y: a.y + t * aby };
+        let d2 = (p.x - q.x).powi(2) + (p.y - q.y).powi(2);
+        if d2 < best_dist2 {
+            best_dist2 = d2;
+            best_pt = q;
+            let len = len2.sqrt();
+            // Counter-clockwise polygon: inward normal is (-aby, abx) / len.
+            best_inward = Vec2 { x: -aby / len, y: abx / len };
+        }
+    }
+    let inside = point_in_polygon(poly, p);
+    if inside && best_dist2 >= margin * margin {
+        return p;
+    }
+    let candidate = Vec2 {
+        x: best_pt.x + best_inward.x * margin,
+        y: best_pt.y + best_inward.y * margin,
+    };
+    if point_in_polygon(poly, candidate) {
+        return candidate;
+    }
+    // Fallback toward polygon centroid (always safe for all four room shapes).
+    let cx = poly.iter().map(|v| v.x).sum::<f64>() / n as f64;
+    let cy = poly.iter().map(|v| v.y).sum::<f64>() / n as f64;
+    let mut lo = 0.0;
+    let mut hi = 1.0;
+    for _ in 0..12 {
+        let mid = 0.5 * (lo + hi);
+        let q = Vec2 { x: p.x + (cx - p.x) * mid, y: p.y + (cy - p.y) * mid };
+        if point_in_polygon(poly, q) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let f = (hi + 0.04).min(1.0);
+    Vec2 { x: p.x + (cx - p.x) * f, y: p.y + (cy - p.y) * f }
 }
 
 /// The grand's lid, hinged along the bass side.
@@ -328,6 +535,16 @@ pub struct GrandOptions {
     pub ear_spacing_m: f64,
     /// 0 closes the lid.
     pub lid_angle_deg: f64,
+    /// Room floor-plan shape: 0 rectangular, 1 fan hall, 2 angled studio, 3 L-alcove.
+    pub room_shape: f64,
+    /// Ceiling tilt along room length, degrees (-15..15).
+    pub ceiling_slope_deg: f64,
+    /// Wall taper (-0.30..0.30) for sculpting arbitrary non-rectangular rooms.
+    pub wall_splay: f64,
+    /// Wall shear (-0.25..0.25) for angling opposing walls.
+    pub wall_skew: f64,
+    /// Woodworth spherical head-shadow low-pass cue on contralateral ear (headphones).
+    pub binaural_head: bool,
 
     // Switches.
     /// Octaves tuned by matching partials, as on a real piano.
@@ -384,6 +601,11 @@ impl Default for GrandOptions {
             ear_height_m: 1.2,
             ear_spacing_m: 0.5,
             lid_angle_deg: 38.0,
+            room_shape: 0.0,
+            ceiling_slope_deg: 0.0,
+            wall_splay: 0.0,
+            wall_skew: 0.0,
+            binaural_head: false,
             stretch_tuning: true,
             longitudinal: true,
             air_loading: true,
@@ -485,6 +707,11 @@ pub fn make_grand(o: &GrandOptions) -> PianoDesign {
         lx: o.room_lx,
         ly: o.room_ly,
         lz: o.room_lz,
+        shape: RoomShape::from_value(o.room_shape),
+        ceiling_slope_deg: o.ceiling_slope_deg,
+        wall_splay: o.wall_splay,
+        wall_skew: o.wall_skew,
+        binaural_head: o.binaural_head,
         piano_x: o.piano_x,
         piano_y: o.piano_y,
         board_height: 0.75,

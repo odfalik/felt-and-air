@@ -1,14 +1,18 @@
 //! One editor for the host and the standalone. Geometry is cached per rebuild, heat map
 //! uploads happen at the snapshot rate, painting at 60 Hz. All controls use host gestures.
+mod board_view;
 mod guide;
 #[cfg(test)]
 #[path = "editor/headless_tests.rs"]
 mod headless_tests;
 mod illustration;
+mod knob;
+mod room_view;
+mod strings_view;
 use crate::{demo::Demo, presets, setup::Setup, shared::*, PianoParams, Setting};
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui::*, resizable_window::ResizableWindow};
-use piano_engine::{params::PARAMS, GrandOptions, PianoDesign, Snapshot, Vec2 as Point};
+use piano_engine::{design::RoomShape, params::PARAMS, GrandOptions, PianoDesign, Snapshot, Vec2 as Point};
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -48,12 +52,10 @@ struct State {
     message: String,
     ui_cost: f32,
     active_param: usize,
-    extra_monitors: bool,
     scroll_debug: Option<(Rect, Vec2, Vec2)>,
     last_wheel: Option<(Vec2, Option<Pos2>)>,
     preview_values: Vec<f64>,
     preview_design: PianoDesign,
-    grand_art: illustration::GrandIllustration,
     action_art: illustration::action::ActionIllustration,
 }
 
@@ -257,8 +259,37 @@ fn controls_scroll<R>(
     ScrollArea::vertical()
         .id_salt(("controls", tab))
         .max_height(height)
-        .scroll_bar_visibility(scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+        .scroll_bar_visibility(scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, body)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_standalone_app() {
+    use std::ffi::{c_char, c_void, CString};
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+    unsafe {
+        let cls = objc_getClass(CString::new("NSApplication").unwrap().as_ptr());
+        let shared_sel = sel_registerName(CString::new("sharedApplication").unwrap().as_ptr());
+        let term_sel = sel_registerName(CString::new("terminate:").unwrap().as_ptr());
+        let msg0: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let msg1: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as *const ());
+        let app = msg0(cls, shared_sel);
+        if !app.is_null() {
+            msg1(app, term_sel, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn terminate_standalone_app() {
+    std::process::exit(0);
 }
 fn black(m: i32) -> bool {
     matches!(m % 12, 1 | 3 | 6 | 8 | 10)
@@ -328,12 +359,10 @@ impl State {
             message: String::new(),
             ui_cost: 0.0,
             active_param: 0,
-            extra_monitors: false,
             scroll_debug: None,
             last_wheel: None,
             preview_values,
             preview_design,
-            grand_art: illustration::GrandIllustration::default(),
             action_art: illustration::action::ActionIllustration::default(),
         }
     }
@@ -350,51 +379,6 @@ impl State {
             // Pure geometry/design only: never construct or step a Piano on the UI thread.
             self.preview_design = piano_engine::make_grand(&options);
         }
-    }
-    fn room_preview(&mut self, ui: &mut Ui, setter: &ParamSetter, height: f32) {
-        let options = self.params.options();
-        let selected = PARAMS[self.active_param].name == "Lid angle";
-        self.grand_art.paint(
-            ui,
-            (height - 170.0).max(170.0),
-            options.lid_angle_deg as f32,
-            selected,
-        );
-        let plan_width = ui.available_width() * 0.56;
-        let tail_width = ui.available_width() - plan_width - 10.0;
-        ui.horizontal_top(|ui| {
-            ui.allocate_ui_with_layout(vec2(plan_width,150.0),Layout::top_down(Align::Min),|ui| {
-                ui.set_max_width(plan_width);
-                self.room(ui,setter,150.0);
-            });
-            ui.allocate_ui_with_layout(vec2(tail_width,150.0),Layout::top_down(Align::Min),|ui| {
-                ui.set_max_width(tail_width);
-                let tail=guide::room_decay(&options);
-                ui.label(RichText::new(if options.room_enabled {format!("Room tail ≈ {tail:.2} s")} else {"Room tail off".into()}).color(AMBER))
-                    .on_hover_text("Sabine estimate from room size and absorption, not measured audio. More absorption shortens this tail.");
-                let _decay=ui.collapsing("Decay estimate",|ui|guide::decay(ui,&options,60.0));
-                #[cfg(test)]
-                {
-                    trace_left_target(ui,"decay-header",_decay.header_response.rect);
-                    if let Some(body)=&_decay.body_response { trace_left_target(ui,"decay-body",body.rect); }
-                    let open=_decay.body_returned.is_some();
-                    ui.ctx().data_mut(|data|data.insert_temp(Id::new("left:decay-open"),open));
-                }
-            });
-        });
-    }
-    fn settings_preview(&mut self, ui: &mut Ui, height: f32) {
-        let options = self.params.options();
-        Frame::new().fill(PANEL).inner_margin(9.0).show(ui, |ui| {
-            guide::instrument(
-                ui,
-                self.tab,
-                &options,
-                &self.preview_design,
-                self.snap.focus_midi,
-                height,
-            );
-        });
     }
     fn refresh(&mut self, ctx: &Context) {
         let frame = self.shared.display_frames.load(Ordering::Acquire);
@@ -413,7 +397,7 @@ impl State {
         // The generation and owned Snapshot were captured together; decode outside the lock.
         let now=ctx.input(|input|input.time);
         self.action_art.receive(generation,&self.snap.action,now);
-        if self.tab != 3 && !self.extra_monitors {
+        if self.tab != 3 {
             return;
         }
         let Some(v) = &self.view else { return };
@@ -507,46 +491,24 @@ impl State {
                     ui.set_min_height(h);
                     ui.allocate_ui_with_layout(vec2(left,h),Layout::top_down(Align::Min),|ui| {
                         ui.set_max_width(left);
-                        ui.style_mut().spacing.scroll=style::ScrollStyle::solid();
-                        let _visual_scroll=ScrollArea::vertical().drag_to_scroll(false).max_height(h).id_salt(("visual",self.tab)).show(ui,|ui| {
-                            match self.tab {
-                                0=>self.room_preview(ui,setter,h-36.0),
-                                1=>{self.action_art.paint(ui,&self.snap.action,PARAMS[self.active_param].name,(h-185.0).clamp(170.0,330.0));},
-                                2=>{
-                                    self.settings_preview(ui,125.0);
-                                    self.strings(ui,vec2(ui.available_width(),115.0));
-                                },
-                                _=>{
-                                    let board_width=ui.available_width()*0.61;
-                                    let section_width=ui.available_width()-board_width-10.0;
-                                    ui.horizontal_top(|ui| {
-                                        ui.allocate_ui_with_layout(vec2(board_width,360.0),Layout::top_down(Align::Min),|ui| {
-                                            ui.set_max_width(board_width);
-                                            self.board(ui,vec2(board_width,(h-145.0).clamp(90.0,360.0)));
-                                            self.motion_legend(ui);
-                                        });
-                                        ui.allocate_ui_with_layout(vec2(section_width,260.0),Layout::top_down(Align::Min),|ui| {
-                                            ui.set_max_width(section_width);
-                                            self.settings_preview(ui,180.0);
-                                        });
-                                    });
-                                },
+                        ui.set_max_height(h);
+                        let canvas_size = vec2(left, h);
+                        match self.tab {
+                            0 => room_view::paint(self, ui, setter, canvas_size),
+                            1 => {
+                                let opts = self.params.options();
+                                let soft = self.shared.soft.load(Ordering::Relaxed);
+                                self.action_art.paint(
+                                    ui,
+                                    &self.snap,
+                                    &opts,
+                                    soft,
+                                    PARAMS[self.active_param].name,
+                                    canvas_size,
+                                );
                             }
-                            let more=CollapsingHeader::new("Other live motion monitors").id_salt("extra-motion").show(ui,|ui| {
-                                if self.tab!=3 {
-                                    ui.label(RichText::new("Simulated soundboard motion · magnified, not air pressure").color(Color32::from_rgb(232,231,221)));
-                                    self.board(ui,vec2(ui.available_width(),190.0));
-                                    self.motion_legend(ui);
-                                }
-                                if self.tab!=2 { self.strings(ui,vec2(ui.available_width(),85.0)); }
-                            });
-                            let open=more.body_returned.is_some();
-                            if open!=self.extra_monitors { self.extra_monitors=open; self.frame=u64::MAX; }
-                        });
-                        #[cfg(test)]
-                        {
-                            let snapshot=(_visual_scroll.inner_rect,_visual_scroll.content_size,_visual_scroll.state.offset);
-                            ui.ctx().data_mut(|data|data.insert_temp(Id::new("left:scroll"),snapshot));
+                            2 => strings_view::paint(self, ui, setter, canvas_size),
+                            _ => board_view::paint(self, ui, canvas_size),
                         }
                     });
                     ui.allocate_ui_with_layout(vec2(right,h),Layout::top_down(Align::Min),|ui| {
@@ -810,18 +772,20 @@ impl State {
                     }
                 });
             });
-            let button_width = ["Sound on", "Sound off", "Diagnostics"]
+            let button_width = ["Sound on", "Sound off", "Diagnostics ·", "Rebuilding…"]
                 .into_iter()
                 .map(|label| WidgetText::from(label)
                     .into_galley(ui, Some(TextWrapMode::Extend), f32::INFINITY, TextStyle::Button)
                     .size().x + 2.0 * ui.spacing().button_padding.x)
                 .fold(ui.spacing().interact_size.x, f32::max);
-            let info_rows = 1.0 + u8::from(STANDALONE.load(Ordering::Relaxed)) as f32
-                + u8::from(self.shared.building.load(Ordering::Relaxed)) as f32;
+            // Strictly fixed 2-row header height so background rebuilds never reflow the body or pop scrollbars.
+            let info_rows = 2.0f32;
             let info_group_size = vec2(button_width,
                 info_rows * ui.spacing().interact_size.y
                     + (info_rows - 1.0) * ui.spacing().item_spacing.y);
             ui.allocate_ui_with_layout(info_group_size, Layout::top_down(Align::Min), |ui| {
+                ui.set_min_size(info_group_size);
+                let building = self.shared.building.load(Ordering::Relaxed);
                 if STANDALONE.load(Ordering::Relaxed) {
                     let mut sound = self.shared.sound_on.load(Ordering::Relaxed);
                     let label = if sound { "Sound on" } else { "Sound off" };
@@ -832,10 +796,12 @@ impl State {
                         self.shared.sound_on.store(sound, Ordering::Relaxed);
                     }
                 }
-                if self.shared.building.load(Ordering::Relaxed) {
-                    ui.label("Rebuilding…");
-                }
-                let diagnostics_response=ui.menu_button("Diagnostics", |ui| {
+                let diag_label = if building {
+                    RichText::new("Rebuilding…").color(AMBER)
+                } else {
+                    RichText::new("Diagnostics")
+                };
+                let _diagnostics_response=ui.menu_button(diag_label, |ui| {
                     ui.label(format!(
                         "Render load: {:.0}%",
                         self.shared.load.load() * 100.0
@@ -860,443 +826,233 @@ impl State {
                     ));
                 });
                 #[cfg(test)]
-                trace_compact_widget(ui,"header:diagnostics",&diagnostics_response.response);
+                trace_compact_widget(ui,"header:diagnostics",&_diagnostics_response.response);
             });
         });
-    }
-    fn motion_legend(&self, ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Amber: up · Blue: down").small().color(AMBER));
-            ui.label(
-                RichText::new(format!("Auto-scaled: ± {:.2} μm", self.board_scale * 1e6))
-                    .small()
-                    .color(MUTED),
-            );
-        });
-    }
-    fn board(&self, ui: &mut Ui, size: Vec2) {
-        let (r, _) = ui.allocate_exact_size(size, Sense::hover());
-        let p = ui.painter();
-        p.rect_filled(r, 8.0, PANEL);
-        let Some(v) = &self.view else {
-            p.text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                "Building the instrument…",
-                FontId::proportional(18.0),
-                MUTED,
-            );
-            return;
-        };
-        let aspect = ((v.max.x - v.min.x) / (v.max.y - v.min.y)) as f32;
-        let h = (r.height() - 60.0).min((r.width() - 210.0) / aspect);
-        let br = Rect::from_center_size(r.center(), vec2(h * aspect, h));
-        let to = |q: Point| {
-            pos2(
-                br.left() + (q.x - v.min.x) as f32 / (v.max.x - v.min.x) as f32 * br.width(),
-                br.bottom() - (q.y - v.min.y) as f32 / (v.max.y - v.min.y) as f32 * br.height(),
-            )
-        };
-        if let Some(t) = &self.texture {
-            p.image(
-                t.id(),
-                br,
-                Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        }
-        let mut outline: Vec<_> = v.outline.iter().map(|q| to(*q)).collect();
-        if let Some(first) = outline.first().copied() {
-            outline.push(first);
-        }
-        p.add(Shape::line(
-            outline,
-            Stroke::new(1.5, Color32::from_rgb(103, 103, 97)),
-        ));
-        for (index, bridge) in v.bridges.iter().enumerate() {
-            p.add(Shape::line(
-                bridge.iter().map(|q| to(*q)).collect(),
-                Stroke::new(2.0, Color32::from_gray(183)),
-            ));
-            if let Some(mid) = bridge.get(bridge.len() / 2) {
-                let point = to(*mid);
-                let x = if index == 0 {
-                    br.left() - 12.0
-                } else {
-                    br.right() + 12.0
-                };
-                p.line_segment([point, pos2(x, point.y)], Stroke::new(0.7, MUTED));
-                p.text(
-                    pos2(x, point.y),
-                    if index == 0 {
-                        Align2::RIGHT_CENTER
-                    } else {
-                        Align2::LEFT_CENTER
-                    },
-                    if index == 0 {
-                        "Bass bridge"
-                    } else {
-                        "Treble bridge"
-                    },
-                    FontId::proportional(11.0),
-                    Color32::from_gray(195),
-                );
-            }
-        }
-        p.text(
-            r.left_top() + vec2(10.0, 8.0),
-            Align2::LEFT_TOP,
-            "Simulated panel motion · bridges in white; string ends glow",
-            FontId::proportional(11.0),
-            MUTED,
-        );
-        for (i, q) in v.string_bridge.iter().enumerate() {
-            let lv = self.snap.string_level.get(i).copied().unwrap_or(0.0);
-            if lv > 2e-7 {
-                let a = (0.3 + 0.12 * (lv / 2e-7).log10()).clamp(0.0, 1.0);
-                p.circle_filled(to(*q), 2.8, AMBER.gamma_multiply(a));
-            }
-        }
-        p.text(
-            pos2(br.center().x, r.bottom() - 10.0),
-            Align2::CENTER_BOTTOM,
-            "Keyboard edge",
-            FontId::proportional(9.0),
-            MUTED,
-        );
-    }
-    fn strings(&mut self, ui: &mut Ui, size: Vec2) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Individual string motion")
-                    .strong()
-                    .color(Color32::from_rgb(232, 231, 221)),
-            );
-            if self.snap.focus_midi >= 21 {
-                ui.label(RichText::new(note_name(self.snap.focus_midi)).color(AMBER));
-            }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(if self.snap.focus_midi >= 21 {
-                        format!(
-                            "Felt contact now: {:.1} N",
-                            self.snap.hammer_force.iter().sum::<f32>()
-                        )
-                    } else {
-                        "No note yet".into()
-                    })
-                    .small()
-                    .color(MUTED),
-                );
-            });
-        });
-        let (r, response) = ui.allocate_exact_size(size, Sense::hover());
-        #[cfg(test)]
-        trace_left_target(ui,"strings-panel",response.rect);
-        response.on_hover_text("Up to three wires make one note. Left to right is string length, not time.");
-        let p = ui.painter();
-        p.rect_filled(r, 6.0, PANEL);
-        p.line_segment(
-            [
-                pos2(r.left() + 10.0, r.center().y),
-                pos2(r.right() - 10.0, r.center().y),
-            ],
-            Stroke::new(1.0, Color32::from_gray(55)),
-        );
-        let peak = self
-            .snap
-            .shape
-            .iter()
-            .zip(self.snap.shape_nodes)
-            .flat_map(|(s, n)| s[..n.min(s.len())].iter())
-            .fold(1e-7f32, |m, x| m.max(x.abs()));
-        self.string_scale = peak.max(self.string_scale * 0.98);
-        for i in 0..3 {
-            let n = self.snap.shape_nodes[i];
-            if n < 2 {
-                continue;
-            }
-            let points = (0..n)
-                .map(|j| {
-                    pos2(
-                        r.left() + 10.0 + (r.width() - 20.0) * j as f32 / (n - 1) as f32,
-                        r.center().y
-                            - self.snap.shape[i][j] / self.string_scale * (r.height() * 0.4),
-                    )
-                })
-                .collect();
-            p.add(Shape::line(
-                points,
-                Stroke::new(
-                    1.2,
-                    [
-                        AMBER,
-                        Color32::from_rgb(106, 158, 187),
-                        Color32::from_rgb(157, 178, 143),
-                    ][i],
-                ),
-            ));
-        }
-        p.text(
-            r.left_bottom() + vec2(10.0, -6.0),
-            Align2::LEFT_BOTTOM,
-            format!("Height magnified: ± {:.3} mm", self.string_scale * 1000.0),
-            FontId::monospace(10.0),
-            MUTED,
-        );
-        p.text(
-            r.left_bottom() + vec2(10.0, -18.0),
-            Align2::LEFT_BOTTOM,
-            "Fixed string end",
-            FontId::proportional(10.0),
-            MUTED,
-        );
-        p.text(
-            r.right_bottom() + vec2(-10.0, -18.0),
-            Align2::RIGHT_BOTTOM,
-            "Bridge end",
-            FontId::proportional(10.0),
-            MUTED,
-        );
-        if self.snap.focus_midi < 21 {
-            p.text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                "Play the on-screen keyboard to see actual string motion.",
-                FontId::proportional(12.0),
-                MUTED,
-            );
-        }
     }
     fn controls(&mut self, ui: &mut Ui, setter: &ParamSetter) {
-        // add_sized alone does not override egui Slider's preferred rail width.
-        // This child UI owns the parameter-column style; header Volume stays unchanged.
-        let rail_width = ui.available_width();
-        ui.spacing_mut().slider_width = rail_width;
         let tab = self.tab;
-        let room_switch =
-            |i: usize| tab == 0 && PARAMS[i].kind == piano_engine::params::Kind::Switch;
-        let indices = (0..PARAMS.len())
-            .filter(|&i| PARAMS[i].tab == tab && room_switch(i))
-            .chain((0..PARAMS.len()).filter(|&i| PARAMS[i].tab == tab && !room_switch(i)));
-        for index in indices {
-            let p = &PARAMS[index];
-            let setting = &self.params.settings[index];
-            let (label, why) = guide::copy(p.name);
-            let help = if p.help.is_empty() {
-                why.into()
-            } else {
-                format!("{why}\n{}", p.help)
-            };
-            match setting {
-                Setting::Number(param) => {
-                    ui.horizontal(|ui| {
-                        ui.label(label).on_hover_text(&help);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if default_reset(
-                                ui,
-                                setter,
-                                param,
-                                guide::value(p, param.default_plain_value() as f64),
-                            ) {
-                                self.active_param = index;
-                                self.preset = "Custom settings".into();
-                            }
-                            ui.label(
-                                RichText::new(guide::value(p, param.value() as f64))
-                                    .monospace()
-                                    .color(AMBER),
-                            );
-                        });
-                    });
-                    let mut value = param.value();
-                    let response = ui
-                        .add_sized(
-                            vec2(ui.available_width(), 18.0),
-                            Slider::new(&mut value, p.lo as f32..=p.hi as f32)
-                                .logarithmic(p.log)
-                                .show_value(false),
-                        )
-                        .on_hover_text(&help);
-                    #[cfg(test)]
-                    trace_control(ui, "control", param, &response);
-                    if response.hovered() || response.dragged() {
-                        self.active_param = index;
-                    }
-                    if response.drag_started() {
-                        setter.begin_set_parameter(param);
-                    }
-                    if response.changed() {
-                        if !response.dragged() {
-                            setter.begin_set_parameter(param);
-                        }
-                        setter.set_parameter(param, value);
-                        self.preset = "Custom settings".into();
-                        if !response.dragged() {
-                            setter.end_set_parameter(param);
-                        }
-                    }
-                    if response.drag_stopped() {
-                        setter.end_set_parameter(param);
-                    }
-                }
-                Setting::Switch(param) => {
-                    ui.horizontal(|ui| {
-                        let mut value = param.value();
-                        let response = ui.checkbox(&mut value, label).on_hover_text(&help);
-                        #[cfg(test)]
-                        trace_control(ui, "control", param, &response);
-                        if response.hovered() || response.changed() {
-                            self.active_param = index;
-                        }
-                        if response.changed() {
-                            set_switch(setter, param, value);
-                            self.preset = "Custom settings".into();
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let default = param.default_plain_value() as u8 as f64;
-                            if default_reset(ui, setter, param, guide::value(p, default)) {
-                                self.active_param = index;
-                                self.preset = "Custom settings".into();
-                            }
-                        });
-                    });
-                }
-            }
-            ui.add_space(4.0);
-        }
-    }
-    fn room(&mut self, ui: &mut Ui, setter: &ParamSetter, height: f32) {
-        let mut o = self.params.options();
-        let (r, response) =
-            ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-        #[cfg(test)]
-        trace_left_target(ui,"room-panel",response.rect);
-        response.on_hover_text("Room plan: drag the piano or listener. The ring is the listener handle; the two dots are virtual pickup points. Paths are illustrative, not a measured sound field.");
-        let p = ui.painter_at(r);
-        p.rect_filled(r, 6.0, PANEL);
-        let area = Rect::from_min_max(r.min + vec2(12.0, 10.0), r.max - vec2(12.0, 20.0));
-        let scale = (area.width() / o.room_lx as f32).min(area.height() / o.room_ly as f32);
-        let room = Rect::from_center_size(
-            area.center(),
-            vec2(o.room_lx as f32 * scale, o.room_ly as f32 * scale),
-        );
-        let to = |x: f64, y: f64| {
-            pos2(
-                room.left() + x as f32 * scale,
-                room.bottom() - y as f32 * scale,
-            )
+        let groups: &[(&str, &[&str])] = match tab {
+            0 => &[
+                (
+                    "SPACE & GEOMETRY",
+                    &[
+                        "Room (walls, floor, ceiling, reverberation)",
+                        "Binaural head shadow",
+                        "Room shape",
+                        "Room length",
+                        "Room width",
+                        "Room height",
+                        "Ceiling slope",
+                        "Wall splay",
+                        "Wall skew",
+                        "Wall absorption",
+                    ],
+                ),
+                (
+                    "LISTENER & LID",
+                    &[
+                        "Lid angle",
+                        "Ear height",
+                        "Ear spacing",
+                        "Piano position, along the keyboard",
+                        "Piano position, along the strings",
+                        "Listener position, along the keyboard",
+                        "Listener position, along the strings",
+                    ],
+                ),
+            ],
+            1 => &[
+                (
+                    "HAMMER & FELT",
+                    &["Felt hardness", "Hammer mass", "Felt damping", "Strike point"],
+                ),
+                (
+                    "ACTION MECHANICS",
+                    &["Let-off distance", "Shank springiness", "Action knocks"],
+                ),
+                (
+                    "DAMPERS & PEDAL",
+                    &["Damper strength", "Damper weight", "Pedal noise"],
+                ),
+            ],
+            2 => &[
+                (
+                    "TUNING & WIRE",
+                    &[
+                        "Pitch of A4",
+                        "Unison detune",
+                        "Internal loss",
+                        "Wire stiffness",
+                        "Downbearing angle",
+                        "Strike angle",
+                    ],
+                ),
+                (
+                    "PHYSICS OPTIONS",
+                    &[
+                        "Stretch tuning (octaves tuned by matching overtones)",
+                        "Longitudinal motion (stretching: phantom partials, bass ring)",
+                        "Duplex lengths behind the bridge (treble shimmer)",
+                        "Sideways string motion (of struck strings)",
+                        "Damped strings keep ringing faintly (costs as much as holding the pedal)",
+                    ],
+                ),
+            ],
+            _ => &[
+                (
+                    "SPRUCE PLATE",
+                    &[
+                        "Thickness",
+                        "Loss factor",
+                        "Crown radius",
+                        "Air loading (the air's mass and drag on the board)",
+                    ],
+                ),
+                (
+                    "RIBS, RIM & BRIDGE",
+                    &["Rib height", "Rib spacing", "Rim grip", "Bridge height"],
+                ),
+            ],
         };
-        p.rect_stroke(
-            room,
-            0.0,
-            Stroke::new(
-                1.0,
-                if o.room_enabled {
-                    MUTED
-                } else {
-                    Color32::from_gray(62)
-                },
-            ),
-            StrokeKind::Inside,
-        );
-        let listener = to(o.listener_x, o.listener_y);
-        let piano = to(o.piano_x + 0.7, o.piano_y + 0.7);
-        let points: Vec<_> = self
-            .preview_design
-            .board
-            .outline
-            .iter()
-            .map(|q| to(o.piano_x + q.x, o.piano_y + q.y))
-            .collect();
-        p.add(Shape::convex_polygon(
-            points,
-            AMBER.gamma_multiply(0.45),
-            Stroke::new(1.0, AMBER),
-        ));
-        p.circle_stroke(listener, 5.5, Stroke::new(1.3, Color32::LIGHT_BLUE));
-        for ear in &self.preview_design.ears {
-            p.circle_filled(
-                to(o.piano_x + ear.x, o.piano_y + ear.y),
-                2.5,
-                Color32::LIGHT_BLUE,
-            );
-        }
-        p.line_segment(
-            [listener, piano],
-            Stroke::new(1.0, Color32::LIGHT_BLUE.gamma_multiply(0.65)),
-        );
-        if o.room_enabled {
-            // Example top-down wall path, not the engine's full radiation/pressure solution.
-            let sx = o.piano_x + 0.7;
-            let sy = o.piano_y + 0.7;
-            let image_y = 2.0 * o.room_ly - sy;
-            let t = (o.room_ly - image_y) / (o.listener_y - image_y).min(-0.001);
-            let wall = to(sx + (o.listener_x - sx) * t, o.room_ly);
-            p.add(Shape::line(
-                vec![piano, wall, listener],
-                Stroke::new(1.2, AMBER.gamma_multiply((1.0 - o.room_absorption) as f32)),
-            ));
-        }
-        p.text(
-            r.left_bottom() + vec2(3.0, -1.0),
-            Align2::LEFT_BOTTOM,
-            format!("{:.1} × {:.1} m", o.room_lx, o.room_ly),
-            FontId::proportional(10.0),
-            MUTED,
-        );
-        p.text(
-            piano + vec2(-2.0, 15.0),
-            Align2::CENTER_TOP,
-            "Piano",
-            FontId::proportional(10.0),
-            AMBER,
-        );
-        p.text(
-            listener + vec2(7.0, 0.0),
-            Align2::LEFT_CENTER,
-            "Listener",
-            FontId::proportional(10.0),
-            Color32::LIGHT_BLUE,
-        );
-        // Object-specific hit targets leave empty space available to the scroll area.
-        let piano_hit = ui.interact(
-            Rect::from_center_size(piano, vec2(1.4 * scale, 1.5 * scale)),
-            ui.id().with("piano-drag"),
-            Sense::drag(),
-        );
-        let listener_hit = ui.interact(
-            Rect::from_center_size(listener, vec2(28.0, 28.0)),
-            ui.id().with("listener-drag"),
-            Sense::drag(),
-        );
-        for (is_listener, hit) in [(false, piano_hit), (true, listener_hit)] {
-            if hit.dragged() {
-                let delta = hit.drag_delta();
-                let dx = delta.x as f64 / scale as f64;
-                let dy = -delta.y as f64 / scale as f64;
-                if is_listener {
-                    o.listener_x = (o.listener_x + dx).clamp(0.3, o.room_lx - 0.3);
-                    o.listener_y = (o.listener_y + dy).clamp(0.3, o.room_ly - 0.3);
-                } else {
-                    o.piano_x = (o.piano_x + dx).clamp(0.2, (o.room_lx - 1.6).max(0.2));
-                    o.piano_y = (o.piano_y + dy).clamp(0.8, (o.room_ly - 1.7).max(0.8));
-                }
-                self.apply_options(setter, &o);
-                let field = match (is_listener, dx.abs() >= dy.abs()) {
-                    (true, true) => "Listener position, along the keyboard",
-                    (true, false) => "Listener position, along the strings",
-                    (false, true) => "Piano position, along the keyboard",
-                    _ => "Piano position, along the strings",
-                };
-                self.active_param = PARAMS
-                    .iter()
-                    .position(|p| p.name == field)
-                    .unwrap_or(self.active_param);
-                self.preset = "Custom settings".into();
+
+        let avail = (ui.available_width() - 4.0).max(200.0);
+        let cols: usize = if avail >= 310.0 { 3 } else { 2 };
+
+        for &(title, names) in groups {
+            let group_indices: Vec<usize> = names
+                .iter()
+                .filter_map(|&name| PARAMS.iter().position(|p| p.name == name && p.tab == tab))
+                .collect();
+            if group_indices.is_empty() {
+                continue;
             }
+            knob::control_card(ui, title, |ui| {
+                // 1) Switches & Room shape selector cleanly stacked at top of card
+                for &index in &group_indices {
+                    let p = &PARAMS[index];
+                    let setting = &self.params.settings[index];
+                    let (label, why) = guide::copy(p.name);
+                    let help = if p.help.is_empty() {
+                        why.into()
+                    } else {
+                        format!("{why}\n{}", p.help)
+                    };
+                    match setting {
+                        Setting::Switch(param) => {
+                            ui.horizontal(|ui| {
+                                let mut value = param.value();
+                                let response = ui.checkbox(&mut value, label).on_hover_text(&help);
+                                #[cfg(test)]
+                                trace_control(ui, "control", param, &response);
+                                if response.hovered() || response.changed() {
+                                    self.active_param = index;
+                                }
+                                if response.changed() {
+                                    set_switch(setter, param, value);
+                                    self.preset = "Custom settings".into();
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let default = param.default_plain_value() as u8 as f64;
+                                    if default_reset(ui, setter, param, guide::value(p, default)) {
+                                        self.active_param = index;
+                                        self.preset = "Custom settings".into();
+                                    }
+                                });
+                            });
+                            ui.add_space(2.0);
+                        }
+                        Setting::Number(param) if p.name == "Room shape" => {
+                            let cur = RoomShape::from_value(param.value() as f64);
+                            ui.horizontal(|ui| {
+                                ui.label(label).on_hover_text(&help);
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if default_reset(
+                                        ui,
+                                        setter,
+                                        param,
+                                        guide::value(p, param.default_plain_value() as f64),
+                                    ) {
+                                        self.active_param = index;
+                                        self.preset = "Custom settings".into();
+                                    }
+                                    let resp = ComboBox::from_id_salt("room-shape-select")
+                                        .width(148.0)
+                                        .selected_text(cur.name())
+                                        .show_ui(ui, |ui| {
+                                            for shape in RoomShape::ALL {
+                                                let v = shape as i32 as f32;
+                                                if ui
+                                                    .selectable_label(cur == shape, shape.name())
+                                                    .clicked()
+                                                    && cur != shape
+                                                {
+                                                    set_number(setter, param, v);
+                                                    self.active_param = index;
+                                                    self.preset = "Custom settings".into();
+                                                }
+                                            }
+                                        });
+                                    #[cfg(test)]
+                                    trace_control(ui, "control", param, &resp.response);
+                                    if resp.response.hovered() {
+                                        self.active_param = index;
+                                    }
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
+                        _ => {}
+                    }
+                }
+
+                // 2) Tactile rotary knob grid (3-up or 2-up cleanly inside the card!)
+                let knob_indices: Vec<usize> = group_indices
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        matches!(self.params.settings[i], Setting::Number(_))
+                            && PARAMS[i].name != "Room shape"
+                    })
+                    .collect();
+                if !knob_indices.is_empty() {
+                    let gap = 6.0;
+                    let inner_w = (ui.available_width() - gap * (cols as f32 - 1.0)).max(120.0);
+                    let cell_w = (inner_w / cols as f32).floor();
+                    for row in knob_indices.chunks(cols) {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for &index in row {
+                                let p = &PARAMS[index];
+                                let Setting::Number(param) = &self.params.settings[index] else {
+                                    continue;
+                                };
+                                let (label, why) = guide::copy(p.name);
+                                let help = if p.help.is_empty() {
+                                    why.into()
+                                } else {
+                                    format!("{why}\n{}", p.help)
+                                };
+                                if knob::rotary_knob_cell(
+                                    ui,
+                                    setter,
+                                    p,
+                                    param,
+                                    label,
+                                    &help,
+                                    cell_w,
+                                    self.active_param == index,
+                                    &mut self.preset,
+                                ) {
+                                    self.active_param = index;
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                }
+            });
         }
-        ui.add_space(4.0);
     }
     fn keyboard(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
@@ -1384,26 +1140,69 @@ impl State {
                 whites += 1;
             }
         }
+        // Keybed frame behind keys
+        p.rect_filled(r.expand(1.5), 3.0, Color32::from_rgb(12, 15, 17));
+        let key_hints = ["A", "W", "S", "E", "D", "F", "T", "G", "Y", "H", "U", "J", "K", "O", "L", "P", ";"];
+        let base_midi = (self.octave + 1) * 12;
+
         for is_black in [false, true] {
             for (m, kr) in rects.iter().filter(|(m, _)| black(*m) == is_black) {
                 let down = self.shared.held[*m as usize].load(Ordering::Relaxed) != 0
                     || self.mouse_note == Some(*m)
                     || self.key_notes.values().any(|n| n == m);
+                let vel = (self.shared.velocity[*m as usize].load(Ordering::Relaxed) as f32 / 127.0).clamp(0.25, 1.0);
                 let color = if down {
-                    AMBER
+                    // Velocity-scaled amber glow: softer touch = warm gold, forte = luminous amber
+                    Color32::from_rgb(
+                        (182.0 + 64.0 * vel) as u8,
+                        (134.0 + 58.0 * vel) as u8,
+                        (74.0 + 38.0 * vel) as u8,
+                    )
                 } else if is_black {
-                    Color32::from_rgb(24, 28, 30)
+                    Color32::from_rgb(24, 28, 31)
                 } else {
-                    Color32::from_rgb(218, 220, 213)
+                    Color32::from_rgb(224, 222, 212)
                 };
                 p.rect_filled(*kr, 2.0, color);
+                if !is_black && !down {
+                    // Subtle ivory front bevel lip
+                    let lip = Rect::from_min_max(pos2(kr.left(), kr.bottom() - 4.0), kr.max);
+                    p.rect_filled(lip, 1.5, Color32::from_rgb(196, 194, 184));
+                } else if is_black && !down {
+                    // Subtle raised ebony top highlight
+                    let cap = Rect::from_min_max(kr.min + vec2(1.0, 1.0), pos2(kr.right() - 1.0, kr.bottom() - 5.0));
+                    p.rect_filled(cap, 1.5, Color32::from_rgb(36, 42, 46));
+                }
+                // Faint computer-keyboard key hints on the active octave
+                let off = *m - base_midi;
+                if (0..key_hints.len() as i32).contains(&off) {
+                    let hint = key_hints[off as usize];
+                    let pos = if is_black {
+                        kr.center_bottom() + vec2(0.0, -6.0)
+                    } else {
+                        kr.center_bottom() + vec2(0.0, -19.0)
+                    };
+                    p.text(
+                        pos,
+                        Align2::CENTER_BOTTOM,
+                        hint,
+                        FontId::proportional(8.5),
+                        if down {
+                            BG
+                        } else if is_black {
+                            Color32::from_rgb(132, 138, 142)
+                        } else {
+                            Color32::from_rgb(122, 126, 124)
+                        },
+                    );
+                }
                 if *m % 12 == 0 && !is_black {
                     p.text(
-                        kr.center_bottom() + vec2(0.0, -7.0),
+                        kr.center_bottom() + vec2(0.0, -5.0),
                         Align2::CENTER_BOTTOM,
                         note_name(*m),
                         FontId::proportional(9.0),
-                        Color32::from_gray(80),
+                        if down { BG } else { Color32::from_gray(82) },
                     );
                 }
             }
@@ -1469,6 +1268,16 @@ impl State {
                 ..
             } = event
             {
+                if pressed
+                    && !repeat
+                    && STANDALONE.load(Ordering::Relaxed)
+                    && (modifiers.command || modifiers.mac_cmd)
+                    && matches!(key, Key::Q | Key::W)
+                {
+                    self.release_ui();
+                    terminate_standalone_app();
+                    return;
+                }
                 if repeat || (pressed && (modifiers.command || modifiers.alt || self.saving)) {
                     continue;
                 }

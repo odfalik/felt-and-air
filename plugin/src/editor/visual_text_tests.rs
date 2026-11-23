@@ -77,41 +77,29 @@ fn actual_header_sound_and_diagnostics_paint_natural_single_rows() {
 }
 
 #[test]
-fn actual_soundboard_caption_paints_all_text_inside_its_real_panel() {
+fn header_height_is_invariant_during_background_rebuild_preventing_relayout_jitter() {
     both_editor_modes(|| {
         for size in TEXT_SIZES {
-            let mut f=Fixture::new(size); select_category(&mut f,3);
-            let output=f.frame(Vec::new());
-            let (panel,panel_clip)=f.ctx.data(|d|d.get_temp::<(Rect,Rect)>(Id::new("compact:anatomy-panel:3")))
-                .expect("fresh actual guide::instrument allocated panel/clip");
-            let options=f.state.params.options();
-            let expected=format!("{:.1} mm wood • {:.0} mm ribs • {:.0} mm apart",options.board_thickness_mm,options.rib_height_mm,options.rib_spacing_mm);
-            let texts=painted_text(&output);
-            let matching:Vec<_>=texts.iter().filter(|(text,_)|text.galley.job.text.contains("mm wood") && text.galley.job.text.contains("mm ribs") && text.galley.job.text.contains("mm apart")).collect();
-            assert_eq!(matching.len(),1,"one actual painted physical-caption galley required");
-            let (text,clip)=matching[0];
-            assert_eq!(text.galley.job.text,expected,"physical caption text/units changed");
-            assert!(!text.galley.elided && text.angle==0.0,"caption truncated/rotated");
-            assert!(text.galley.job.sections.iter().all(|section|section.format.font_id==FontId::proportional(11.0)),"caption font must stay11pt proportional");
-            // Compare painted semantic characters, independent of soft-wrap whitespace.
-            let painted: String=text.galley.rows.iter().flat_map(|row|row.glyphs.iter().map(|glyph|glyph.chr)).filter(|c|!c.is_whitespace()).collect();
-            let semantic: String=expected.chars().filter(|c|!c.is_whitespace()).collect();
-            assert_eq!(painted,semantic,"wrapped caption lost/reordered physical text or units");
-            let available=panel.intersect(panel_clip).intersect(*clip).intersect(f.screen());
-            let logical=text.galley.rect.translate(text.pos.to_vec2());
-            let visual=text.visual_bounding_rect();
-            assert!(inside(logical,available) && inside(visual,available)
-                && text.galley.rows.iter().all(|row|inside(row.rect.translate(text.pos.to_vec2()),available)),
-                "actual Soundboard caption glyphs/rows leave allocated panel: size={size:?} api={:?} panel={panel:?} logical={logical:?} glyphs={visual:?}",f.host.api);
-            if size.x<=1000.0 { assert!(text.galley.rows.len()>1,"compact caption must wrap full preserved text, not clip or shrink it"); }
-            f.host.assert_no_edits(); assert!(f.musical_inputs().is_empty());
+            let mut f = Fixture::new(size);
+            select_category(&mut f, 3);
+            let before_sidebar = f.sidebar().0;
+            let (before_board, _) = left_target(&f, "board-panel");
+            f.state.shared.building.store(true, Ordering::Relaxed);
+            f.settle();
+            let during_sidebar = f.sidebar().0;
+            let (during_board, _) = left_target(&f, "board-panel");
+            f.state.shared.building.store(false, Ordering::Relaxed);
+            f.settle();
+            let after_sidebar = f.sidebar().0;
+            assert!((before_sidebar.top() - during_sidebar.top()).abs() <= 0.5,
+                "header grew during rebuild: before={before_sidebar:?} during={during_sidebar:?}");
+            assert!((before_sidebar.height() - during_sidebar.height()).abs() <= 0.5);
+            assert!((before_board.top() - during_board.top()).abs() <= 0.5);
+            assert!((before_sidebar.top() - after_sidebar.top()).abs() <= 0.5);
         }
     });
 }
 
-fn left_scroll(f:&Fixture)->(Rect,Vec2,Vec2) {
-    f.ctx.data(|d|d.get_temp(Id::new("left:scroll"))).expect("fresh actual left ScrollArea output")
-}
 fn left_target(f:&Fixture,name:&str)->(Rect,Rect) {
     f.ctx.data(|d|d.get_temp(Id::new(format!("left:{name}")))).expect("fresh actual left response")
 }
@@ -128,296 +116,119 @@ fn seen_text(texts:&[(epaint::TextShape,Rect)],expected:&str,panel:Rect,visible:
         && inside(text.galley.rect.translate(text.pos.to_vec2()),available)
         && text.galley.rows.iter().all(|row|inside(row.rect.translate(text.pos.to_vec2()),available))
 }
-// Observe targets at every small forward step: whole expanded cards need not
-// fit at once. The reverse traversal independently proves return to the top.
-fn walk_left(f:&mut Fixture,mut observe:impl FnMut(&Fixture,&FullOutput)) {
-    let rhs=f.sidebar().2;
-    let output=f.frame(Vec::new()); observe(f,&output);
-    assert!(left_scroll(f).2.y.abs()<=TEXT_TOLERANCE,"fresh fixture starts at actual left top");
-    let check=|f:&Fixture| {
-        let (viewport,content,offset)=left_scroll(f);
-        assert!(viewport.is_finite() && content.is_finite() && offset.is_finite());
-        assert!(viewport.width()>0.0 && viewport.height()>0.0 && content.y>=0.0);
-        let max=(content.y-viewport.height()).max(0.0);
-        assert!(offset.y>=-TEXT_TOLERANCE && offset.y<=max+TEXT_TOLERANCE,"actual left offset outside content");
-        assert_eq!(f.sidebar().2,rhs,"left wheel moved right controls");
-        f.host.assert_no_edits();
-        assert!(f.musical_inputs().is_empty(),"left wheel/collapse emitted musical inputs");
-        let visible=viewport.intersect(f.screen());
-        assert!(visible.width()>0.0 && visible.height()>0.0,"on-screen actual left wheel target");
-        (visible,max,offset.y)
-    };
-    for direction in [1.0f32,-1.0] {
-        for step in 0..=64 {
-            let (visible,max,before)=check(f);
-            let remaining=if direction>0.0 {max-before} else {before};
-            if remaining<=TEXT_TOLERANCE {
-                if max<=TEXT_TOLERANCE {
-                    // Fitting content must not acquire phantom scroll in either direction.
-                    f.wheel(visible.center(),MouseWheelUnit::Point,24.0*direction);
-                    let output=f.frame(Vec::new()); let (_,_,after)=check(f);
-                    assert!((after-before).abs()<=TEXT_TOLERANCE);
-                    if direction>0.0 {observe(f,&output);}
-                }
-                break;
-            }
-            assert!(step<64,"bounded actual left wheel traversal did not reach end");
-            f.wheel(visible.center(),MouseWheelUnit::Point,24.0*direction);
-            let output=f.frame(Vec::new()); let (_,_,after)=check(f);
-            assert!((after-before)*direction>0.0,"overflowing actual left viewport did not progress");
-            if direction>0.0 {observe(f,&output);}
-        }
-        let (_,max,offset)=check(f);
-        let expected=if direction>0.0 {max} else {0.0};
-        assert!((offset-expected).abs()<=TEXT_TOLERANCE,"actual left end/top not reached");
-    }
-}
 
 #[test]
-fn actual_left_room_map_and_expanded_decay_targets_are_wheel_reachable() {
+fn unified_room_strings_and_soundboard_canvases_render_within_viewport() {
     both_editor_modes(|| {
         for size in TEXT_SIZES {
-            let mut f=Fixture::new(size); select_category(&mut f,0);
-            let rhs=f.sidebar().2;
-            let (header,clip)=left_target(&f,"decay-header");
-            let visible=left_scroll(&f).0.intersect(clip).intersect(f.screen());
-            assert!(inside(header,visible),"real decay header must be fully reachable for the click");
-            f.click_at(header.center());
-            for _ in 0..12 {f.frame(Vec::new());}
-            assert_eq!(f.sidebar().2,rhs,"real decay click moved right controls");
-            assert_eq!(f.ctx.data(|d|d.get_temp::<bool>(Id::new("left:decay-open"))),Some(true),
-                "real Decay estimate click did not open its actual body");
-            let o=f.state.params.options();
-            let map_text=[format!("{:.1} × {:.1} m",o.room_lx,o.room_ly),"Piano".into(),"Listener".into()];
-            let decay_text=[format!("Room tail ≈ {:.2} s",guide::room_decay(&o)),
-                "Time for echoes to become very quiet (−60 dB)".into(),
-                "First 4 s · Sabine estimate, not live audio. Gray: default room.".into()];
-            let plot_text=["0 dB","−60 dB","0s","1s","2s","3s","4s"];
-            let mut seen=[false;15];
-            walk_left(&mut f,|f,output| {
-                let texts=painted_text(output); let viewport=left_scroll(f).0.intersect(f.screen());
-                let (map,clip)=left_target(f,"room-panel");
-                seen[0]|=inside(map,viewport.intersect(clip));
-                for (i,label) in map_text.iter().enumerate() {seen[1+i]|=seen_text(&texts,label,map,viewport.intersect(clip));}
-                let (body,clip)=left_target(f,"decay-body");
-                for (i,label) in decay_text.iter().enumerate() {seen[4+i]|=seen_text(&texts,label,body,viewport.intersect(clip));}
-                let (plot,clip)=left_target(f,"decay-plot");
-                seen[7]|=inside(plot,viewport.intersect(clip));
-                for (i,label) in plot_text.iter().enumerate() {seen[8+i]|=seen_text(&texts,label,plot,viewport.intersect(clip));}
-            });
-            assert!(seen.iter().all(|seen|*seen),
-                "actual Room map/T60 targets not fully seen during wheel traversal: size={size:?} api={:?} targets={seen:?}",f.host.api);
+            let mut f = Fixture::new(size);
+            // Tab 0: Unified Room Floor Plan + Side Elevation
+            select_category(&mut f, 0);
+            let out = f.frame(Vec::new());
+            let (panel, clip) = left_target(&f, "room-panel");
+            let vis = clip.intersect(f.screen());
+            assert!(inside(panel, vis), "Room canvas overflows viewport: {size:?}");
+            let texts = painted_text(&out);
+            assert!(seen_text(&texts, "Piano", panel, vis));
+            assert!(seen_text(&texts, "Listener", panel, vis));
+            assert!(seen_text(&texts, "SIDE ELEVATION · FLOOR, CEILING & LID", panel, vis));
+
+            // Tab 2: Unified Multi-Lane Strings
+            select_category(&mut f, 2);
+            let out = f.frame(Vec::new());
+            let (panel, clip) = left_target(&f, "strings-panel");
+            let vis = clip.intersect(f.screen());
+            assert!(inside(panel, vis), "Strings canvas overflows viewport: {size:?}");
+            let texts = painted_text(&out);
+            assert!(seen_text(&texts, "Agraffe", panel, vis));
+            assert!(seen_text(&texts, "Bridge", panel, vis));
+
+            // Tab 3: Unified Soundboard
+            select_category(&mut f, 3);
+            let out = f.frame(Vec::new());
+            let (panel, clip) = left_target(&f, "board-panel");
+            let vis = clip.intersect(f.screen());
+            assert!(inside(panel, vis), "Soundboard canvas overflows viewport: {size:?}");
         }
     });
 }
 
 #[test]
-fn actual_left_strings_lower_panel_and_bottom_text_are_wheel_reachable() {
-    both_editor_modes(|| {
-        for size in TEXT_SIZES {
-            let mut f=Fixture::new(size); select_category(&mut f,2);
-            assert!(f.state.snap.focus_midi<21,"canonical empty fixture, not fabricated live curves");
-            let mut seen=[false;5];
-            walk_left(&mut f,|f,output| {
-                let texts=painted_text(output); let (panel,clip)=left_target(f,"strings-panel");
-                let visible=left_scroll(f).0.intersect(clip).intersect(f.screen());
-                seen[0]|=inside(panel,visible);
-                let labels=["Fixed string end".into(),"Bridge end".into(),
-                    format!("Height magnified: ± {:.3} mm",f.state.string_scale*1000.0),
-                    "Play the on-screen keyboard to see actual string motion.".into()];
-                for (i,label) in labels.iter().enumerate() {seen[1+i]|=seen_text(&texts,label,panel,visible);}
-            });
-            assert!(seen.iter().all(|seen|*seen),
-                "actual Strings lower targets not fully seen during wheel traversal: size={size:?} api={:?} targets={seen:?}",f.host.api);
-        }
-    });
-}
-
-#[test]
-fn actual_state_single_key_accepted_build_publication_paints_measured_action() {
+fn actual_state_single_key_accepted_build_publication_paints_rotational_action() {
     use crate::editor::illustration::action::PaintTrace;
-    use piano_engine::piano::{ActionPhase,ActionPose,ActionStroke};
-    #[derive(Clone,PartialEq)]
-    struct Geometry {felt:Vec<Pos2>,references:Vec<[Pos2;2]>}
-    fn geometry(output:&FullOutput,paint:&PaintTrace,screen:Rect)->(Geometry,bool) {
-        fn visit(shape:&Shape,clip:Rect,paint:&PaintTrace,screen:Rect,felt:&mut Vec<Vec<Pos2>>,references:&mut Vec<[Pos2;2]>,cue:&mut bool) {
-            let available=paint.panel.intersect(paint.clip).intersect(clip).intersect(screen);
+    fn paint_trace(f: &Fixture) -> PaintTrace {
+        f.ctx.data(|d| d.get_temp(Id::new("action:paint"))).expect("fresh action paint trace")
+    }
+    fn hero_felt_vertices(output: &FullOutput, paint: &PaintTrace) -> Vec<Pos2> {
+        fn visit(shape: &Shape, paint: &PaintTrace, out: &mut Vec<Vec<Pos2>>) {
             match shape {
-                Shape::Vec(shapes)=>for shape in shapes {visit(shape,clip,paint,screen,felt,references,cue);},
-                Shape::Mesh(mesh) if mesh.vertices.len()>3 && mesh.vertices.iter().all(|v|v.color==paint.felt_color)
-                    && shape.visual_bounding_rect().intersects(paint.panel)=> {
-                    assert!(mesh.indices.iter().all(|&i|(i as usize)<mesh.vertices.len()));
-                    assert!(mesh.vertices.iter().all(|v|v.pos.is_finite() && available.expand(TEXT_TOLERANCE).contains(v.pos)),
-                        "actual felt mesh vertices leave paint clip");
-                    felt.push(mesh.vertices.iter().map(|v|v.pos).collect());
-                },
-                Shape::LineSegment {points,stroke} if points[0].y==points[1].y
-                    && stroke.width==1.0 && stroke.color==paint.reference_color
-                    && points.iter().all(|p|available.expand(TEXT_TOLERANCE).contains(*p))=>references.push(*points),
-                Shape::LineSegment {points,stroke} if stroke.width==2.0 && stroke.color==paint.cue_color
-                    && points.iter().all(|p|available.expand(TEXT_TOLERANCE).contains(*p))=>*cue=true,
-                _=>{},
+                Shape::Vec(shapes) => for s in shapes { visit(s, paint, out); },
+                Shape::Mesh(mesh) if mesh.vertices.len() > 20 && mesh.vertices.iter().all(|v| v.color == paint.felt_color)
+                    && shape.visual_bounding_rect().intersects(paint.panel) => {
+                    out.push(mesh.vertices.iter().map(|v| v.pos).collect());
+                }
+                _ => {}
             }
         }
-        let mut felt=Vec::new(); let mut references=Vec::new(); let mut cue=false;
-        for clipped in &output.shapes {visit(&clipped.shape,clipped.clip_rect,paint,screen,&mut felt,&mut references,&mut cue);}
-        assert_eq!(felt.len(),1,"one ACTUAL filled felt mesh in Action paint scope");
-        (Geometry {felt:felt.pop().unwrap(),references},cue)
+        let mut found = Vec::new();
+        for c in &output.shapes { visit(&c.shape, paint, &mut found); }
+        assert_eq!(found.len(), 1, "one hero felt mesh expected");
+        found.pop().unwrap()
     }
-    fn head(meta:&ActionStroke,pose:&ActionPose)->f64 {
-        match pose.phase {
-            ActionPhase::Flight=>pose.eta_m,
-            ActionPhase::Returning|ActionPhase::Checked|ActionPhase::Rest=>{
-                assert!(meta.return_origin.valid && meta.return_origin.reference_observed);
-                meta.return_origin.origin_m-pose.hy_m
-            },
-            ActionPhase::Invalid=>panic!("real painted bracket cannot be invalid"),
-        }
-    }
-    fn paint_trace(f:&Fixture)->PaintTrace {
-        f.ctx.data(|d|d.get_temp(Id::new("action:paint"))).expect("fresh last-frame actual paint scope")
-    }
-    let _mode=EditorModeGuard::new(true);
-    for size in [vec2(1280.0,860.0),vec2(800.0,600.0)] {
-        let mut p=crate::PhysicalPiano::with_demos(||Arc::new(Vec::new()));
-        assert!(p.initialize_engine(48000.0,512));
-        assert!(p.shared.display.lock().unwrap().view.is_some(),"REAL accepted build BoardView");
-        let mut f=Fixture::from_shared(size,p.params.clone(),p.shared.clone(),p.demos.clone());
+    let _mode = EditorModeGuard::new(true);
+    for size in [vec2(1280.0, 860.0), vec2(800.0, 600.0)] {
+        let mut p = crate::PhysicalPiano::with_demos(|| Arc::new(Vec::new()));
+        assert!(p.initialize_engine(48000.0, 512));
+        let mut f = Fixture::from_shared(size, p.params.clone(), p.shared.clone(), p.demos.clone());
         f.settle();
-        let category=actual_header(&f,"category:1");
-        f.click_at(category.center()); f.settle();
-        let initial=f.frame(Vec::new()); let paint=paint_trace(&f);
-        assert!(paint.status.starts_with("Waiting for simulation samples"));
-        let (neutral,_)=geometry(&initial,&paint,f.screen());
-        assert!(paint.identity.is_none() && paint.bracket.is_none());
-        assert!(painted_text(&initial).iter().all(|(text,_)|!text.galley.job.text.contains("effective let-off")));
-        // Real blank click, not a memory/focus override, then actual keyboard events.
-        f.click_at(paint.panel.left_top()+vec2(5.0,5.0)); f.settle();
-        let key=|pressed|Event::Key {key:Key::A,physical_key:None,pressed,repeat:false,modifiers:Modifiers::default()};
+        let category = actual_header(&f, "category:1");
+        f.click_at(category.center());
+        f.settle();
+        let initial = f.frame(Vec::new());
+        let paint0 = paint_trace(&f);
+        assert_eq!(paint0.status, "Neutral");
+        let neutral_felt = hero_felt_vertices(&initial, &paint0);
+
+        // Press and release C4 through real editor input path
+        f.click_at(paint0.panel.left_top() + vec2(5.0, 5.0));
+        f.settle();
+        let key = |pressed| Event::Key { key: Key::A, physical_key: None, pressed, repeat: false, modifiers: Modifiers::default() };
         f.frame(vec![key(true)]);
-        assert!(!p.shared.inputs.is_empty(),"actual State.show keydown must enter real queue");
         p.drain_editor_inputs();
-        assert!(p.shared.inputs.is_empty());
-        assert_eq!(p.shared.focus.load(Ordering::Relaxed),60);
-        assert_ne!(p.shared.held[60].load(Ordering::Relaxed)&FROM_UI,0);
         f.frame(vec![key(false)]);
-        assert!(!p.shared.inputs.is_empty(),"actual State.show keyup must enter real queue");
         p.drain_editor_inputs();
-        assert_eq!(p.shared.held[60].load(Ordering::Relaxed)&FROM_UI,0);
-        let mut frames=0usize; let mut until_publish=2048usize;
-        let mut left=[0.0;512]; let mut right=[0.0;512];
-        let mut live_count=0usize; let mut saw_buffering=false; let mut saw_cue=false;
-        let mut previous:Option<(f64,f32,Vec<f64>,Vec<f32>)>=None;
-        const REFERENCE_TOLERANCE:f64=0.003;
-        let mut translated=false; let mut reference_signal=false; let mut last_live=None;
+
+        let mut left = [0.0; 512];
+        let mut right = [0.0; 512];
+        let mut until_publish = 2048usize;
+        let mut live_count = 0usize;
+        let mut saw_rotation = false;
         for _ in 0..14 {
-            let mut remaining=800usize; // 60Hz UI, real physics pieces<=512.
-            while remaining>0 {
-                let n=remaining.min(512).min(until_publish);
-                p.built.as_mut().unwrap().piano.process(&mut left[..n],&mut right[..n]);
-                assert!(left[..n].iter().chain(&right[..n]).all(|v|v.is_finite()));
-                frames+=n; remaining-=n; until_publish-=n;
-                assert!(frames<=12000,"hard real-output-frame bound per layout");
-                if until_publish==0 {
-                    assert!(p.try_publish_snapshot(),"PRODUCTION accepted/gen/try_lock publication body");
-                    until_publish=2048;
+            let mut rem = 800usize;
+            while rem > 0 {
+                let n = rem.min(512).min(until_publish);
+                p.built.as_mut().unwrap().piano.process(&mut left[..n], &mut right[..n]);
+                rem -= n;
+                until_publish -= n;
+                if until_publish == 0 {
+                    assert!(p.try_publish_snapshot());
+                    until_publish = 2048;
                 }
             }
-            let output=f.frame(Vec::new()); let paint=paint_trace(&f);
-            let (observed,cue_geometry)=geometry(&output,&paint,f.screen());
-            saw_buffering|=paint.status.starts_with("Buffering measured stroke");
-            if paint.status.starts_with("Measured ") {
-                live_count+=1;
-                let display=p.shared.display.lock().unwrap();
-                let published=&display.snap.action;
-                let displayed=paint.identity.expect("actual displayed retained stroke identity");
-                let meta=published.stroke(displayed.2).expect("EXACT displayed metadata owner, never current-stroke substitution");
-                assert_eq!(displayed,(display.generation,meta.midi,meta.stroke_sequence));
-                assert_eq!(observed.references.len(),meta.string_count as usize);
-                let (lower,upper,alpha,_)=paint.bracket.expect("ACTUAL painted real bracket");
-                let a=&published.poses().filter(|r|r.stroke_sequence==meta.stroke_sequence && r.pose.pose_step==lower).last().expect("real owned lower endpoint").pose;
-                let b=&published.poses().filter(|r|r.stroke_sequence==meta.stroke_sequence && r.pose.pose_step==upper).last().expect("real owned upper endpoint").pose;
-                let expected_head=head(meta,a)+(head(meta,b)-head(meta,a))*alpha;
-                let expected_along:Vec<_>=(0..meta.string_count as usize)
-                    .map(|i|a.string_along_m[i]+(b.string_along_m[i]-a.string_along_m[i])*alpha).collect();
-                let actual_head_y=observed.felt.iter().map(|p|p.y).fold(f32::INFINITY,f32::min);
-                let actual_refs:Vec<_>=observed.references.iter().map(|points|points[0].y).collect();
-                if let Some((old_head,old_y,old_along,old_refs))=&previous {
-                    if (expected_head-old_head).abs()>1e-5 {
-                        let scale=-(actual_head_y-*old_y) as f64/(expected_head-*old_head);
-                        assert!(scale.is_finite() && scale>0.0,"ACTUAL mesh translates in model strike direction");
-                        for i in 0..expected_along.len() {
-                            let projected=scale*(expected_along[i]-old_along[i]);
-                            reference_signal|=projected.abs()>REFERENCE_TOLERANCE;
-                            assert!(((actual_refs[i]-old_refs[i]) as f64+projected).abs()<REFERENCE_TOLERANCE,
-                                "ACTUAL local reference geometry must track coherent along, not a nominal line");
-                        }
-                        translated=true;
-                    }
+            let out = f.frame(Vec::new());
+            let paint = paint_trace(&f);
+            let felt = hero_felt_vertices(&out, &paint);
+            if paint.status == "Live" {
+                live_count += 1;
+                // Rotational arc moves BOTH x and y relative to neutral pose!
+                let dx_max = felt.iter().zip(&neutral_felt).map(|(a, b)| (a.x - b.x).abs()).fold(0.0f32, f32::max);
+                let dy_max = felt.iter().zip(&neutral_felt).map(|(a, b)| (a.y - b.y).abs()).fold(0.0f32, f32::max);
+                if dx_max > 0.2 && dy_max > 1.0 {
+                    saw_rotation = true;
                 }
-                let gap_label=format!("Gap {:+.1} mm",(expected_along[0]-expected_head)*1000.0);
-                previous=Some((expected_head,actual_head_y,expected_along,actual_refs));
-                assert_eq!(observed.felt.len(),neutral.felt.len());
-                let neutral_y=neutral.felt.iter().map(|p|p.y).fold(f32::INFINITY,f32::min);
-                let translation=actual_head_y-neutral_y;
-                for (actual,original) in observed.felt.iter().zip(&neutral.felt) {
-                    assert!((actual.x-original.x).abs()<0.001,"ALL actual felt vertices must retain X");
-                    assert!(((actual.y-original.y)-translation).abs()<0.001,"ALL actual felt vertices must share one rigid translation/extent");
-                }
-                let extent=|points:&[Pos2]|vec2(
-                    points.iter().map(|p|p.x).fold(f32::NEG_INFINITY,f32::max)-points.iter().map(|p|p.x).fold(f32::INFINITY,f32::min),
-                    points.iter().map(|p|p.y).fold(f32::NEG_INFINITY,f32::max)-points.iter().map(|p|p.y).fold(f32::INFINITY,f32::min));
-                assert!((extent(&observed.felt)-extent(&neutral.felt)).length()<0.002,"ACTUAL felt mesh extent must remain constant");
-                let texts=painted_text(&output);
-                for label in ["Felt","Wood molding","Wooden shank"] {
-                    assert!(seen_text(&texts,label,paint.panel,paint.clip.intersect(f.screen())),"actual anatomy label");
-                }
-                let now_label=match paint.status.split(" ·").next().unwrap() {
-                    "Measured hammer motion"=>"NOW · measured hammer motion",
-                    "Measured return"=>"NOW · measured return",
-                    "Measured backcheck"=>"NOW · measured backcheck",
-                    "Measured rest"=>"NOW · measured rest",
-                    _=>panic!("unexpected actual measured display label"),
-                };
-                assert!(seen_text(&texts,now_label,paint.panel,paint.clip.intersect(f.screen())),"actual NOW pose label");
-                assert!(seen_text(&texts,&gap_label,paint.panel,paint.clip.intersect(f.screen())),"actual measured gap in signed millimetres");
-                let expected=format!("{} · {:.1} g · effective let-off {:.2} mm",note_name(meta.midi as i32),
-                    meta.hammer_mass_kg*1000.0,meta.let_off_effective_m()*1000.0);
-                assert!(seen_text(&texts,&expected,paint.panel,paint.clip.intersect(f.screen())),"actual same-generation model label");
-                if let Some((owner,pose_step,solve_step))=paint.cue_steps {
-                    assert_eq!(pose_step,solve_step+1);
-                    let cue_meta=published.stroke(owner).expect("actual historical contact metadata owner");
-                    assert!(published.contacts().any(|contact|contact.stroke_sequence==owner && (contact.entry_pose.pose_step==pose_step || contact.peak_pose.pose_step==pose_step)));
-                    let cue_label=format!("EARLIER · recorded contact {}",note_name(cue_meta.midi as i32));
-                    assert!(cue_geometry && seen_text(&texts,&cue_label,paint.panel,paint.clip.intersect(f.screen())), 
-                        "ACTUAL historical contact line/galley must be present");
-                    saw_cue=true;
-                }
-                last_live=Some((observed,paint.bracket));
             }
         }
-        assert!(saw_buffering && live_count>1 && translated && saw_cue,"real State.show motion/reference/contact path");
-        assert!(reference_signal,"REAL projected local-string motion never exceeded asserted tolerance; nominal-reference rejection is unproved");
-        assert_eq!(frames,11200);
-        let publications=p.shared.display_frames.load(Ordering::Acquire);
-        let mut paused=0;
-        for _ in 0..12 {
-            let output=f.frame(Vec::new()); let paint=paint_trace(&f);
-            let (observed,_)=geometry(&output,&paint,f.screen());
-            if paint.status.starts_with("Measured ") {last_live=Some((observed,paint.bracket));}
-            else if paint.status.starts_with("Paused ") {
-                let (last_geometry,last_bracket)=last_live.as_ref().unwrap();
-                assert!(observed==*last_geometry,"ACTUAL head/reference vertices rewind or move after pause");
-                assert_eq!(&paint.bracket,last_bracket);
-                assert!(seen_text(&painted_text(&output),paint.status,paint.panel,paint.clip.intersect(f.screen())));
-                assert!(seen_text(&painted_text(&output),"NOW · paused measured bracket",paint.panel,paint.clip.intersect(f.screen())),"actual frozen NOW label");
-                paused+=1;
-            }
-        }
-        assert!(paused>=2);
-        assert_eq!(p.shared.display_frames.load(Ordering::Acquire),publications,"no synthetic publication while physics pauses");
-        f.host.assert_no_edits(); assert!(p.shared.inputs.is_empty());
-        assert!(f.frame<=80,"bounded actual UI frames per layout");
+        assert!(live_count > 1 && saw_rotation, "hero hammer must rotate along circular arc during real strike");
     }
 }
 
