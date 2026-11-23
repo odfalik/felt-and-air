@@ -616,3 +616,155 @@ fn t16_pedal_stir() {
     println!("      before: {:.0} dB SPL; pedal going down: {:.0} dB SPL; one mezzo forte C4: {:.0} dB SPL", spl(quiet.max(1e-12)), spl(stir), spl(note));
     check!(stir > 30.0 * quiet.max(1e-9) && stir < 0.1 * note, "the stir is audible and far below a played note ({:.0} dB under)", spl(note) - spl(stir));
 }
+
+#[test]
+fn t17_single_note_c4_grazing_uses_felt_contact_not_output_level() {
+    // C4-only design, not a full-compass loading/threshold calibration.
+    // A missed hammer can still produce action/preload sound. Test the actual felt force,
+    // with the key held, not pressure amplitude or an arbitrary minimum note duration.
+    // Fixed legacy launch reference, independent of experimental MIDI touch curves.
+    let legacy_launch = 0.25 + 5.5 * (1.0_f64 / 127.0).powf(1.7);
+    for rate in [44100.0, 48000.0, 96000.0] {
+        for speed in [0.185, 0.200, legacy_launch] {
+            let d = one_note(40);
+            let contacts = d.notes[0].strings.len();
+            let mut p = Piano::new(&d, &PianoOptions { sample_rate: rate, ..options(1) }).unwrap();
+            p.note_on(60, speed);
+            let (mut first, mut peak, mut impulse) = (None, 0.0f64, 0.0);
+            for sample in 0..(0.2 * rate) as usize {
+                let (left, right) = p.step();
+                assert!(left.is_finite() && right.is_finite());
+                let force: f64 = (0..contacts).map(|i| p.hammer_force(i)).sum();
+                assert!(force.is_finite() && force >= 0.0);
+                if force > 1e-8 { first.get_or_insert(sample); }
+                peak = peak.max(force);
+                impulse += force / rate;
+            }
+            println!("      {rate} Hz, {speed:.9} m/s: first {first:?} samples, peak {peak:.6} N, impulse {impulse:.9} N s");
+            if speed == 0.185 {
+                check!(first.is_none() && peak == 0.0, "subthreshold launch has no felt contact");
+            } else if speed == 0.200 {
+                check!(first.is_some() && peak > 0.01 && peak < 0.2 && impulse > 0.0,
+                    "near-threshold launch makes a weak real contact");
+            } else {
+                let onset = first.expect("fixed legacy launch must contact in this reference case") as f64 / rate;
+                check!(onset > 0.008 && onset < 0.012 && peak > 0.5 && peak < 3.0,
+                    "fixed 0.251458466... m/s reference keeps its original physical contact bounds");
+            }
+        }
+    }
+}
+
+
+#[test]
+fn t18_unison_profile_is_stable_centered_and_geometry_invariant() {
+    let geometry = |s: &StringDesign| ([s.length, s.rho_a, s.ei, s.ea, s.tension,
+        s.sigma0, s.sigma1, s.bridge.x, s.bridge.y].map(f64::to_bits), s.attached);
+    for a4 in [432.0, 440.0, 442.0] {
+        for stretch in [false, true] {
+            let options = GrandOptions { a4_hz: a4, stretch_tuning: stretch, unison_detune_cents: 0.0, ..Default::default() };
+            let aligned = make_grand(&options);
+            for amount in [0.0, 0.6, 6.0] {
+                let options = GrandOptions { unison_detune_cents: amount, ..options.clone() };
+                let design = make_grand(&options);
+                let rebuilt = make_grand(&options);
+                let mut patterns = std::collections::BTreeSet::new();
+                for ((base, note), again) in aligned.notes.iter().zip(&design.notes).zip(&rebuilt.notes) {
+                    let center = base.strings[0].f0;
+                    let cents: Vec<_> = note.strings.iter().map(|s| 1200.0 * (s.f0 / center).log2()).collect();
+                    assert!(cents.iter().sum::<f64>().abs() / (cents.len() as f64) < 1e-9);
+                    for ((s, zero), repeat) in note.strings.iter().zip(&base.strings).zip(&again.strings) {
+                        assert_eq!(s.f0.to_bits(), repeat.f0.to_bits());
+                        assert_eq!(geometry(s), geometry(zero));
+                        if amount == 0.0 || note.strings.len() == 1 { assert_eq!(s.f0.to_bits(), center.to_bits()); }
+                    }
+                    assert_eq!(note.duplex.len(), base.duplex.len());
+                    for (s, zero) in note.duplex.iter().zip(&base.duplex) { assert_eq!(geometry(s), geometry(zero)); }
+                    if amount > 0.0 && note.strings.len() > 1 {
+                        assert!(note.strings.windows(2).all(|w| w[0].f0 < w[1].f0));
+                        if cents.len() == 3 { patterns.insert(cents.iter().map(|c| (c * 1000.0).round() as i64).collect::<Vec<_>>()); }
+                    }
+                }
+                if amount > 0.0 { assert!(patterns.len() > 50, "profile is not the same triple on every key"); }
+            }
+        }
+    }
+}
+
+#[test]
+fn t19_unison_targets_have_finite_partials_and_identical_helper_output() {
+    for amount in [0.0, 0.6, 6.0] {
+        let design = make_grand(&GrandOptions { unison_detune_cents: amount, ..Default::default() });
+        let options = PianoOptions { board_grid_scale: 1.5, ..options(1) };
+        let mut serial = Piano::new(&design, &options).unwrap();
+        let mut parallel = Piano::new(&design, &options).unwrap();
+        parallel.set_helper_threads(3, None, None);
+        for midi in [36, 60, 84, 96] {
+            let note = &design.notes[(midi - 21) as usize];
+            for (index, string) in serial.strings_of_note(midi).into_iter().zip(&note.strings) {
+                let fundamental = serial.discrete_partial(index, 1);
+                assert!((1200.0 * (fundamental / string.f0).log2()).abs() < 1e-6);
+                let partials: Vec<_> = (1..=3).map(|p| serial.discrete_partial(index, p)).collect();
+                assert!(partials.iter().all(|f| f.is_finite() && *f > 0.0 && *f < 24000.0));
+                assert!(partials.windows(2).all(|w| w[0] < w[1]));
+            }
+        }
+        let (mut left, mut right, mut pl, mut pr) = ([0.0f32; 64], [0.0f32; 64], [0.0f32; 64], [0.0f32; 64]);
+        let mut peak = 0.0f32;
+        for block in 0..32 {
+            for piano in [&mut serial, &mut parallel] {
+                match block {
+                    0 => { piano.note_on(36, 2.0); piano.note_on(60, 2.0); }
+                    4 => piano.note_on(96, 3.0),
+                    8 => piano.note_off(36, 1.0),
+                    12 => piano.set_pedal(0.5),
+                    16 => piano.note_off(60, 1.0),
+                    24 => piano.set_pedal(0.0),
+                    _ => {}
+                }
+            }
+            serial.process(&mut left, &mut right);
+            parallel.process(&mut pl, &mut pr);
+            for i in 0..64 {
+                assert!(left[i].is_finite() && right[i].is_finite());
+                assert_eq!((left[i].to_bits(), right[i].to_bits()), (pl[i].to_bits(), pr[i].to_bits()));
+                peak = peak.max(left[i].abs()).max(right[i].abs());
+            }
+        }
+        assert!(peak > 0.0);
+        assert_eq!(serial.energy().to_bits(), parallel.energy().to_bits());
+        println!("      unison amount {amount}: real full-compass partial targets, finite stereo and 0/3-helper equality, peak {peak:.6}");
+    }
+}
+
+
+#[test]
+fn t20_quiet_midi_one_matches_direct_launch_in_full_compass_without_gain_scaling() {
+    // Contact/miss is an observation, not an assertion that every positive velocity sounds.
+    let design = make_grand(&GrandOptions::default());
+    assert_eq!(design.notes.len(), 88);
+    for midi in [21, 36, 60, 84, 90, 96, 108] {
+        let mut mapped = Piano::new(&design, &options(1)).unwrap();
+        let mut direct = Piano::new(&design, &options(1)).unwrap();
+        mapped.note_on(midi, midi_velocity_to_hammer_speed(1));
+        direct.note_on(midi, 0.200);
+        let contacts = mapped.strings_of_note(midi);
+        let (mut peak, mut impulse, mut first) = (0.0f64, 0.0, None);
+        for frame in 0..2400 {
+            let a = mapped.step(); let b = direct.step();
+            assert!(a.0.is_finite() && a.1.is_finite());
+            assert_eq!((a.0.to_bits(), a.1.to_bits()), (b.0.to_bits(), b.1.to_bits()));
+            let mut force = 0.0;
+            for &index in &contacts {
+                let f = mapped.hammer_force(index);
+                assert!(f.is_finite() && f >= 0.0);
+                assert_eq!(f.to_bits(), direct.hammer_force(index).to_bits());
+                force += f;
+            }
+            if force > 0.0 { first.get_or_insert(frame); }
+            peak = peak.max(force); impulse += force / 48000.0;
+        }
+        assert!(mapped.energy().is_finite());
+        println!("      full-compass MIDI{midi}/velocity1: direct launch0.200m/s bit-identical, first={first:?} samples, peak={peak:.9e}N, impulse={impulse:.9e}Ns; no audibility guarantee");
+    }
+}

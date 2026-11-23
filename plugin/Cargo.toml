@@ -21,7 +21,7 @@ piano_engine = { path = "../engine" }
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a", default-features = false }
 nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a" }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["float_roundtrip"] }
 crossbeam = "0.8"
 midir = { version = "0.9.1", optional = true }
 

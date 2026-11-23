@@ -11,7 +11,12 @@
 //! helper costs time, never correctness. State touched during a job lives in `Shared` and is
 //! reached through raw buffers, each chunk keeping to its own part.
 
+mod action_observer;
+pub use action_observer::{ActionContact, ActionPhase, ActionPose, ActionPoseRecord, ActionReturnOrigin, ActionStroke, ActionTrace};
+use action_observer::{ActionObserver, FORCE_OBSERVED, KEY_DOWN, SHANK_OBSERVED};
+
 use crate::acoustics::Radiation;
+use crate::action_contact::{felt, RAIL_REFERENCE, STOP_REFERENCE};
 use crate::design::*;
 use crate::plate::{Attachment, Coupling, Interp, Plate};
 use std::cell::UnsafeCell;
@@ -82,7 +87,7 @@ struct StringRt {
     damp_target: f64,
     /// Steps spent fully damped.
     damped_steps: usize,
-    /// How fast the damper comes down, relative to ordinary.
+    /// Existing grounded-contact compression-rate proxy, relative to ordinary.
     damp_land: f64,
     /// dt^2 * resting damper force per node / node mass, at full engagement.
     press_k: f64,
@@ -431,6 +436,8 @@ impl Shared {
         // Damper felt.
         if s.damp_rate != s.damp_target {
             // Felt takes a few milliseconds to seat or to let go.
+            // Grounded contact approximation retained unchanged. Key return sets
+            // first contact; release-speed compression proxy remains independent.
             let rate = if s.damp_target > s.damp_rate { 0.004 * s.damp_land } else { 0.006 };
             s.damp_rate += (s.damp_target - s.damp_rate) * rate * (48000.0 * k);
             if (s.damp_rate - s.damp_target).abs() < 1e-3 {
@@ -520,6 +527,8 @@ pub struct Snapshot {
     pub hammer_force: [f32; 3],
     pub focus_midi: i32,
     pub awake: usize,
+    /// Read-only real action history; identity is also labelled by Display.generation.
+    pub action: ActionTrace,
 }
 
 pub type ThreadHook = Arc<dyn Fn() + Send + Sync>;
@@ -542,6 +551,7 @@ pub struct Piano {
     note_of_midi: [Option<usize>; 128],
     /// Share of full damper strength the pedal position leaves on.
     pedal_damping: f64,
+    sostenuto_down: bool,
     never_sleep: bool,
     action: ActionDesign,
     soft: bool,
@@ -565,6 +575,7 @@ pub struct Piano {
     mech_noise: f64,
     rng: u32,
     step_count: u64,
+    action_observer: ActionObserver,
     quiet_checks: u32,
     hammer_iters_max: usize,
     // One-way constructor experiment: prove a real zero tick once, never detect tails.
@@ -983,6 +994,7 @@ impl Piano {
             notes,
             note_of_midi,
             pedal_damping: 1.0,
+            sostenuto_down: false,
             never_sleep: d.damped_strings_ring,
             action: d.action,
             soft: false,
@@ -1002,6 +1014,7 @@ impl Piano {
             mech_noise: d.mechanism_noise,
             rng: 0x2545F491,
             step_count: 0,
+            action_observer: ActionObserver::new(k),
             quiet_checks: 1 << 20,
             hammer_iters_max: 0,
             pristine,
@@ -1037,13 +1050,6 @@ fn plate_advance(r: &[f64], scale: &[f64], vw: &mut [f64], w: &mut [f64], keep: 
         w[t] += vw[t];
         keep[t] = dv;
     }
-}
-
-fn felt(z: f64, zdot: f64, k: f64, p: f64, drag: f64) -> f64 {
-    if z <= 0.0 {
-        return 0.0;
-    }
-    (k * z.powf(p) + drag * zdot).max(0.0)
 }
 
 impl Piano {
@@ -1157,13 +1163,17 @@ impl Piano {
     /// `speed`: hammer speed at let-off, m/s. Call from the same thread as `process`.
     pub fn note_on(&mut self, midi: i32, speed: f64) {
         let Some(ni) = self.note_of_midi[(midi & 127) as usize] else { return };
+        if speed > 0.0 && self.action_observer.focus().is_some() {
+            // Real old-focus endpoint BEFORE retarget, pristine/wake/key/head mutation.
+            let previous=self.observed_action_pose(self.step_count);
+            self.action_observer.end_focus(previous);
+        }
         self.pristine = Pristine::Disabled; // Even speed 0 wakes the bent, preloaded string.
         let mut n = self.notes[ni].clone();
         n.key_down = true;
         for i in 0..n.total {
             self.wake(n.first + i);
             let s = &mut self.strings_mut()[n.first + i];
-            s.damp_target = 0.0; // the key lifts the damper well before the hammer arrives
             s.damp_rate = 0.0;
             if s.l_cells > 0 {
                 s.l_on = true;
@@ -1202,6 +1212,16 @@ impl Piano {
             }
         }
         self.notes[ni] = n;
+        self.refresh_damper(ni);
+        if speed > 0.0 {
+            let n=&self.notes[ni];
+            self.action_observer.begin(ni,n.midi,n.count,self.step_count,self.action.let_off,
+                self.action.check_distance,self.action.rest_distance,n.h_total);
+            if self.action_observer.focus()==Some(ni) {
+                let pose=self.observed_action_pose(self.step_count);
+                self.action_observer.finish_step(self.step_count,Some(pose));
+            }
+        }
     }
 
     /// `release_speed`: how fast the key comes back up, 1 = ordinary. Sets how quickly the
@@ -1213,14 +1233,11 @@ impl Piano {
         }
         self.pristine = Pristine::Disabled;
         let release_speed = release_speed.clamp(0.25, 4.0);
-        let target = self.sh.damp_max * self.pedal_damping;
         let n = &mut self.notes[ni];
         n.key_down = false;
-        let (first, total, sost) = (n.first, n.total, n.sost);
-        // The key on its way up: a note-off is taken as the moment the damper meets the string,
-        // which happens about half way up. The key then travels on to its rest.
+        // Off starts the existing virtual key's return. Its lifter stays up until
+        // the simulated key coordinate reaches the regulated contact point.
         n.key_phase = 3;
-        n.ky = n.ky.min(self.action.key_at_damper);
         n.kv = -0.15 * release_speed;
         n.k_force = 0.0;
         if n.checked {
@@ -1228,11 +1245,28 @@ impl Piano {
             n.checked = false;
             n.returning = true;
         }
-        for s in &mut self.strings_mut()[first..first + total] {
-            if s.has_damper && !sost {
-                s.damp_target = target;
-                s.damp_land = release_speed;
+        let (first, total, sost) = (n.first, n.total, n.sost);
+        if !sost {
+            for s in &mut self.strings_mut()[first..first + total] {
+                if s.has_damper { s.damp_land = release_speed; }
             }
+        }
+        self.refresh_damper(ni);
+    }
+
+    /// One owner of grounded felt engagement. Key, sustain and sostenuto lifters
+    /// compose here, so releasing one control cannot defeat another's support.
+    /// This gates the existing grounded brake; it is not a finite-mass felt model.
+    fn refresh_damper(&mut self, ni: usize) {
+        let n = &self.notes[ni];
+        let lifted = n.key_down || n.sost || n.ky > self.action.key_at_damper;
+        let target = if lifted { 0.0 } else { self.sh.damp_max * self.pedal_damping };
+        let (first, total) = (n.first, n.total);
+        for i in first..first + total {
+            let s = &self.strings()[i];
+            if !s.has_damper { continue; }
+            if target < self.sh.damp_max && !s.sideways { self.wake(i); }
+            self.strings_mut()[i].damp_target = target;
         }
     }
 
@@ -1272,23 +1306,15 @@ impl Piano {
             return;
         }
         self.pedal_damping = damping;
-        let damp_max = self.sh.damp_max;
         for ni in 0..self.notes.len() {
-            let (first, total, held) = (self.notes[ni].first, self.notes[ni].total, self.notes[ni].key_down || self.notes[ni].sost);
-            for i in first..first + total {
-                let s = &self.strings()[i];
-                if !s.has_damper {
-                    continue;
-                }
-                if damping < 1.0 && !s.sideways {
-                    self.wake(i);
-                }
-                if !held {
-                    let s = &mut self.strings_mut()[i];
-                    s.damp_target = damp_max * damping;
-                    s.damp_land = 1.0;
+            let n = &self.notes[ni];
+            if !n.key_down && !n.sost {
+                let (first, total) = (n.first, n.total);
+                for s in &mut self.strings_mut()[first..first + total] {
+                    if s.has_damper { s.damp_land = 1.0; }
                 }
             }
+            self.refresh_damper(ni);
         }
     }
 
@@ -1302,27 +1328,20 @@ impl Piano {
 
     /// Sostenuto: dampers of the keys held at this moment stay up until the pedal is released.
     pub fn set_sostenuto(&mut self, down: bool) {
-        if down || self.notes.iter().any(|n| n.sost) {
-            self.pristine = Pristine::Disabled;
-        }
-        let target = self.sh.damp_max * self.pedal_damping;
+        if down == self.sostenuto_down { return; }
+        self.pristine = Pristine::Disabled;
+        self.sostenuto_down = down;
         for ni in 0..self.notes.len() {
             let n = &mut self.notes[ni];
-            if down {
-                n.sost = n.key_down;
-                continue;
-            }
-            let release = n.sost && !n.key_down;
-            n.sost = false;
+            let release = !down && n.sost && !n.key_down;
+            n.sost = down && n.key_down;
             if release {
                 let (first, total) = (n.first, n.total);
                 for s in &mut self.strings_mut()[first..first + total] {
-                    if s.has_damper {
-                        s.damp_target = target;
-                        s.damp_land = 1.0;
-                    }
+                    if s.has_damper { s.damp_land = 1.0; }
                 }
             }
+            self.refresh_damper(ni);
         }
     }
 
@@ -1351,8 +1370,8 @@ impl Piano {
     fn step_action(a: &ActionDesign, k: f64, n: &mut NoteRt, r: &mut [f64]) {
         let mut to_case = 0.0;
         if n.key_phase == 1 || n.key_phase == 3 {
-            let bottom = felt(n.ky - a.key_travel, n.kv, a.felt_k, a.felt_p, a.felt_c);
-            let rest = felt(-n.ky, -n.kv, a.felt_k, a.felt_p, a.felt_c);
+            let bottom = felt(n.ky - a.key_travel, n.kv, a.felt_k, a.felt_p, a.felt_c, RAIL_REFERENCE);
+            let rest = felt(-n.ky, -n.kv, a.felt_k, a.felt_p, a.felt_c, RAIL_REFERENCE);
             let f = n.k_force - a.up_weight - bottom + rest;
             n.kv += k * f / a.key_mass;
             n.ky += k * n.kv;
@@ -1367,7 +1386,7 @@ impl Piano {
         }
         if n.returning {
             let place = if n.key_down { a.check_distance } else { a.rest_distance };
-            let stop = felt(n.hy - place, n.hv, a.stop_k, a.stop_p, a.stop_c);
+            let stop = felt(n.hy - place, n.hv, a.stop_k, a.stop_p, a.stop_c, STOP_REFERENCE);
             n.hv += k * (if a.gravity { 9.81 } else { 0.0 } - stop / n.h_total);
             n.hy += k * n.hv;
             n.h_slow += (stop - n.h_slow) * k / 0.02;
@@ -1518,6 +1537,8 @@ impl Piano {
             r = c;
         }
 
+        // Observe the actual solved interval forces before the rebound path clears s.force.
+        self.action_observer.force(ni,self.step_count,force,total);
         let mut away = true;
         for i in 0..ns {
             for pol in 0..if n.twin { 2 } else { 1 } {
@@ -1544,6 +1565,8 @@ impl Piano {
             n.checked = false;
             n.hy = -self.strings()[n.first].zeta;
             n.hv = -n.veta / k;
+            let observed_zeta=self.strings()[n.first].zeta;
+            self.action_observer.returning(ni,self.step_count+1,n.eta,n.hy,observed_zeta);
             n.h_slow = 0.0;
             for s in &mut self.strings_mut()[n.first..n.first + ns] {
                 s.force = 0.0;
@@ -1710,10 +1733,19 @@ impl Piano {
                     s.defer_advance = n.hammer_active;
                 }
             }
+            // This reference is observed AFTER string advance but BEFORE return integration.
+            if self.action_observer.needs_reference(ni) {
+                let n=&self.notes[ni];
+                let along0=self.along(n,0,&self.sh.u);
+                let hy=n.hy;
+                self.action_observer.return_reference(along0,hy);
+            }
             let n = &mut self.notes[ni];
+            let lifted = n.ky > self.action.key_at_damper;
             if n.key_phase == 1 || n.key_phase == 3 || n.returning {
                 Self::step_action(&self.action, k, n, r);
             }
+            if lifted != (n.ky > self.action.key_at_damper) { self.refresh_damper(ni); }
         }
         sh.vb.fetch_xor(1, Ordering::Relaxed);
         sh.plate.solve_stiff(r, &mut self.solve_work);
@@ -1734,6 +1766,11 @@ impl Piano {
         if self.pristine == Pristine::Candidate {
             self.pristine = if self.zero_tick(out) { Pristine::Zero } else { Pristine::Disabled };
         }
+        // Observe the COMPLETED step, including vb flip, plate work and housekeeping sleep.
+        let pose=if self.action_observer.needs_pose(self.step_count) {
+            Some(self.observed_action_pose(self.step_count))
+        } else { None };
+        self.action_observer.finish_step(self.step_count,pose);
         out
     }
 
@@ -2036,6 +2073,28 @@ impl Piano {
         self.sh.plate.interp(piano_xy).eval(unsafe { self.sh.vw.all() }) / self.k
     }
 
+    /// This reads only stable serial state, after the corresponding strings/action advance.
+    fn observed_action_pose(&self, step:u64) -> ActionPose {
+        let n=&self.notes[self.action_observer.focus().expect("observed real stroke")];
+        let force=self.action_observer.force_observation();
+        let mut along=[0.0;3];
+        for (i,value) in along.iter_mut().enumerate().take(n.count) {
+            *value=self.along(n,i,&self.sh.u);
+        }
+        let phase=if n.hammer_active {ActionPhase::Flight} else if n.returning {ActionPhase::Returning}
+            else if n.checked {ActionPhase::Checked} else {ActionPhase::Rest};
+        let mut flags=0;
+        if force.observed { flags|=FORCE_OBSERVED; }
+        if n.key_down { flags|=KEY_DOWN; }
+        if n.hammer_active && n.s_mass>0.0 { flags|=SHANK_OBSERVED; }
+        ActionPose { pose_step:step, force_solve_step:force.step,
+            eta_m:n.eta, eta_velocity_mps:n.veta/self.k, xi_m:n.xi, xi_velocity_mps:n.vxi/self.k,
+            hy_m:n.hy, hv_mps:n.hv, ky_m:n.ky, kv_mps:n.kv,
+            string_along_m:along, force_n:force.wires,
+            flags,
+            key_phase:n.key_phase, phase }
+    }
+
     pub fn new_snapshot(&self) -> Snapshot {
         let max_n = self.strings().iter().map(|s| s.n + 1).max().unwrap_or(0);
         Snapshot {
@@ -2046,10 +2105,13 @@ impl Piano {
             hammer_force: [0.0; 3],
             focus_midi: -1,
             awake: 0,
+            action: ActionTrace::default(),
         }
     }
 
     pub fn fill_snapshot(&self, snap: &mut Snapshot, focus_midi: i32) {
+        // Independent observed-note identity; copy even if the legacy waveform focus is absent.
+        snap.action=self.action_observer.trace;
         let w = unsafe { self.sh.w.all() };
         for (dst, src) in snap.board.iter_mut().zip(w) {
             *dst = *src as f32;
@@ -2094,6 +2156,12 @@ mod tests {
     use super::*;
 
     fn same_state(a: &Piano, b: &Piano) {
+        same_physical_state(a, b);
+        assert_eq!(a.quiet_checks, b.quiet_checks);
+        assert_eq!(a.sh.active.load(Ordering::Relaxed), b.sh.active.load(Ordering::Relaxed));
+    }
+
+    fn same_physical_state(a: &Piano, b: &Piano) {
         let bits = |s: &[f64]| s.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
         for (x, y) in [(&a.sh.u, &b.sh.u), (&a.sh.v[0], &b.sh.v[0]), (&a.sh.v[1], &b.sh.v[1]),
             (&a.sh.w, &b.sh.w), (&a.sh.vw, &b.sh.vw), (&a.sh.r, &b.sh.r),
@@ -2104,12 +2172,11 @@ mod tests {
         assert_eq!(a.step_count, b.step_count);
         assert_eq!(a.vb(), b.vb());
         assert_eq!(a.hist_pos, b.hist_pos);
-        assert_eq!(a.quiet_checks, b.quiet_checks);
-        assert_eq!(a.sh.active.load(Ordering::Relaxed), b.sh.active.load(Ordering::Relaxed));
         assert_eq!(bits(&a.solve_work), bits(&b.solve_work));
         for i in 0..2 { assert_eq!(bits(&a.hist[i]), bits(&b.hist[i])); }
         assert_eq!(a.rng, b.rng);
         assert_eq!(a.pedal_step, b.pedal_step);
+        assert_eq!(a.sostenuto_down, b.sostenuto_down);
         assert_eq!(a.pulse_count, b.pulse_count);
         assert_eq!(a.awake_strings(), b.awake_strings());
         for (a, b) in a.strings().iter().zip(b.strings()) {
@@ -2300,6 +2367,74 @@ mod tests {
     }
 
     #[test]
+    fn action_contact_coupled_strokes_are_finite_and_bounded() {
+        use std::io::Write;
+        for fs in [44100.0, 48000.0, 96000.0] {
+            for rapid in [false, true] {
+                let mut p = Piano::new(&make_grand(&GrandOptions::default()),
+                    &PianoOptions { sample_rate: fs, board_grid_scale: 1.5, ..PianoOptions::default() }).unwrap();
+                let ni = p.note_of_midi[60].unwrap();
+                let mut peak = 0.0f64;
+                let mut compression = [0.0f64; 3];
+                let mut force_peak = [0.0f64; 3];
+                let mut contacts = [0usize; 3];
+                let mut previous = [false; 3];
+                let mut diagnostic = std::env::var_os("FELT_ACTION_CONTACT_DIAGNOSTICS").map(|dir| {
+                    let dir = std::path::PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let file = std::fs::File::create(dir.join(format!("{fs}-rapid-{rapid}.csv"))).unwrap();
+                    let mut writer = std::io::BufWriter::new(file);
+                    writeln!(writer, "time_s,lower_N,upper_N,hammer_N,case_N").unwrap();
+                    writer
+                });
+                for frame in 0..(0.6 * fs) as usize {
+                    if rapid {
+                        for i in 0..4 {
+                            if frame == (i as f64 * 0.05 * fs).round() as usize { p.note_on(60, 2.0); }
+                            if frame == ((i as f64 * 0.05 + 0.025) * fs).round() as usize { p.note_off(60, 1.0); }
+                        }
+                    } else {
+                        if frame == 0 { p.note_on(60, 2.0); }
+                        if frame == (0.18 * fs).round() as usize { p.note_off(60, 1.0); }
+                    }
+                    let n = &p.notes[ni];
+                    assert!([n.ky, n.kv, n.k_slow, n.hy, n.hv, n.h_slow].iter().all(|x| x.is_finite()));
+                    let moving_key = n.key_phase == 1 || n.key_phase == 3;
+                    let place = if n.key_down { p.action.check_distance } else { p.action.rest_distance };
+                    let z = [if moving_key { n.ky - p.action.key_travel } else { 0.0 },
+                        if moving_key { -n.ky } else { 0.0 }, if n.returning { n.hy - place } else { 0.0 }];
+                    let f = [felt(z[0], n.kv, p.action.felt_k, p.action.felt_p, p.action.felt_c, RAIL_REFERENCE),
+                        felt(z[1], -n.kv, p.action.felt_k, p.action.felt_p, p.action.felt_c, RAIL_REFERENCE),
+                        felt(z[2], n.hv, p.action.stop_k, p.action.stop_p, p.action.stop_c, STOP_REFERENCE)];
+                    if let Some(writer) = &mut diagnostic {
+                        let key = if moving_key { (f[0] + f[1] - n.k_slow) * (1.0 - p.k / 0.02) } else { 0.0 };
+                        let hammer = if n.returning { (f[2] - n.h_slow) * (1.0 - p.k / 0.02) } else { 0.0 };
+                        let case_force = if n.thump > 0.0 { p.action.case_share * (key + hammer) } else { 0.0 };
+                        writeln!(writer, "{},{},{},{},{}", frame as f64 / fs, f[0], f[1], f[2], case_force).unwrap();
+                    }
+                    for i in 0..3 {
+                        assert!(f[i].is_finite());
+                        compression[i] = compression[i].max(z[i]);
+                        force_peak[i] = force_peak[i].max(f[i]);
+                        let contact = z[i] > 0.0;
+                        if contact && !previous[i] { contacts[i] += 1; }
+                        previous[i] = contact;
+                    }
+                    let (l, r) = p.step();
+                    assert!(l.is_finite() && r.is_finite());
+                    peak = peak.max(l.abs()).max(r.abs());
+                    if frame % 256 == 0 { assert!(p.energy().is_finite()); }
+                }
+                println!("coupled fs={fs}, rapid={rapid}: raw pressure peak={peak:.6} Pa, compression={compression:?} m, contact force peaks={force_peak:?} N, entries(lower,upper,hammer)={contacts:?}");
+                assert!(peak < 100.0); // Pressure before output_gain; no output limiter.
+                assert!(compression.iter().all(|&z| z < 0.003));
+                assert!(force_peak.iter().all(|&f| f < 200.0));
+                assert!(contacts.iter().all(|&n| n < 32), "unbounded recontacts");
+            }
+        }
+    }
+
+    #[test]
     fn string_kernel_leaves_prescribed_endpoints_and_ghosts_alone() {
         for n in [2, 3, 8, 200] {
             let u: Vec<f64> = (0..n + 3).map(|i| (i as f64).sin()).collect();
@@ -2311,6 +2446,215 @@ mod tests {
                 assert_eq!(next[i], 123.0, "N={n}, prescribed/ghost index {i}");
             }
         }
+    }
+
+    fn key_return_test_piano(first: i32, last: i32, fs: f64) -> Piano {
+        let d = make_grand(&GrandOptions { first_key: first, last_key: last, key_thump: 0.0,
+            mechanism_noise: 0.0, room_enabled: false, ..GrandOptions::default() });
+        Piano::new(&d, &PianoOptions { sample_rate: fs, board_grid_scale: 1.5, ..PianoOptions::default() }).unwrap()
+    }
+
+    #[test]
+    fn key_return_engagement_follows_geometry_and_release_velocity() {
+        for midi in [21, 36, 60, 84, 89] {
+            let mut delays = Vec::new();
+            for release in [0.25, 1.0, 4.0] {
+                let mut p = key_return_test_piano(midi - 20, midi - 20, 48000.0);
+                p.note_on(midi, 2.0);
+                for _ in 0..1440 { let (l, r) = p.step(); assert!(l.is_finite() && r.is_finite()); }
+                let initial = p.notes[0].ky;
+                p.note_off(midi, release);
+                assert_eq!(p.notes[0].ky.to_bits(), initial.to_bits(), "Off must not teleport the key");
+                let first = p.notes[0].first;
+                assert!(p.strings()[first].has_damper);
+                assert_eq!(p.strings()[first].damp_target, 0.0);
+                let mut contact = None;
+                for frame in 0..7200 {
+                    let (l, r) = p.step(); assert!(l.is_finite() && r.is_finite());
+                    assert_eq!(p.strings()[first].damp_land, release, "geometry refresh must preserve contact-rate proxy");
+                    if p.strings()[first].damp_target > 0.0 {
+                        assert!(p.notes[0].ky <= p.action.key_at_damper);
+                        contact = Some((frame + 1) as f64 * p.k);
+                        break;
+                    }
+                    assert!(p.notes[0].ky > p.action.key_at_damper);
+                }
+                let delay = contact.expect("regulated contact must be reached during real key return");
+                assert!(delay > 0.0 && delay < 0.15);
+                delays.push(delay);
+                println!("keyreturn midi={midi} release={release} Offkey={initial:.9}m engagement={:.3}ms (grounded post-contact law unchanged)", delay * 1000.0);
+            }
+            assert!(delays[0] > delays[1] && delays[1] > delays[2]);
+        }
+    }
+
+    #[test]
+    fn key_return_support_ownership_and_sostenuto_edges_compose() {
+        let mut p = key_return_test_piano(40, 42, 48000.0);
+        p.note_on(60, 2.0);
+        p.set_sostenuto(true);
+        p.note_off(60, 1.0);
+        p.set_sostenuto(true); // no recapture of the now-released key mask
+        p.note_on(62, 2.0);
+        p.set_sostenuto(true); // a newly pressed key is NOT captured on repeated true
+        assert!(p.notes[0].sost && !p.notes[2].sost);
+        for _ in 0..7200 { p.step(); }
+        assert_eq!(p.strings()[p.notes[0].first].damp_target, 0.0);
+        p.set_pedal(1.0);
+        p.set_sostenuto(false); // sustain still owns support
+        assert_eq!(p.strings()[p.notes[0].first].damp_target, 0.0);
+        p.set_pedal(0.0);
+        assert_eq!(p.strings()[p.notes[0].first].damp_target, p.sh.damp_max);
+        assert_eq!(p.strings()[p.notes[2].first].damp_target, 0.0); // key still down
+        p.note_off(62, 1.0);
+        p.set_pedal(1.0); p.set_pedal(0.0); // cannot defeat the returning key lifter
+        assert_eq!(p.strings()[p.notes[2].first].damp_target, 0.0);
+        p.set_pedal(0.41);
+        for _ in 0..7200 { let (l, r) = p.step(); assert!(l.is_finite() && r.is_finite()); }
+        assert_eq!(p.strings()[p.notes[2].first].damp_target, p.sh.damp_max * p.pedal_damping);
+        assert!(p.pedal_damping > 0.0 && p.pedal_damping < 1.0);
+    }
+
+    #[test]
+    fn key_return_same_block_tap_keeps_flight_and_retrigger_clears_contact() {
+        let mut p = key_return_test_piano(40, 40, 48000.0);
+        p.note_on(60, 2.0);
+        let flight = (p.notes[0].eta.to_bits(), p.notes[0].veta.to_bits(), p.notes[0].ky.to_bits());
+        p.note_off(60, 1.0);
+        assert!(p.notes[0].hammer_active);
+        assert_eq!(flight, (p.notes[0].eta.to_bits(), p.notes[0].veta.to_bits(), p.notes[0].ky.to_bits()));
+        let mut hit = false;
+        for _ in 0..1440 {
+            let (l, r) = p.step(); assert!(l.is_finite() && r.is_finite());
+            hit |= p.strings().iter().any(|s| s.force > 0.0);
+        }
+        assert!(hit, "Off must not cancel a hammer already in flight");
+        p.note_on(60, 1.0);
+        for s in &p.strings()[p.notes[0].first..p.notes[0].first + p.notes[0].total] {
+            if s.has_damper { assert_eq!((s.damp_target, s.damp_rate), (0.0, 0.0)); }
+        }
+    }
+
+    #[test]
+    fn key_return_undamped_release_remains_exact_with_noise_off() {
+        for fs in [44100.0, 48000.0, 96000.0] {
+            let mut held = key_return_test_piano(70, 70, fs);
+            let mut off = key_return_test_piano(70, 70, fs);
+            held.note_on(90, 2.0); off.note_on(90, 2.0);
+            assert!(!off.strings()[off.notes[0].first].has_damper);
+            for frame in 0..(fs * 0.3) as usize {
+                if frame == (fs * 0.03) as usize { off.note_off(90, 1.0); }
+                let a = held.step(); let b = off.step();
+                assert_eq!((a.0.to_bits(), a.1.to_bits()), (b.0.to_bits(), b.1.to_bits()));
+            }
+        }
+    }
+
+    // Frozen grounded seating recurrence from the 203232a control. This is a
+    // test oracle, not a second production contact law or a modal-decay claim.
+    fn expected_grounded_rate(rate: f64, target: f64, land: f64, k: f64) -> f64 {
+        if rate == target { return rate; }
+        let approach = if target > rate { 0.004 * land } else { 0.006 };
+        let rate = rate + (target - rate) * approach * (48000.0 * k);
+        if (rate - target).abs() < 1e-3 { target } else { rate }
+    }
+
+    #[test]
+    fn combined_quiet_short_off_preserves_geometry_flight_and_grounded_recurrence() {
+        let mut cases = 0;
+        for midi in [21, 60, 89] {
+            for velocity in [1, 8, 16] {
+                for off_ms in [0, 10, 30] {
+                    for release in [0.25, 1.0, 4.0] {
+                        let mut p = key_return_test_piano(midi - 20, midi - 20, 48000.0);
+                        // Small frozen immediate-contact controls only for the three
+                        // ordinary-release/MIDI16/Off30 cases; no second shipping path.
+                        let mut legacy = if velocity == 16 && off_ms == 30 && release == 1.0 {
+                            Some(key_return_test_piano(midi - 20, midi - 20, 48000.0))
+                        } else { None };
+                        let speed = midi_velocity_to_hammer_speed(velocity);
+                        p.note_on(midi, speed);
+                        if let Some(q) = &mut legacy { q.note_on(midi, speed); }
+                        for _ in 0..off_ms * 48 {
+                            let (l, r) = p.step(); assert!(l.is_finite() && r.is_finite());
+                            if let Some(q) = &mut legacy { assert_eq!((l.to_bits(), r.to_bits()), { let x = q.step(); (x.0.to_bits(), x.1.to_bits()) }); }
+                        }
+                        if let Some(q) = &legacy { same_state(&p, q); }
+                        let flight = (p.notes[0].hammer_active, p.notes[0].eta.to_bits(), p.notes[0].veta.to_bits(),
+                            p.notes[0].xi.to_bits(), p.notes[0].vxi.to_bits(), p.notes[0].ky.to_bits());
+                        p.note_off(midi, release);
+                        assert_eq!(flight, (p.notes[0].hammer_active, p.notes[0].eta.to_bits(), p.notes[0].veta.to_bits(),
+                            p.notes[0].xi.to_bits(), p.notes[0].vxi.to_bits(), p.notes[0].ky.to_bits()));
+                        let first = p.notes[0].first;
+                        assert_eq!(p.strings()[first].damp_target, 0.0);
+                        if let Some(q) = &mut legacy {
+                            q.note_off(midi, release);
+                            q.notes[0].ky = q.notes[0].ky.min(q.action.key_at_damper); // frozen legacy Off assumption
+                            q.refresh_damper(0);
+                            assert_eq!(q.strings()[first].damp_target, q.sh.damp_max);
+                        }
+                        let mut onset = None;
+                        for frame in 0..7200 {
+                            let s = &p.strings()[first];
+                            let expected = expected_grounded_rate(s.damp_rate, s.damp_target, s.damp_land, p.k);
+                            let (l, r) = p.step(); assert!(l.is_finite() && r.is_finite());
+                            let s = &p.strings()[first];
+                            assert_eq!(s.damp_rate.to_bits(), expected.to_bits(), "quiet={velocity} Off={off_ms} release={release} midi={midi}");
+                            assert_eq!(s.damp_land, release);
+                            if let Some(q) = &mut legacy {
+                                let s = &q.strings()[first];
+                                let expected = expected_grounded_rate(s.damp_rate, s.damp_target, s.damp_land, q.k);
+                                let (l, r) = q.step(); assert!(l.is_finite() && r.is_finite());
+                                assert_eq!(q.strings()[first].damp_rate.to_bits(), expected.to_bits());
+                            }
+                            if s.damp_target > 0.0 {
+                                assert!(p.notes[0].ky <= p.action.key_at_damper);
+                                if onset.is_none() { onset = Some(frame); }
+                            } else { assert!(p.notes[0].ky > p.action.key_at_damper); }
+                            if onset.is_some_and(|start| frame >= start + 8) { break; }
+                        }
+                        let onset = onset.expect("finite key return must reach contact");
+                        println!("COMBINED midi={midi} velocity={velocity} Off={off_ms}ms release={release}: geometry={:.3}ms afterOff; recurrenceEXACT, flightcontinued(notallcasesrequiredtohit)", (onset + 1) as f64 * p.k * 1000.0);
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 81);
+    }
+
+    #[test]
+    fn combined_quiet_full_compass_helpers_preserve_physical_state() {
+        let mut a = key_return_test_piano(1, 88, 48000.0);
+        let mut b = key_return_test_piano(1, 88, 48000.0);
+        b.set_helper_threads(3, None, None);
+        let edges = [0, 1, 479, 480, 681, 1001, 1202, 2002, 2303, 4096];
+        for pair in edges.windows(2) {
+            for p in [&mut a, &mut b] {
+                match pair[0] {
+                    0 => for (i, midi) in [21, 36, 60, 84, 89, 90, 108].into_iter().enumerate() {
+                        p.note_on(midi, midi_velocity_to_hammer_speed([1, 8, 16][i % 3]));
+                    },
+                    1 => p.note_off(21, 4.0),
+                    479 => p.note_off(60, 0.25),
+                    480 => p.note_off(36, 1.0),
+                    681 => p.set_pedal(0.41),
+                    1001 | 1202 => p.set_sostenuto(true),
+                    2002 => { for midi in [84, 89, 90, 108] { p.note_off(midi, 1.0); } p.set_pedal(0.0); },
+                    2303 => p.set_sostenuto(false),
+                    _ => unreachable!(),
+                }
+            }
+            let frames = pair[1] - pair[0];
+            let (mut al, mut ar, mut bl, mut br) = (vec![0.0f32; frames], vec![0.0f32; frames], vec![0.0f32; frames], vec![0.0f32; frames]);
+            a.process(&mut al, &mut ar); b.process(&mut bl, &mut br);
+            assert!(al.iter().chain(&ar).all(|x| x.is_finite()));
+            assert_eq!(al, bl); assert_eq!(ar, br);
+            // Scheduler activity/counters intentionally differ with0vs3 helpers;
+            // every physical state, control ownership and output must still match.
+            same_physical_state(&a, &b);
+        }
+        b.set_helper_threads(0, None, None);
     }
 
     #[test]
@@ -2344,6 +2688,7 @@ mod tests {
                 }
             }
             assert_eq!(output[0], output[1], "stereo output at block {block}");
+            assert_eq!(engines[0].sostenuto_down, engines[1].sostenuto_down);
             for (a, b) in engines[0].strings().iter().zip(engines[1].strings()) {
                 assert_eq!(a.awake, b.awake);
                 assert_eq!(engines[0].nodes(&engines[0].sh.u, a), engines[1].nodes(&engines[1].sh.u, b));
@@ -2376,4 +2721,391 @@ mod tests {
             }
         }
     }
+    fn observer_test_piano(fs:f64, os:usize) -> Piano {
+        let d=make_grand(&GrandOptions { first_key:40,last_key:42,key_thump:0.0,
+            mechanism_noise:0.0,room_enabled:false,..GrandOptions::default() });
+        Piano::new(&d,&PianoOptions { sample_rate:fs,oversample:os,board_grid_scale:1.5,
+            ..PianoOptions::default() }).unwrap()
+    }
+
+    #[test]
+    fn action_observer_preserves_exact_audio_and_whole_existing_physical_oracle() {
+        for fs in [44100.0,48000.0] {
+            for os in [1,2] {
+                let mut observed=observer_test_piano(fs,os);
+                let mut bypassed=observer_test_piano(fs,os);
+                // Same real physical solver. Only observer writes/reads are bypassed.
+                bypassed.action_observer.enabled=false;
+                paired_render(&mut observed,&mut bypassed,67);
+                assert!(!observed.action_observer.trace.valid);
+                for p in [&mut observed,&mut bypassed] {
+                    p.note_on(60,2.0);
+                    p.note_off(60,1.0); // actual key return while hammer is still in flight
+                }
+                for n in [1,7,64,257,1024] { paired_render(&mut observed,&mut bypassed,n); }
+                for p in [&mut observed,&mut bypassed] {
+                    p.set_soft_pedal(true); p.note_on(62,3.0); p.note_on(60,1.0);
+                    p.set_sustain(true); p.set_sostenuto(true);
+                }
+                for n in [3,127,2048] { paired_render(&mut observed,&mut bypassed,n); }
+                for p in [&mut observed,&mut bypassed] {
+                    p.note_off(60,0.25); p.note_off(62,4.0);
+                    p.set_sustain(false); p.set_sostenuto(false);
+                }
+                paired_render(&mut observed,&mut bypassed,4096);
+                let mut snap=observed.new_snapshot();
+                observed.fill_snapshot(&mut snap,-1);
+                assert!(snap.action.valid);
+                assert_eq!(snap.focus_midi,-1);
+                assert_eq!(snap.action.current_stroke().unwrap().midi,60); // independent from legacy waveform-focus lookup
+                same_state(&observed,&bypassed); // unchanged physical oracle, excludes observer
+                assert!(observed.pristine==bypassed.pristine);
+            }
+        }
+    }
+
+    #[test]
+    fn action_observer_aggregate_contacts_and_return_basis_use_real_solver_steps() {
+        for soft in [false,true] {
+            let mut p=observer_test_piano(48000.0,1);
+            p.set_soft_pedal(soft);
+            p.note_on(60,2.0);
+            let initial=*p.action_observer.trace.poses().last().unwrap();
+            let n=&p.notes[p.note_of_midi[60].unwrap()];
+            assert_eq!(initial.pose.eta_m.to_bits(),n.eta.to_bits());
+            assert_eq!(initial.pose.eta_velocity_mps.to_bits(),(n.veta/p.k).to_bits());
+            assert_eq!(initial.pose.xi_velocity_mps.to_bits(),(n.vxi/p.k).to_bits());
+            p.note_off(60,1.0);
+            assert!(p.notes[p.note_of_midi[60].unwrap()].hammer_active);
+            let mut was_positive=false;
+            let mut expected_contacts=0;
+            let mut expected_peak=0.0f64;
+            let mut saw_return=false;
+            let mut saw_active_key_return=false;
+            for _ in 0..14400 {
+                let solve_step=p.step_count;
+                p.step();
+                let ni=p.note_of_midi[60].unwrap();
+                let n=&p.notes[ni];
+                let mut force=[0.0;3];
+                for i in 0..n.count { force[i]=p.strings()[n.first+i].force; }
+                let total=force.iter().sum::<f64>();
+                if total>0.0 {
+                    if !was_positive {expected_contacts+=1; expected_peak=0.0;}
+                    expected_peak=expected_peak.max(total);
+                    let c=p.action_observer.trace.contacts().last().unwrap();
+                    assert!(c.open);
+                    assert_eq!(c.last_positive_solve_step,solve_step);
+                    assert_eq!(c.peak_total_force_n.to_bits(),expected_peak.to_bits());
+                    assert_eq!(c.peak_pose.pose_step,c.peak_solve_step+1);
+                    assert_eq!(c.peak_pose.force_solve_step,c.peak_solve_step);
+                    assert!(c.peak_pose.flags&FORCE_OBSERVED!=0);
+                    if soft { assert_eq!(c.peak_pose.force_n[0],0.0); }
+                } else if was_positive {
+                    let c=p.action_observer.trace.contacts().last().unwrap();
+                    assert!(!c.open && c.exit_force_observed);
+                    assert_eq!(c.exit_solve_step,solve_step);
+                    assert_eq!(c.exit_pose.pose_step,solve_step+1);
+                }
+                was_positive=total>0.0;
+                saw_active_key_return|=p.action_observer.trace.poses().any(|r|
+                    r.pose.phase==ActionPhase::Flight && r.pose.key_phase==3);
+                assert_eq!(p.action_observer.trace.contact_sequence,expected_contacts);
+                let origin=p.action_observer.trace.current_stroke().unwrap().return_origin;
+                if origin.reference_observed && !saw_return {
+                    saw_return=true;
+                    assert_eq!(origin.hy_seed_m.to_bits(),(-origin.zeta_at_transition_m).to_bits());
+                    assert_eq!(origin.hy_before_action_m.to_bits(),origin.hy_seed_m.to_bits());
+                    assert_eq!(origin.origin_m.to_bits(),(origin.eta_at_transition_m+origin.hy_seed_m).to_bits());
+                    // zeta_end = eta_next - along_next. Compare, never repair or hide a discrepancy.
+                    let scale=origin.eta_at_transition_m.abs()+origin.hy_seed_m.abs()
+                        +origin.zeta_at_transition_m.abs()+origin.along0_after_advance_m.abs();
+                    assert!((origin.origin_m-origin.along0_after_advance_m).abs()
+                        <=256.0*f64::EPSILON*scale.max(f64::MIN_POSITIVE),
+                        "return reference disagrees with real post-advance along0: {origin:?}");
+                    assert_eq!(origin.transition_pose_step,p.step_count);
+                    assert!(!n.hammer_active);
+                    assert!(n.returning || (!n.checked && n.hy>=p.action.rest_distance));
+                }
+            }
+            assert!(expected_contacts>0 && saw_return,"actual tap must reach contact and return");
+            assert!(saw_active_key_return,"key return must not override observed live flight");
+            let mut snap=p.new_snapshot(); p.fill_snapshot(&mut snap,60);
+            assert!(snap.hammer_force.iter().all(|f|*f==0.0));
+            assert!(snap.action.contacts().any(|c|c.peak_total_force_n>0.0));
+            assert!(snap.action.poses().any(|r|r.pose.phase==ActionPhase::Returning || r.pose.phase==ActionPhase::Rest));
+        }
+    }
+
+    #[test]
+    fn action_observer_retrigger_focus_overwrite_and_checked_release_are_observations() {
+        let mut p=observer_test_piano(48000.0,1);
+        let mut snap=p.new_snapshot(); p.fill_snapshot(&mut snap,60);
+        assert!(!snap.action.valid && snap.action.poses().next().is_none());
+        p.note_on(60,0.0);
+        assert!(!p.action_observer.trace.valid,"zero-speed key is not an invented strike");
+        p.note_on(60,2.0);
+        let first=p.action_observer.trace.stroke_sequence;
+        let mut checked=false;
+        for _ in 0..48000 {
+            p.step();
+            if p.notes[p.note_of_midi[60].unwrap()].checked {checked=true;break;}
+        }
+        assert!(checked,"real held hammer must reach the backcheck");
+        let origin=p.action_observer.trace.current_stroke().unwrap().return_origin.origin_m;
+        let checked_hy=p.notes[p.note_of_midi[60].unwrap()].hy;
+        p.note_off(60,1.0);
+        let n=&p.notes[p.note_of_midi[60].unwrap()];
+        assert!(n.returning && !n.checked);
+        assert_eq!(n.hy.to_bits(),checked_hy.to_bits());
+        assert_eq!(p.action_observer.trace.current_stroke().unwrap().return_origin.origin_m.to_bits(),origin.to_bits());
+        for _ in 0..7000 {p.step();}
+        assert!(p.action_observer.trace.pose_overwrites>0);
+        assert!(p.action_observer.trace.poses().map(|r|r.pose.pose_step).collect::<Vec<_>>().windows(2)
+            .all(|w|w[0]<w[1]));
+        p.note_on(62,3.0);
+        let t=&p.action_observer.trace;
+        assert_eq!(t.stroke_sequence,first+1);
+        assert_eq!(t.current_stroke().unwrap().midi,62);
+        assert_eq!(t.poses().filter(|r|r.stroke_sequence==t.stroke_sequence).count(),1);
+        assert_eq!(t.contacts().filter(|r|r.stroke_sequence==t.stroke_sequence).count(),0);
+        assert!(!t.current_stroke().unwrap().return_origin.valid);
+        assert!(t.poses().any(|r|r.stroke_sequence==first),"old measured history is retained");
+        assert_eq!(t.poses().last().unwrap().pose.phase,ActionPhase::Flight);
+        let mut new=p.new_snapshot();
+        p.fill_snapshot(&mut new,-1);
+        assert_eq!(new.action.stroke_sequence,t.stroke_sequence);
+        assert_eq!(new.action.current_stroke().unwrap().midi,62);
+        let replacement=observer_test_piano(48000.0,1);
+        assert!(!replacement.new_snapshot().action.valid,"new generation starts invalid");
+    }
+
+    #[test]
+    fn action_observer_matches_completed_pose_including_real_housekeeping_sleep() {
+        let mut p=observer_test_piano(48000.0,1);
+        // Test-only read frequency, NOT a physical scheduler/sleep mutation.
+        p.action_observer.trace.sample_stride_steps=1;
+        p.note_on(60,1.0); p.note_off(60,1.0);
+        let ni=p.note_of_midi[60].unwrap();
+        let mut saw_sleep=false;
+        let mut saw_nonzero_sleep=false;
+        for _ in 0..96000 {
+            let n=&p.notes[ni];
+            let mut awake=[false;6];
+            let mut before_along=[0.0;3];
+            for i in 0..n.total {awake[i]=p.strings()[n.first+i].awake;}
+            for i in 0..n.count {before_along[i]=p.along(n,i,&p.sh.u);}
+            p.step();
+            let n=&p.notes[ni];
+            let pose=p.action_observer.trace.poses().last().unwrap().pose;
+            assert_eq!(pose.pose_step,p.step_count);
+            assert_eq!(p.action_observer.trace.latest_step,p.step_count);
+            for i in 0..n.count {
+                assert_eq!(pose.string_along_m[i].to_bits(),p.along(n,i,&p.sh.u).to_bits(),
+                    "must observe AFTER all completed-step work, including sleep");
+            }
+            assert_eq!(pose.eta_m.to_bits(),n.eta.to_bits());
+            assert_eq!(pose.hy_m.to_bits(),n.hy.to_bits());
+            assert_eq!(pose.ky_m.to_bits(),n.ky.to_bits());
+            assert_eq!(pose.kv_mps.to_bits(),n.kv.to_bits());
+            assert_eq!(pose.key_down(),n.key_down);
+            assert_eq!(pose.shank_observed(),n.hammer_active && n.s_mass>0.0);
+            if pose.force_observed() {assert_eq!(pose.force_solve_step+1,pose.pose_step);}
+            for i in 0..n.total {
+                if awake[i] && !p.strings()[n.first+i].awake {
+                    saw_sleep=true;
+                    assert_eq!(p.step_count&63,0,"actual housekeeping boundary");
+                    let contact=i%n.count;
+                    saw_nonzero_sleep|=before_along[contact]!=0.0
+                        && pose.string_along_m[contact].to_bits()!=before_along[contact].to_bits();
+                }
+            }
+            if saw_sleep && saw_nonzero_sleep {break;}
+        }
+        assert!(saw_sleep && saw_nonzero_sleep,"real stroke must exercise a nonzero-to-sleep endpoint");
+    }
+
+    #[test]
+    fn action_observer_canonical_note_and_requested_let_off_do_not_mislabel_state() {
+        let mut d=make_grand(&GrandOptions {first_key:40,last_key:40,..GrandOptions::default()});
+        d.action.let_off=0.0; // real design input; solver's existing 1e-5 floor is unchanged
+        let mut p=Piano::new(&d,&PianoOptions {board_grid_scale:1.5,..PianoOptions::default()}).unwrap();
+        p.note_on(60+128,2.0);
+        let ni=p.note_of_midi[60].unwrap();
+        let n=&p.notes[ni];
+        let trace=&p.action_observer.trace;
+        assert_eq!(trace.current_stroke().unwrap().midi,n.midi as i16);
+        assert_eq!(trace.current_stroke().unwrap().midi,60);
+        assert_eq!(trace.current_stroke().unwrap().let_off_requested_m,0.0);
+        assert_eq!(trace.current_stroke().unwrap().let_off_effective_m(),1e-5);
+        let mut top=-1e30f64;
+        for i in 0..n.count {top=top.max(p.along(n,i,&p.sh.u));}
+        assert_eq!(n.eta.to_bits(),(top-trace.current_stroke().unwrap().let_off_effective_m()).to_bits());
+        assert_eq!(trace.poses().next().unwrap().pose.eta_m.to_bits(),n.eta.to_bits());
+        p.note_off(60+128,1.0);
+        assert!(!p.notes[ni].key_down);
+    }
+
+    #[test]
+    fn action_observer_full_88_default_physics_helpers_preserve_bits() {
+        let d=make_grand(&GrandOptions::default());
+        assert_eq!(d.notes.len(),88);
+        for helpers in [0,3] {
+            let mut a=Piano::new(&d,&PianoOptions::default()).unwrap();
+            let mut b=Piano::new(&d,&PianoOptions::default()).unwrap();
+            b.action_observer.enabled=false;
+            for p in [&mut a,&mut b] {p.set_helper_threads(helpers,None,None);}
+            paired_render(&mut a,&mut b,32);
+            for p in [&mut a,&mut b] {p.note_on(60,2.0);p.note_off(60,1.0);}
+            for frames in [64,256] {paired_render(&mut a,&mut b,frames);}
+            for p in [&mut a,&mut b] {p.note_on(36,2.0);p.note_on(84,3.0);}
+            paired_render(&mut a,&mut b,512);
+            for p in [&mut a,&mut b] {p.note_off(36,1.0);p.note_off(84,1.0);}
+            paired_render(&mut a,&mut b,2048);
+            assert!(a.pristine==b.pristine);
+        }
+    }
+
+    #[test]
+    fn action_retention_closes_observation_with_real_pre_mutation_endpoint() {
+        let mut p=observer_test_piano(48000.0,1);
+        p.note_on(60,2.0);
+        let old=p.action_observer.trace.stroke_sequence;
+        let mut hit=false;
+        for _ in 0..512 {
+            p.step();
+            if p.action_observer.trace.contacts().any(|c|c.stroke_sequence==old && c.open) {hit=true;break;}
+        }
+        assert!(hit,"real old focus must enter solved contact");
+        let step=p.step_count;
+        let endpoint=p.observed_action_pose(step);
+        let last_positive=p.action_observer.trace.contacts().last().unwrap().last_positive_solve_step;
+        p.note_on(62,3.0);
+        let t=&p.action_observer.trace;
+        let meta=t.stroke(old).unwrap();
+        assert!(!meta.observing);
+        assert_eq!(meta.observation_end_step,step);
+        assert_eq!(meta.last_observed_pose_step,step);
+        let ended=t.poses().filter(|r|r.stroke_sequence==old).last().unwrap();
+        assert_eq!(ended.pose,endpoint,"must record OLD actual pose before any note mutation");
+        let seed=t.poses().last().unwrap();
+        assert_ne!(seed.stroke_sequence,old);
+        assert_eq!(seed.pose.pose_step,ended.pose.pose_step);
+        assert!(seed.sequence>ended.sequence,"same-step ordering is explicit and deterministic");
+        assert_eq!(t.current_stroke().unwrap().midi,62);
+        let contact=t.contacts().find(|c|c.stroke_sequence==old).unwrap();
+        assert!(!contact.open && contact.observation_ended && !contact.exit_force_observed);
+        assert_eq!(contact.observed_exit_solve_step(),None);
+        assert_eq!(contact.termination_pose_step(),Some(step));
+        assert_eq!(contact.exit_pose,endpoint);
+        for _ in 0..512 {p.step();}
+        let t=&p.action_observer.trace;
+        assert_eq!(t.contacts().find(|c|c.stroke_sequence==old).unwrap().last_positive_solve_step,last_positive,
+            "unfocused future contact is not observed or invented");
+        assert_eq!(t.stroke(old).unwrap().observation_end_step,step);
+    }
+
+    #[test]
+    fn action_retention_bounds_history_and_metadata_without_claiming_polyphony() {
+        let mut p=observer_test_piano(48000.0,1);
+        for launch in 0..8 {
+            p.note_on(60,2.0);p.note_off(60,1.0);
+            for _ in 0..960 {p.step();}
+            if launch==1 {
+                let t=&p.action_observer.trace;
+                assert!(t.poses().any(|r|r.stroke_sequence==1));
+                assert!(t.contacts().any(|c|c.stroke_sequence==1 && c.peak_total_force_n>0.0),
+                    "recorded contact survives a later launch before publication");
+                assert_eq!(t.stroke(1).unwrap().midi,60);
+                assert!(!t.stroke(1).unwrap().observing);
+            }
+        }
+        let t=&p.action_observer.trace;
+        assert_eq!(t.strokes().count(),8);
+        assert!(t.pose_overwrites>0);
+        let cursor=t.latest_step-(0.060/t.internal_dt_s).round() as u64;
+        assert!(t.strokes().any(|meta| {
+            let rows=t.poses().filter(|r|r.stroke_sequence==meta.stroke_sequence).collect::<Vec<_>>();
+            rows.windows(2).any(|w|w[0].pose.pose_step<=cursor && cursor<=w[1].pose.pose_step
+                && w[0].pose.pose_step<w[1].pose.pose_step && w[0].pose.phase==w[1].pose.phase)
+        }),"global delayed cursor has an ACTUAL same-stroke bracket after dense launches");
+        for _ in 0..17 {p.note_on(60,2.0);} // real simultaneous launches, not seeded counters
+        let t=&p.action_observer.trace;
+        assert_eq!(t.strokes().count(),16);
+        assert_eq!(t.metadata_overwrites,9);
+        assert!(t.stroke(1).is_none());
+        assert!(t.unresolved_pose_count()>0 && t.unresolved_contact_count()>0,
+            "missing metadata is explicit, never reused from a recycled slot");
+        assert!(t.poses().map(|r|r.sequence).collect::<Vec<_>>().windows(2).all(|w|w[0]<w[1]));
+        // Real same-step chord. Earlier voices continue physically but only latest is observed.
+        let mut ids=[0u64;3];
+        for (i,midi) in [60,61,62].into_iter().enumerate() {
+            p.note_on(midi,2.0);ids[i]=p.action_observer.trace.stroke_sequence;
+        }
+        let mut physical_contacts=[false;3];
+        for _ in 0..512 {
+            p.step();
+            for (i,midi) in [60,61,62].into_iter().enumerate() {
+                let n=&p.notes[p.note_of_midi[midi as usize].unwrap()];
+                physical_contacts[i]|=(0..n.count).any(|j|p.strings()[n.first+j].force>0.0);
+            }
+        }
+        assert!(physical_contacts.into_iter().all(|contact|contact),"real physical chord contacts");
+        let t=&p.action_observer.trace;
+        assert!(t.contacts().any(|c|c.stroke_sequence==ids[2] && c.peak_total_force_n>0.0));
+        for id in &ids[..2] {
+            assert!(!t.stroke(*id).unwrap().observing);
+            assert!(!t.contacts().any(|c|c.stroke_sequence==*id),
+                "same-step let-off seeds are NOT evidence of unobserved polyphonic contact");
+        }
+    }
+
+    #[test]
+    fn action_retention_real_contact_ring_overflow_has_exact_counts_and_ownership() {
+        let mut p=observer_test_piano(48000.0,1);
+        let mut expected=Vec::<(u64,u64)>::new();
+        for launch in 0..20 {
+            p.note_on(60,2.0);p.note_off(60,1.0);
+            let id=p.action_observer.trace.stroke_sequence;
+            assert_eq!(id,launch+1);
+            let before=expected.len();
+            let mut positive=false;
+            for _ in 0..960 {
+                let solve_step=p.step_count;
+                p.step();
+                let n=&p.notes[p.note_of_midi[60].unwrap()];
+                let total=(0..n.count).map(|i|p.strings()[n.first+i].force).sum::<f64>();
+                if total>0.0 && !positive {expected.push((id,solve_step));}
+                positive=total>0.0;
+                assert_eq!(p.action_observer.trace.contact_sequence,expected.len() as u64,
+                    "aggregate episodes counted from REAL solved force transitions");
+            }
+            assert!(expected.len()>before,"each real20ms stroke must actually contact");
+        }
+        let t=&p.action_observer.trace;
+        assert!(expected.len()>16,"exercise actual contact overwrite, not only pose/metadata overwrite");
+        assert_eq!(t.contacts().count(),16);
+        assert_eq!(t.contact_overwrites,expected.len() as u64-16);
+        assert_eq!(t.contact_sequence,expected.len() as u64);
+        let retained:Vec<_>=t.contacts().collect();
+        let first=expected.len()-16;
+        for (i,contact) in retained.iter().enumerate() {
+            let (id,solve_step)=expected[first+i];
+            assert_eq!(contact.sequence,(first+i+1) as u64);
+            assert_eq!(contact.stroke_sequence,id);
+            assert_eq!(contact.entry_solve_step,solve_step);
+            assert_eq!(contact.entry_pose.pose_step,solve_step+1);
+            assert!(contact.entry_pose.force_observed());
+            assert!(contact.entry_pose.force_n.iter().any(|f|*f>0.0));
+            let metadata=t.stroke(id).expect("retained16 episodes have retained actual stroke metadata");
+            assert_eq!(metadata.midi,60);
+            assert!(contact.peak_pose.pose_step>=metadata.onset_step);
+            assert!(!contact.open);
+            assert_ne!(contact.exit_force_observed,contact.observation_ended,
+                "measured force exit and stopped force observation are not the same event");
+        }
+        assert!(t.current_stroke().unwrap().observing,"pose observation may continue after contact exit");
+        assert!(retained.iter().any(|c|c.stroke_sequence==t.stroke_sequence && c.exit_force_observed));
+    }
+
 }

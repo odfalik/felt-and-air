@@ -189,8 +189,9 @@ pub struct ActionDesign {
     pub ratio: f64,
     /// Force returning the key, N.
     pub up_weight: f64,
-    /// Felts: a stiffening spring K z^p plus a drag C dz/dt. The drag is what makes them
-    /// swallow a blow instead of bouncing it back. Key rail felts:
+    /// Action felts: stiffening spring K z^p plus compression-engaged drag C(z) dz/dt.
+    /// C retains N s/m units at the assumed reference compression in action_contact.rs;
+    /// damping vanishes at first touch instead of jumping to C*velocity. Key rail felts:
     pub felt_k: f64,
     pub felt_p: f64,
     pub felt_c: f64,
@@ -290,11 +291,13 @@ pub struct GrandOptions {
     pub hammer_mass: f64,
     pub felt_damping: f64,
     pub strike_position: f64,
+    /// Scales keybed/return-rail and hammer backcheck/rest knocks into the case.
     pub key_thump: f64,
     pub shank_hz: f64,
     pub let_off_mm: f64,
     pub damper_strength: f64,
     pub damper_press_n: f64,
+    /// Sustain-pedal endpoint knocks and moving friction, not returning-key sounds.
     pub mechanism_noise: f64,
 
     // Soundboard.
@@ -396,10 +399,26 @@ pub fn key_to_midi(key: i32) -> i32 {
     key + 20
 }
 
-/// MIDI velocity (1..127) to hammer speed at let-off, m/s.
+/// Positive MIDI NoteOn velocity to physical hammer launch speed, m/s.
+/// MIDI velocity zero is NoteOff and must be decoded before calling this mapping.
 pub fn midi_velocity_to_hammer_speed(velocity: i32) -> f64 {
-    let v = velocity.clamp(1, 127) as f64 / 127.0;
+    let midi = velocity.clamp(1, 127);
+    if midi < 16 { return quiet_touch_launch(midi as f64); }
+    // Preserve the original mapping and floating-point operation order for MIDI16..127.
+    let v = midi as f64 / 127.0;
     0.25 + 5.5 * v.powf(1.7)
+}
+
+/// EXPERIMENT: access the grazing-launch regime, not a post-synthesis gain curve.
+/// A cubic joins 0.200m/s with zero slope at MIDI1 to the old value AND slope at16.
+/// The lower launch is a hypothesis, not a universal contact/audibility threshold.
+fn quiet_touch_launch(velocity: f64) -> f64 {
+    let upper = 0.25 + 5.5 * (16.0_f64 / 127.0).powf(1.7);
+    let upper_slope = 5.5 * 1.7 / 127.0 * (16.0_f64 / 127.0).powf(0.7);
+    let delta = upper - 0.200;
+    let u = (velocity - 1.0) / 15.0;
+    0.200 + u * u * (3.0 * delta - 15.0 * upper_slope
+        + u * (15.0 * upper_slope - 2.0 * delta))
 }
 
 fn lerp(a: f64, b: f64, t: f64) -> f64 {
@@ -412,6 +431,35 @@ fn anchors(key: i32, c2: f64, c4: f64, c7: f64) -> f64 {
         lerp(c2, c4, (key - 16) as f64 / 24.0)
     } else {
         lerp(c4, c7, (key - 40) as f64 / 36.0)
+    }
+}
+
+/// Synthetic stable tuning texture, not measurements of a tuned instrument.
+/// Cents sum to zero so detuning does not move the geometric tuning center.
+fn unison_cents(key: i32, count: usize, center_hz: f64, amount: f64) -> [f64; 3] {
+    if count == 1 || amount == 0.0 { return [0.0; 3]; }
+    let texture = |salt: u32| {
+        let mut x = key as u32 ^ salt;
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846ca68b);
+        x ^= x >> 16;
+        2.0 * x as f64 / u32::MAX as f64 - 1.0
+    };
+    let width = 1.0 + 0.15 * texture(0xa511e9b3);
+    let skew = 0.12 * texture(0x63d83595);
+    // Fixed 440 Hz reference, NOT the user's potentially retuned A4 frequency.
+    let register = (440.0 / center_hz).powf(0.25).min(1.0);
+    let a = amount * width * register;
+    match count {
+        2 => [-0.5 * a, 0.5 * a, 0.0],
+        3 => {
+            let low = a * (-1.0 + skew);
+            let middle = a * (-2.0 * skew);
+            [low, middle, -(low + middle)]
+        }
+        _ => unreachable!("grand scale uses one, two or three strings"),
     }
 }
 
@@ -541,12 +589,11 @@ pub fn make_grand(o: &GrandOptions) -> PianoDesign {
         let bp = bridge_point(key);
         let mut strings = Vec::new();
         let mut duplex = Vec::new();
+        let cents = unison_cents(key, count, f0, o.unison_detune_cents);
         for i in 0..count {
             let mut si = s.clone();
             let offset = if count == 1 { 0.0 } else { i as f64 - (count - 1) as f64 / 2.0 };
-            // Uneven spread, so that no two strings of a unison are mirror images.
-            let cents = o.unison_detune_cents * (offset + 0.15 * offset * offset);
-            si.f0 = f0 * 2.0f64.powf(cents / 1200.0);
+            si.f0 = f0 * 2.0f64.powf(cents[i] / 1200.0);
             si.bridge = Vec2 { x: bp.x + 0.006 * offset, y: bp.y };
             if o.duplex && key >= 52 {
                 // The same wire at the same tension, a third (or, in the top octaves, half) as
@@ -617,5 +664,48 @@ pub fn make_grand(o: &GrandOptions) -> PianoDesign {
         lid,
         air_rho: 1.2,
         air_c: 343.0,
+    }
+}
+
+
+#[cfg(test)]
+mod quiet_touch_tests {
+    use super::*;
+    fn legacy(velocity: f64) -> f64 { 0.25 + 5.5 * (velocity / 127.0).powf(1.7) }
+
+    #[test]
+    fn quiet_touch_preserves_every_upper_velocity_bit_and_stays_monotone() {
+        for velocity in 16..=127 {
+            assert_eq!(midi_velocity_to_hammer_speed(velocity).to_bits(), legacy(velocity as f64).to_bits());
+        }
+        assert_eq!(midi_velocity_to_hammer_speed(1).to_bits(), 0.200_f64.to_bits());
+        assert_eq!(midi_velocity_to_hammer_speed(127).to_bits(), 5.75_f64.to_bits());
+        for velocity in 1..127 {
+            let a = midi_velocity_to_hammer_speed(velocity);
+            let b = midi_velocity_to_hammer_speed(velocity + 1);
+            assert!(a.is_finite() && a > 0.0 && b > a);
+        }
+    }
+
+    #[test]
+    fn quiet_touch_cubic_joins_old_value_and_slope_at_sixteen() {
+        assert!((quiet_touch_launch(16.0) - legacy(16.0)).abs() < 1e-14);
+        let epsilon = 1e-3;
+        let quiet_slope = (quiet_touch_launch(16.0 + epsilon) - quiet_touch_launch(16.0 - epsilon)) / (2.0 * epsilon);
+        let old_slope = (legacy(16.0 + epsilon) - legacy(16.0 - epsilon)) / (2.0 * epsilon);
+        assert!((quiet_slope - old_slope).abs() < 1e-9);
+        let low_slope = (quiet_touch_launch(1.0 + epsilon) - quiet_touch_launch(1.0 - epsilon)) / (2.0 * epsilon);
+        assert!(low_slope.abs() < 1e-9);
+    }
+
+    #[test]
+    fn midi_velocity_zero_is_decoded_as_noteoff_not_a_quiet_launch() {
+        let bytes = b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60MTrk\x00\x00\x00\x0c\x00\x90\x3c\x01\x01\x90\x3c\x00\x00\xff\x2f\x00";
+        let events = crate::midi::parse_midi(bytes);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, crate::midi::MidiKind::NoteOn);
+        assert_eq!(events[0].b, 1);
+        assert_eq!(events[1].kind, crate::midi::MidiKind::NoteOff);
+        assert_eq!(events[1].b, 0);
     }
 }

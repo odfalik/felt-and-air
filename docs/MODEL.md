@@ -21,8 +21,8 @@ part consistently.
 | Tuning | A4 = 440 Hz, octaves tuned outward by matching partials (4:2, 2:1 in the high treble, 6:3 in the bass). Gives -14 cents at A0 and +34 cents at C8 |
 | String loss | Constant plus frequency-squared decay rate. The constant is 0.12 /s, not the 0.5 /s of Chaigne and Askenfelt (1994), which was fitted with a rigid bridge and so contained the soundboard's share |
 | Hammer | Head on a flexible shank (two masses and a spring), nonlinear felt `F = K z^p` with Hunt-Crossley damping, one hammer striking all strings of its note |
-| Action after let-off | The hammer is released 2 mm under the string and flies there under gravity (7.6 ms at pianissimo, 1.0 ms at mezzo forte, 0.4 ms at fortissimo), comes back and is caught on the backcheck felt, then falls to rest when the key is released. The key lands on its rail felts going down and coming up. Felts are stiffening springs with drag; a share of their changing force reaches the board |
-| Pedals | Sustain is continuous. Soft (una corda) makes each hammer miss one string of three, on softer felt. Sostenuto holds up the dampers of the keys down when it is pressed. The pedal work knocks at each end of its travel and rustles faintly while moving |
+| Action after let-off | The hammer is released 2 mm under the string and flies there under gravity (7.6 ms at pianissimo, 1.0 ms at mezzo forte, 0.4 ms at fortissimo), comes back and is caught on the backcheck felt, then falls to rest when the key is released. The key lands on its rail felts going down and coming up. Felts are stiffening springs with drag; a share of their changing force reaches the board. The **Action knocks** control scales keybed landing, key return rail and hammer backcheck/rest knocks together |
+| Pedals | Sustain is continuous. Soft (una corda) makes each hammer miss one string of three, on softer felt. Sostenuto holds up the dampers of the keys down when it is pressed. The sustain pedal work knocks at each end of its travel and rustles faintly while moving. **Pedal noise** scales only these endpoint knocks and moving friction, not key-return knocks |
 | Dampers | Felt that rests on the string with a small force and soaks up its motion. Lifting it releases the slightly deflected string, which is the stir of the strings when the pedal goes down (26 dB below a mezzo forte note). A settled damped string is set aside and wakes in its bent shape; optionally damped strings stay in the simulation and answer faintly to the rest. The pedal is continuous: dampers graze the strings between 34 % and 47 % of its travel |
 | Soundboard | Orthotropic Kirchhoff plate on a grain-aligned grid, grand-shaped outline, clamped rim, crown as a shallow-shell stiffness |
 | Air on the board | Each quarter-metre patch feels its own motion as a piston (mass-like at low, resistive at high frequency) and the delayed acceleration of every other patch, on both faces. Lowers the lowest resonance by 8 % |
@@ -34,17 +34,49 @@ part consistently.
 
 ## Touch and timing
 
-A MIDI note-on starts the hammer at let-off, not at string contact. MIDI velocity sets
-hammer speed through `0.25 + 5.5 * (velocity / 127)^1.7` m/s. The configured release gap
+A MIDI note-on starts the hammer at let-off, not at string contact. MIDI16–127 retain
+`0.25 + 5.5 * (velocity / 127)^1.7` m/s exactly. On this experimental branch, MIDI1–15
+use a cubic launch-speed segment from 0.200m/s at MIDI1, joining the original value and
+slope at16. This changes physical hammer flight/contact, not post-synthesis gain. The
+0.200m/s lower endpoint is a hypothesis near one tested grazing regime, not a universal
+piano/keyboard calibration or a guarantee of contact/audibility. Velocity zero remains
+NoteOff in MIDI decoding, never a quiet strike. The configured release gap
 (default 2 mm), gravity and moving string determine the subsequent contact time: roughly
 7.6 ms at 0.3 m/s, 1 ms at 2 m/s and 0.4 ms at 5 m/s in the test case.
 
 The same velocity uses the same launch speed and gap across the keyboard; there is no
-extra bass-note delay. Different hammer masses affect contact, but mass alone does not
+extra bass-note delay. Grazing launches can take longer to reach a string or miss it,
+especially when the gap/gravity/preload differ; no minimum hold or timing compensation
+is inserted. The keyboard's actual velocity distribution is unknown, and a controller
+that never emits MIDI1–15 will not exercise this candidate. Different hammer masses affect contact, but mass alone does not
 slow free flight at a given initial speed. The current masses are assumed per-string values
 multiplied by unison count, not a measured monotonically decreasing hammer-weight scale.
 The preceding finger/key/linkage motion is not part of live synthesis. Adding its whole
 stroke duration after a MIDI event would duplicate latency already incurred by the keyboard.
+
+A MIDI note-off starts the existing simulated key's return; it is not a measured
+hardware position or an instruction for immediate damper contact. The key lifter holds
+the damper clear until that coordinate reaches the assumed regulated contact point
+(4.5 mm). Sustain and captured sostenuto support compose with the key lifter, so releasing
+one control cannot defeat another. Release velocity controls key return and retains the
+existing felt-seating rate proxy. There is no additional minimum hold or envelope.
+After engagement, the grounded viscous brake and preload law are unchanged: this corrects
+contact timing, not the post-contact modal decay law. Finite damper-head inertia and felt
+compression mechanics are not included in this approximation.
+
+## Unison tuning (synthetic voicing)
+
+The existing Unison detune amount scales a fixed per-key profile in `make_grand`, not a
+measured grand-piano tuning table. Two-string widths and three-string widths/asymmetries
+vary deterministically by key; they do not change randomly on a strike or rebuild. Cents
+sum to zero within each group, preserving its geometric target-frequency center; mono
+strings are unaffected and amount zero aligns the target pitches exactly.
+
+Width varies by ±15%, with a gentle fourth-root taper above a **fixed 440 Hz** reference.
+That reference does not follow a custom A4 setting. This limits the growth of high-register
+beat rates without claiming constant beating or a perceptually exact pitch center. All
+previews and baked samples use the actual `make_grand` string targets, not parallel UI
+pitch formulas. This is an intentional voicing choice, not evidence of more realistic sound.
 
 ## Numerics
 
@@ -195,15 +227,16 @@ exists. Peak throughput is not a realtime-latency guarantee.
   are ideal thirds and halves, not a maker's scaling.
 - **Action before let-off.** The key, wippen, jack and repetition lever accelerating the
   hammer are not simulated: with MIDI input their result, the hammer's speed at let-off, is
-  what a note-on carries (hammer speed is a fixed curve of MIDI velocity), and a note-off is
-  taken as the moment the damper meets the string. Felt constants of the key rails and the
+  what a note-on carries (hammer speed is a fixed curve of MIDI velocity). A note-off starts
+  the simulated key return described above, not measured hardware release motion.
+  Felt constants of the key rails and the
   backcheck, the key's mass, the share of their force that reaches the board, and the soft
   pedal's felt hardness are assumptions. Pedal friction is a noise source, not a friction model.
 - **Geometry.** A generic 2 m grand: outline, scale, rib and bridge sizes are plausible
   values, not measurements of an instrument.
 - **Material and felt data.** Spruce and maple constants are textbook values. Felt stiffness
   and exponent are interpolated from three published notes. Felt damping, damper strength,
-  board loss factor, crown radius, key knock strength, pedal thresholds, room size and
+  board loss factor, crown radius, action knock strength, pedal thresholds, room size and
   absorption are assumptions. The pedal thresholds were inferred from recorded pedalling.
 - **Listening.** Checks are numerical. Judgements of tone so far are the owner's, by ear.
 

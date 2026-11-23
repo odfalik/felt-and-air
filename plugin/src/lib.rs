@@ -1,9 +1,11 @@
 //! Shared CLAP/VST3 editor and standalone instrument. Rebuilds, geometry, snapshot allocation
 //! and disposal happen off the audio thread. Audio only moves ownership through bounded queues.
+pub mod bake;
 mod demo;
 mod editor;
 mod paths;
 mod presets;
+pub mod setup;
 pub mod shared;
 #[cfg(test)]
 mod tests;
@@ -92,8 +94,16 @@ impl PianoParams {
         }
         o
     }
+    fn capture_setup(&self) -> setup::Setup {
+        let options = self.options();
+        setup::Setup {
+            values: PARAMS.iter().map(|p| (p.get)(&options)).collect(),
+            grid: self.grid.value(),
+            volume: self.volume.value(),
+        }
+    }
     fn grid_scale(&self) -> f64 {
-        [1.0, 1.25, 1.5, 2.0][self.grid.value() as usize]
+        setup::grid_scale(self.grid.value()).expect("grid parameter is range checked")
     }
 }
 unsafe impl Params for PianoParams {
@@ -249,7 +259,11 @@ pub struct PhysicalPiano {
     captured: [bool; 128],
 }
 impl Default for PhysicalPiano {
-    fn default() -> Self {
+    fn default() -> Self {Self::with_demos(demo::demos)}
+}
+impl PhysicalPiano {
+    // Same production construction/evaluation order; tests supply ONLY an in-memory catalog.
+    fn with_demos(demos:impl FnOnce()->Arc<Vec<demo::Demo>>)->Self {
         Self {
             params: Arc::new(PianoParams::new()),
             shared: Shared::new(),
@@ -257,7 +271,7 @@ impl Default for PhysicalPiano {
             sample_rate: 48000.0,
             fresh: Arc::new(ArrayQueue::new(1)),
             retired: Arc::new(ArrayQueue::new(8)),
-            demos: demo::demos(),
+            demos: demos(),
             player: demo::Player::default(),
             left: Vec::new(),
             right: Vec::new(),
@@ -271,6 +285,7 @@ impl Default for PhysicalPiano {
         }
     }
 }
+
 pub enum Task {
     Rebuild(GrandOptions, f64, f64, u64, u64),
     Collect,
@@ -339,6 +354,34 @@ impl PhysicalPiano {
         let _ = self.retired.push(old);
         shared.display_frames.fetch_add(1, Ordering::Release);
         true
+    }
+    // Exact production panic/queue snapshot+cap; external MIDI remains at its call site.
+    fn drain_editor_inputs(&mut self) {
+        if self.shared.panic.swap(false, Ordering::AcqRel) {
+            for _ in 0..self.shared.inputs.len() {
+                let _ = self.shared.inputs.pop();
+            }
+            self.clear_source(255);
+        }
+        // Snapshot queue lengths and cap normal work: producers cannot extend this block.
+        for _ in 0..self.shared.inputs.len().min(128) {
+            if let Some(e) = self.shared.inputs.pop() {
+                self.input(e);
+            }
+        }
+
+    }
+    // Exact accepted-build/gen/try_lock snapshot body; cadence/open guards stay in process().
+    fn try_publish_snapshot(&mut self)->bool {
+        if let (Some(b), Ok(mut display)) = (&self.built, self.shared.display.try_lock()) {
+            if display.generation == b.generation {
+                b.piano.fill_snapshot(&mut display.snap,self.shared.focus.load(Ordering::Relaxed));
+                self.shared.display_frames.fetch_add(1,Ordering::Release);
+                self.since_snapshot=0;
+                return true;
+            }
+        }
+        false
     }
     fn input(&mut self, input: Input) {
         if matches!(input, Input::PlayDemo(_) | Input::StopDemo) {
@@ -469,6 +512,81 @@ impl PhysicalPiano {
             }
         }
     }
+    fn render_segments(&mut self,frames:usize,mut next_host_event:impl FnMut()->Option<PluginNoteEvent<Self>>) {
+        let mut done = 0;
+        let mut next = next_host_event();
+        loop {
+            let mut until = frames;
+            while let Some(event) = next {
+                if event.timing() as usize > done {
+                    until = (event.timing() as usize).min(frames);
+                    break;
+                }
+                let input = match event {
+                    NoteEvent::NoteOn { note, velocity, .. } => Some(Input::NoteOn {
+                        midi: note as i32,
+                        velocity: (velocity * 127.0).round() as i32,
+                        from: FROM_HOST,
+                    }),
+                    NoteEvent::NoteOff { note, velocity, .. } => Some(Input::NoteOff {
+                        midi: note as i32,
+                        from: FROM_HOST,
+                        release: if velocity > 0.0 {
+                            velocity as f64 * 2.0
+                        } else {
+                            1.0
+                        },
+                    }),
+                    NoteEvent::MidiCC { cc: 64, value, .. } => {
+                        Some(Input::Sustain(value, FROM_HOST))
+                    }
+                    NoteEvent::MidiCC { cc: 67, value, .. } => {
+                        Some(Input::Soft(value >= 0.5, FROM_HOST))
+                    }
+                    NoteEvent::MidiCC { cc: 66, value, .. } => {
+                        Some(Input::Sostenuto(value >= 0.5, FROM_HOST))
+                    }
+                    _ => None,
+                };
+                if let Some(i) = input {
+                    self.input(i);
+                }
+                next = next_host_event();
+            }
+            if done == frames {
+                break;
+            }
+            if let Some(i) = self.player.index {
+                while self.player.next < self.demos[i].events.len()
+                    && (self.demos[i].events[self.player.next].seconds * self.sample_rate) as u64
+                        <= self.player.frame
+                {
+                    let e = self.demos[i].events[self.player.next];
+                    self.player.next += 1;
+                    self.demo_event(e);
+                }
+                if let Some(e) = self.demos[i].events.get(self.player.next) {
+                    until = until.min(
+                        done + ((e.seconds * self.sample_rate) as u64)
+                            .saturating_sub(self.player.frame)
+                            as usize,
+                    );
+                } else if self.player.frame as f64
+                    > (self.demos[i].seconds + 4.0) * self.sample_rate
+                {
+                    self.input(Input::StopDemo);
+                }
+            }
+            if let Some(b) = &mut self.built {
+                b.piano
+                    .process(&mut self.left[done..until], &mut self.right[done..until]);
+            }
+            if self.player.index.is_some() {
+                self.player.frame += (until - done) as u64;
+            }
+            done = until;
+        }
+    }
     fn demo_event(&mut self, e: piano_engine::midi::MidiEvent) {
         use piano_engine::midi::MidiKind::*;
         self.input(match e.kind {
@@ -584,18 +702,7 @@ impl Plugin for PhysicalPiano {
                 self.epoch,
             ));
         }
-        if self.shared.panic.swap(false, Ordering::AcqRel) {
-            for _ in 0..self.shared.inputs.len() {
-                let _ = self.shared.inputs.pop();
-            }
-            self.clear_source(255);
-        }
-        // Snapshot queue lengths and cap normal work: producers cannot extend this block.
-        for _ in 0..self.shared.inputs.len().min(128) {
-            if let Some(e) = self.shared.inputs.pop() {
-                self.input(e);
-            }
-        }
+        self.drain_editor_inputs();
         if shared::STANDALONE.load(Ordering::Relaxed) {
             if shared::EXTERNAL_PANIC.swap(false, Ordering::AcqRel) {
                 for _ in 0..shared::EXTERNAL_MIDI.len() {
@@ -610,76 +717,7 @@ impl Plugin for PhysicalPiano {
             }
         }
         let frames = buffer.samples().min(self.left.len());
-        let mut done = 0;
-        let mut next = context.next_event();
-        while done < frames {
-            let mut until = frames;
-            while let Some(event) = next {
-                if event.timing() as usize > done {
-                    until = (event.timing() as usize).min(frames);
-                    break;
-                }
-                let input = match event {
-                    NoteEvent::NoteOn { note, velocity, .. } => Some(Input::NoteOn {
-                        midi: note as i32,
-                        velocity: (velocity * 127.0).round() as i32,
-                        from: FROM_HOST,
-                    }),
-                    NoteEvent::NoteOff { note, velocity, .. } => Some(Input::NoteOff {
-                        midi: note as i32,
-                        from: FROM_HOST,
-                        release: if velocity > 0.0 {
-                            velocity as f64 * 2.0
-                        } else {
-                            1.0
-                        },
-                    }),
-                    NoteEvent::MidiCC { cc: 64, value, .. } => {
-                        Some(Input::Sustain(value, FROM_HOST))
-                    }
-                    NoteEvent::MidiCC { cc: 67, value, .. } => {
-                        Some(Input::Soft(value >= 0.5, FROM_HOST))
-                    }
-                    NoteEvent::MidiCC { cc: 66, value, .. } => {
-                        Some(Input::Sostenuto(value >= 0.5, FROM_HOST))
-                    }
-                    _ => None,
-                };
-                if let Some(i) = input {
-                    self.input(i);
-                }
-                next = context.next_event();
-            }
-            if let Some(i) = self.player.index {
-                while self.player.next < self.demos[i].events.len()
-                    && (self.demos[i].events[self.player.next].seconds * self.sample_rate) as u64
-                        <= self.player.frame
-                {
-                    let e = self.demos[i].events[self.player.next];
-                    self.player.next += 1;
-                    self.demo_event(e);
-                }
-                if let Some(e) = self.demos[i].events.get(self.player.next) {
-                    until = until.min(
-                        done + ((e.seconds * self.sample_rate) as u64)
-                            .saturating_sub(self.player.frame)
-                            as usize,
-                    );
-                } else if self.player.frame as f64
-                    > (self.demos[i].seconds + 4.0) * self.sample_rate
-                {
-                    self.input(Input::StopDemo);
-                }
-            }
-            if let Some(b) = &mut self.built {
-                b.piano
-                    .process(&mut self.left[done..until], &mut self.right[done..until]);
-            }
-            if self.player.index.is_some() {
-                self.player.frame += (until - done) as u64;
-            }
-            done = until;
-        }
+        self.render_segments(frames,||context.next_event());
         self.shared
             .demo_seconds
             .store((self.player.frame as f64 / self.sample_rate) as f32);
@@ -701,16 +739,7 @@ impl Plugin for PhysicalPiano {
         if self.since_snapshot >= (self.sample_rate / 30.0) as usize
             && self.params.editor_state.is_open()
         {
-            if let (Some(b), Ok(mut display)) = (&self.built, self.shared.display.try_lock()) {
-                if display.generation == b.generation {
-                    b.piano.fill_snapshot(
-                        &mut display.snap,
-                        self.shared.focus.load(Ordering::Relaxed),
-                    );
-                    self.shared.display_frames.fetch_add(1, Ordering::Release);
-                    self.since_snapshot = 0;
-                }
-            }
+            self.try_publish_snapshot();
         }
         let load = t.elapsed().as_secs_f32() / (frames.max(1) as f32 / self.sample_rate as f32);
         self.shared

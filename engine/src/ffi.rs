@@ -216,6 +216,7 @@ pub extern "C" fn pp_snapshot_copy(dst: *mut Snapshot, src: *const Snapshot) {
     d.hammer_force = s.hammer_force;
     d.focus_midi = s.focus_midi;
     d.awake = s.awake;
+    d.action = s.action;
 }
 #[no_mangle]
 pub extern "C" fn pp_snapshot_view(s: *const Snapshot, out: *mut SnapshotView) {
@@ -316,4 +317,43 @@ pub extern "C" fn pp_param_get(options: *const GrandOptions, index: i32) -> f64 
 #[no_mangle]
 pub extern "C" fn pp_param_set(options: *mut GrandOptions, index: i32, value: f64) {
     crate::params::PARAMS[index as usize].write(unsafe { &mut *options }, value);
+}
+
+
+#[cfg(test)]
+mod action_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn ffi_snapshot_copy_preserves_real_action_trace_without_changing_c_view() {
+        let d=make_grand(&GrandOptions {first_key:40,last_key:40,..GrandOptions::default()});
+        let mut p=Piano::new(&d,&PianoOptions {board_grid_scale:1.5,..PianoOptions::default()}).unwrap();
+        p.note_on(60,2.0);
+        p.process(&mut [0.0;1024],&mut [0.0;1024]);
+        let mut src=p.new_snapshot(); let mut dst=p.new_snapshot();
+        p.fill_snapshot(&mut src,60);
+        assert!(src.action.valid && src.action.poses().next().is_some());
+        assert!(!dst.action.valid);
+        let capacities=(dst.board.capacity(),dst.string_level.capacity(),
+            dst.shape[0].capacity(),dst.shape[1].capacity(),dst.shape[2].capacity());
+        pp_snapshot_copy(&mut dst,&src);
+        assert_eq!(dst.action,src.action);
+        assert_eq!(dst.board,src.board);
+        assert_eq!(dst.string_level,src.string_level);
+        assert_eq!(dst.shape,src.shape);
+        assert_eq!(dst.shape_nodes,src.shape_nodes);
+        assert_eq!(dst.hammer_force,src.hammer_force);
+        assert_eq!(dst.focus_midi,src.focus_midi);
+        assert_eq!(dst.awake,src.awake);
+        assert_eq!(capacities,(dst.board.capacity(),dst.string_level.capacity(),
+            dst.shape[0].capacity(),dst.shape[1].capacity(),dst.shape[2].capacity()));
+        // Snapshot remains opaque to C; the old view has no new action fields.
+        assert_eq!(std::mem::size_of::<SnapshotView>(),88);
+        let mut view=std::mem::MaybeUninit::<SnapshotView>::uninit();
+        pp_snapshot_view(&dst,view.as_mut_ptr());
+        let view=unsafe {view.assume_init()};
+        assert_eq!(view.focus_midi,dst.focus_midi);
+        assert_eq!(view.hammer_force,dst.hammer_force);
+        assert_eq!(view.board_len,dst.board.len() as i32);
+    }
 }

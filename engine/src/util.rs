@@ -10,7 +10,20 @@ pub fn write_wav_float(path: &str, interleaved: &[f32], channels: u16, sample_ra
         }
     }
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    let data_bytes = (interleaved.len() * 4) as u32;
+    write_wav_float_to(&mut f, interleaved, channels, sample_rate)?;
+    f.flush()
+}
+
+/// Same WAV encoder for callers that require exclusive file creation.
+pub fn write_wav_float_to(mut f: impl Write, interleaved: &[f32], channels: u16, sample_rate: u32) -> std::io::Result<()> {
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid or oversized float WAV");
+    if channels == 0 || sample_rate == 0 || interleaved.len() % channels as usize != 0 {
+        return Err(invalid());
+    }
+    let data_bytes = interleaved.len().checked_mul(4).and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n <= u32::MAX - 36).ok_or_else(invalid)?;
+    let byte_rate = sample_rate.checked_mul(channels as u32).and_then(|n| n.checked_mul(4)).ok_or_else(invalid)?;
+    let alignment = channels.checked_mul(4).ok_or_else(invalid)?;
     f.write_all(b"RIFF")?;
     f.write_all(&(36 + data_bytes).to_le_bytes())?;
     f.write_all(b"WAVEfmt ")?;
@@ -18,8 +31,8 @@ pub fn write_wav_float(path: &str, interleaved: &[f32], channels: u16, sample_ra
     f.write_all(&3u16.to_le_bytes())?;
     f.write_all(&channels.to_le_bytes())?;
     f.write_all(&sample_rate.to_le_bytes())?;
-    f.write_all(&(sample_rate * channels as u32 * 4).to_le_bytes())?;
-    f.write_all(&(channels * 4).to_le_bytes())?;
+    f.write_all(&byte_rate.to_le_bytes())?;
+    f.write_all(&alignment.to_le_bytes())?;
     f.write_all(&32u16.to_le_bytes())?;
     f.write_all(b"data")?;
     f.write_all(&data_bytes.to_le_bytes())?;

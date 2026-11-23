@@ -21,6 +21,16 @@ use std::f64::consts::PI;
 
 const LINES: usize = 8;
 
+/// Sabine late-decay time in seconds for an enabled rectangular room.
+/// Pure geometry/material estimate; preserves the radiation calibration's operation order.
+#[inline]
+pub fn room_decay_time(lx: f64, ly: f64, lz: f64, absorption: f64) -> f64 {
+    let volume = lx * ly * lz;
+    let surface = 2.0 * (lx * ly + lx * lz + ly * lz);
+    let absorb = absorption * surface;
+    0.161 * volume / absorb
+}
+
 #[inline]
 fn mutual_history_index(base: usize, offset: usize, len: usize) -> usize {
     // Both base and offset are below len. One ring length cancels unsigned underflow;
@@ -326,7 +336,7 @@ impl Radiation {
             let volume = room.lx * room.ly * room.lz;
             let surface = 2.0 * (room.lx * room.ly + room.lx * room.lz + room.ly * room.lz);
             let absorb = room.absorption * surface;
-            rad.reverb_time = 0.161 * volume / absorb;
+            rad.reverb_time = room_decay_time(room.lx, room.ly, room.lz, room.absorption);
             let base = [0.0297, 0.0371, 0.0411, 0.0437, 0.0533, 0.0617, 0.0683, 0.0739];
             for i in 0..LINES {
                 let len = (base[i] * fs) as usize | 1;
@@ -511,6 +521,23 @@ impl Radiation {
 mod tests {
     use super::*;
     use crate::design::{make_grand, GrandOptions};
+
+    #[test]
+    fn room_decay_preserves_calibration_operation_order() {
+        for (lx, ly, lz, absorption) in [
+            (9.0, 7.0, 4.0, 0.18),
+            (3.0, 3.0, 2.2, 0.03),
+            (30.0, 25.0, 15.0, 0.7),
+            (12.345, 8.765, 3.456, 0.234),
+        ] {
+            // Frozen pre-extraction calculation: catch numerically different reassociation.
+            let volume = lx * ly * lz;
+            let surface = 2.0 * (lx * ly + lx * lz + ly * lz);
+            let absorb = absorption * surface;
+            let previous: f64 = 0.161 * volume / absorb;
+            assert_eq!(room_decay_time(lx, ly, lz, absorption).to_bits(), previous.to_bits());
+        }
+    }
 
     fn same_radiation(a: &Radiation, b: &Radiation) {
         let bits = |s: &[f64]| s.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
