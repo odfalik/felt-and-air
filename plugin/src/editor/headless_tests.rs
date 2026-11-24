@@ -332,17 +332,15 @@ fn actual_save_name_typing_owns_text_without_musical_side_effects() {
         f.click_editor_widget("editor:setup-name");
         assert!(f.state.saving && f.setup_name_focused());
         assert!(f.musical_inputs().is_empty());
-        let (octave, velocity, sound) = (f.state.octave, f.state.velocity, f.state.shared.sound_on.load(Ordering::Relaxed));
+        let (octave, velocity) = (f.state.octave, f.state.velocity);
         for (key, text) in [(Key::A,"a"),(Key::W,"w"),(Key::Z,"z"),(Key::X,"x"),(Key::C,"c"),(Key::V,"v"),
             (Key::Space," "),(Key::Comma,","),(Key::Period,".")] {
             f.frame(vec![key_event(key, true), Event::Text(text.into())]);
             f.frame(vec![key_event(key, false)]);
             assert_eq!((f.state.octave, f.state.velocity), (octave, velocity));
-            assert_eq!(f.state.shared.sound_on.load(Ordering::Relaxed), sound);
         }
         assert_eq!(f.state.setup_name, "awzxcv ,."); // actual TextEdit accepted the text
         assert_eq!((f.state.octave, f.state.velocity), (octave, velocity));
-        assert_eq!(f.state.shared.sound_on.load(Ordering::Relaxed), sound);
         assert!(f.state.key_notes.is_empty());
         let leaked = f.musical_inputs();
         assert!(leaked.is_empty(), "typing actual Save name leaked musical commands: {leaked:?}");

@@ -109,8 +109,6 @@ pub struct Shared {
     pub building: AtomicBool,
     pub sample_rate: AtomicF32,
     pub output_peak: AtomicF32,
-    /// Standalone only: the app starts silent until sound is turned on.
-    pub sound_on: AtomicBool,
     pub demo_playing: AtomicI32,
     pub demo_seconds: AtomicF32,
 }
@@ -140,7 +138,6 @@ impl Shared {
             building: AtomicBool::new(false),
             sample_rate: AtomicF32::new(48000.0),
             output_peak: AtomicF32::new(0.0),
-            sound_on: AtomicBool::new(!STANDALONE.load(Ordering::Relaxed)),
             demo_playing: AtomicI32::new(-1),
             demo_seconds: AtomicF32::new(0.0),
         })

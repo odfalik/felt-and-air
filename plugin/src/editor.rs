@@ -772,30 +772,17 @@ impl State {
                     }
                 });
             });
-            let button_width = ["Sound on", "Sound off", "Diagnostics ·", "Rebuilding…"]
+            let button_width = ["Diagnostics", "Rebuilding…"]
                 .into_iter()
                 .map(|label| WidgetText::from(label)
                     .into_galley(ui, Some(TextWrapMode::Extend), f32::INFINITY, TextStyle::Button)
                     .size().x + 2.0 * ui.spacing().button_padding.x)
                 .fold(ui.spacing().interact_size.x, f32::max);
-            // Strictly fixed 2-row header height so background rebuilds never reflow the body or pop scrollbars.
-            let info_rows = 2.0f32;
-            let info_group_size = vec2(button_width,
-                info_rows * ui.spacing().interact_size.y
-                    + (info_rows - 1.0) * ui.spacing().item_spacing.y);
+            // Strictly fixed header height so background rebuilds never reflow the body or pop scrollbars.
+            let info_group_size = vec2(button_width, ui.spacing().interact_size.y);
             ui.allocate_ui_with_layout(info_group_size, Layout::top_down(Align::Min), |ui| {
                 ui.set_min_size(info_group_size);
                 let building = self.shared.building.load(Ordering::Relaxed);
-                if STANDALONE.load(Ordering::Relaxed) {
-                    let mut sound = self.shared.sound_on.load(Ordering::Relaxed);
-                    let label = if sound { "Sound on" } else { "Sound off" };
-                    let sound_response=ui.toggle_value(&mut sound, label);
-                    #[cfg(test)]
-                    trace_compact_widget(ui,"header:sound",&sound_response);
-                    if sound_response.changed() {
-                        self.shared.sound_on.store(sound, Ordering::Relaxed);
-                    }
-                }
                 let diag_label = if building {
                     RichText::new("Rebuilding…").color(AMBER)
                 } else {
@@ -1316,12 +1303,6 @@ impl State {
                         Key::Period if pressed || self.key_sostenuto_down => {
                             self.key_sostenuto_down = pressed;
                             self.shared.send(Input::Sostenuto(pressed, FROM_UI));
-                        }
-                        Key::Enter if pressed && STANDALONE.load(Ordering::Relaxed) => {
-                            self.shared.sound_on.store(
-                                !self.shared.sound_on.load(Ordering::Relaxed),
-                                Ordering::Relaxed,
-                            )
                         }
                         _ => {}
                     }

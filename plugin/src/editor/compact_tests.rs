@@ -129,11 +129,10 @@ fn actual_compact_header_and_footer_widgets_are_fully_reachable() {
                 let label=format!("api={:?} size={size:?} category={}",f.host.api,guide::TABS[tab]);
                 let widgets=f.ctx.data(|data|data.get_temp::<Vec<(String,Rect,Rect)>>(Id::new("compact:widgets")))
                     .expect("fresh actual header/footer traces from State.show");
-                let mut required=vec!["header:title","header:preset","header:save","header:demo",
+                let required=vec!["header:title","header:preset","header:save","header:demo",
                     "header:play","header:elapsed","header:grid","header:diagnostics",
                     "footer:sustain","footer:soft","footer:sostenuto","footer:settings",
                     "footer:keyboard","footer:help","category:0","category:1","category:2","category:3"];
-                if STANDALONE.load(Ordering::Relaxed) {required.push("header:sound");}
                 for name in required {
                     let observed:Vec<_>=widgets.iter().filter(|(key,_,_)|key==name).collect();
                     if observed.len()!=1 {

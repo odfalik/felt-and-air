@@ -33,10 +33,7 @@ fn select_category(f:&mut Fixture,tab:usize) {
 }
 fn check_header_text(f:&Fixture,output:&FullOutput) {
     let texts=painted_text(output);
-    let mut labels=vec![("header:diagnostics","Diagnostics")];
-    if STANDALONE.load(Ordering::Relaxed) {
-        labels.push(("header:sound",if f.state.shared.sound_on.load(Ordering::Relaxed) {"Sound on"} else {"Sound off"}));
-    }
+    let labels=vec![("header:diagnostics","Diagnostics")];
     for (key,label) in labels {
         let response=actual_header(f,key);
         let matching:Vec<_>=texts.iter().filter(|(text,_)|text.galley.job.text==label && text.visual_bounding_rect().intersects(response)).collect();
@@ -58,18 +55,7 @@ fn actual_header_sound_and_diagnostics_paint_natural_single_rows() {
             let mut f=Fixture::new(size);
             for tab in 0..guide::TABS.len() {
                 select_category(&mut f,tab);
-                let toggles=if STANDALONE.load(Ordering::Relaxed) {2} else {1};
-                for _ in 0..toggles {
-                    let output=f.frame(Vec::new()); check_header_text(&f,&output);
-                    if STANDALONE.load(Ordering::Relaxed) {
-                        // Real Sound button toggles the actual UI atomic; no audio/engine.
-                        let response=actual_header(&f,"header:sound");
-                        let before=f.state.shared.sound_on.load(Ordering::Relaxed);
-                        f.click_at(response.center()); f.settle();
-                        assert_eq!(f.state.shared.sound_on.load(Ordering::Relaxed),!before,
-                            "actual Sound button click did not toggle the UI state");
-                    }
-                }
+                let output=f.frame(Vec::new()); check_header_text(&f,&output);
                 f.host.assert_no_edits(); assert!(f.musical_inputs().is_empty());
             }
         }

@@ -722,15 +722,14 @@ impl Plugin for PhysicalPiano {
             .demo_seconds
             .store((self.player.frame as f64 / self.sample_rate) as f32);
         let volume = self.params.volume.value();
-        let sound = self.shared.sound_on.load(Ordering::Relaxed);
         let out = buffer.as_slice();
         let mut peak = 0.0f32;
         for i in 0..frames {
             let l = (self.left[i] * volume).tanh();
             let r = (self.right[i] * volume).tanh();
             peak = peak.max(l.abs()).max(r.abs());
-            out[0][i] = if sound { l } else { 0.0 };
-            out[1][i] = if sound { r } else { 0.0 };
+            out[0][i] = l;
+            out[1][i] = r;
         }
         self.shared
             .output_peak
